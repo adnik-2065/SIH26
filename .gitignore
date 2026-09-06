@@ -141,3 +141,26 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local AI model downloads (keep server/models/ source code trackable)
+/model-weights/
+
+# Local screenshots and debug captures (keep tests/fixtures/ trackable)
+/debug-captures/
+
+# Local ngrok configuration may contain credentials
+ngrok.yml
+ngrok.yaml
+.ngrok2/
