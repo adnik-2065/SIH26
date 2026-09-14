@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="240" viewBox="0 0 720 240">
+  <rect width="720" height="240" fill="white"/>
+  <g font-family="Arial, sans-serif" fill="#111">
+    <text x="30" y="48" font-size="22">SYNTHETIC TEST DATA</text>
+    <text x="30" y="105" font-size="30">Name: Demo Student</text>
+    <text x="30" y="158" font-size="30">Email: student@example.test</text>
+    <text x="30" y="211" font-size="30">Phone: 0000000000</text>
+  </g>
+</svg>

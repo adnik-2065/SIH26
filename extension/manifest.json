@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "SIH26 — Local observation",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "Inspect visible page text and faces locally with Tesseract OCR and MediaPipe.",
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage", "debugger"],
+  "action": { "default_title": "Open SIH26 local observer" },
+  "commands": { "_execute_action": { "suggested_key": { "default": "Ctrl+Shift+Y" }, "description": "Open local observer on the current tab" } },
+  "background": { "service_worker": "background.js", "type": "module" },
+  "side_panel": { "default_path": "panel.html" },
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
+  }
+}
