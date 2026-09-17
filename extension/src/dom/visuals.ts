@@ -1,0 +1,46 @@
+import type { z } from 'zod';
+import type { VisualRegionSchema, VisualCategorySchema } from '../contracts';
+
+// Labels classify a container locally; no label, URL or image value leaves here.
+export function documentCategory(label: string): z.infer<typeof VisualCategorySchema> | undefined {
+  if (/aadhaar|aadhar|uidai/i.test(label)) return 'aadhaar_card';
+  if (/\bpan\b|permanent account|income tax/i.test(label)) return 'pan_card';
+  if (/passport/i.test(label)) return 'passport';
+  if (/identity|identification|\bid card\b|driving licen[cs]e/i.test(label)) return 'identity_card';
+  if (/bank|financial|statement|cheque|checkbook|invoice/i.test(label)) return 'financial_document';
+  if (/signature|signed by/i.test(label)) return 'signature';
+  if (/\bqr\b|barcode|bar code/i.test(label)) return 'qr_barcode';
+  if (/confidential|private document|medical record/i.test(label)) return 'private_document';
+}
+
+// OCR document cues need specific phrases. Common words such as "bank" or
+// "statement" on a general page must not mask the entire screenshot.
+export function ocrDocumentCategory(text: string): z.infer<typeof VisualCategorySchema> | undefined {
+  if (/\b(?:aadhaar|aadhar|uidai)\s+(?:card|number|no\.?|enrolment|enrollment)\b/i.test(text)) return 'aadhaar_card';
+  if (/\bpan\s+card\b|permanent\s+account\s+number/i.test(text)) return 'pan_card';
+  if (/\bpassport\s+(?:number|no\.?|authority|expiry|issued)\b/i.test(text)) return 'passport';
+  if (/\b(?:bank|credit|debit)\s+statement\b|\bcheque\s+book\b/i.test(text)) return 'financial_document';
+  if (/\bconfidential\s+(?:document|record)|\bprivate\s+medical\s+record\b/i.test(text)) return 'private_document';
+}
+
+export function collectVisualRegions() {
+  const regions: z.infer<typeof VisualRegionSchema>[] = [];
+  const nodes = document.querySelectorAll<HTMLElement>('*');
+  let truncated = nodes.length > 10_000;
+  for (const node of Array.from(nodes).slice(0, 10_000)) {
+    // SVG children are covered by their root. Backgrounds on ordinary elements
+    // matter too; a document need not use an <img> tag.
+    if (node.parentElement?.closest('svg')) continue;
+    const style = getComputedStyle(node);
+    const visual = node.matches('img,svg,canvas,video,object,embed,iframe,input,textarea,select,[contenteditable]') || style.backgroundImage !== 'none';
+    if (!visual || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+    const box = node.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) continue;
+    if (regions.length >= 500) { truncated = true; break; }
+    const label = ['alt', 'aria-label', 'title'].map(name => node.getAttribute(name) ?? '').join(' ').slice(0, 2000);
+    const category = node.matches('input,textarea,select,[contenteditable]') ? 'form_control' : documentCategory(label);
+    regions.push({ category: category ?? 'sensitive_image', confidence: category ? .8 : .5,
+      bounds: { x: box.x, y: box.y, width: box.width, height: box.height } });
+  }
+  return { regions, truncated };
+}

@@ -1,21 +1,20 @@
 # SIH26 — Project context and conversation handoff
 
 **Last updated:** 2026-09-09, Asia/Kolkata.  
-**Current stage:** Phase 1 foundation plus real local Tesseract OCR, MediaPipe face detection, and a redesigned vision workspace. Document/PII models, redaction, payload building, and AI integration remain future work.  
+**Current stage:** Phase 1 foundation plus local Tesseract OCR, MediaPipe face detection, the fail-closed redaction pipeline, and the supplied ONNX document detector. AI integration remains future work.
 **Purpose:** Give a new collaborator or conversation enough context to continue without mistaking plans or mock results for completed features.
 
 This is a dated handoff, not a substitute for inspecting current code. Read this file first, then check the relevant source files and `git status` before making changes. Tests reported here were run during the prior implementation, not rerun merely to create this document.
 
 ## Current MediaPipe update — 2026-09-09
 
-The user authorized MediaPipe now, a substantial SaaS-style panel redesign, and explanations of future trained-model integration, preprocessing/redaction, and the final payload. Their Aadhaar/PAN/passport/card/document model is explicitly deferred. No privacy gateway, backend, or execution work was requested or implemented.
+The user authorized MediaPipe now, a substantial SaaS-style panel redesign, and explanations of future trained-model integration, preprocessing/redaction, and the final payload. Their The supplied ONNX document model is now bundled and integrated; broader model coverage remains future work. No privacy gateway, backend, or execution work was requested or implemented.
 
 - **Implemented:** `extension/src/vision/face/{mediapipe.ts,mediapipe.worker.ts,normalize.ts}` runs real MediaPipe BlazeFace alongside existing OCR. Separate bitmaps/workers; original-image face bounds and confidence; no identity recognition.
 - **Packaging:** pinned `@mediapipe/tasks-vision` 1.0.1 and BlazeFace short-range float16 v1 weights. Build verifies SHA-256 and bundles WASM/model/worker under `dist/vision` (~35 MB). No runtime CDN or new permission/CSP changes.
 - **Lifecycle:** reusable face worker, 30-second deadline, cancellation/error termination, stale-result rejection, independent OCR/face error states, retry, Stop/opt-out/panel-close disposal.
 - **UI:** workflow view with Capture → Detect → Review, per-engine status, primary scan action, settings, searchable text and face tabs, selectable boxes, layer toggles, and explicit unredacted/planned-feature status. New labels supersede prior UI instructions below.
-- **Future model handoff and payload:** [MediaPipe guide](mediapipe.md) explains the adapter contract, model export/runtime requirements, coordinate conversion, schema changes, remaining privacy pipeline, and an example conforming to the existing future `StepRequestSchema`. No outgoing payload exists today.
-- **Verification (2026-09-09):** production build, TypeScript, lint, 46 unit tests, and 9 Chromium browser tests passed. Real face localization on the fictional portrait at 100%/125% zoom; zero faces after replacing portrait pixels with white; selection/search; worker reuse and Stop/opt-out cleanup; missing model simulation with incomplete status and successful retry. No external HTTP(S) requests or page errors observed. The 380-pixel panel was visually checked. Synthetic UI artifact: `/tmp/sih26-vision-panel.png`. The documented payload example was parsed successfully by the generated `StepRequestSchema`.
+- **Document model integration:** `src/vision/documents/onnx.ts` runs the supplied `models/best.onnx` through ONNX Runtime Web in a local worker. `models/README.md` records classes, checksum, and licensing. No outgoing network payload exists today. - **Verification (2026-09-09):** production build, TypeScript, lint, 46 unit tests, and 9 Chromium browser tests passed. Real face localization on the fictional portrait at 100%/125% zoom; zero faces after replacing portrait pixels with white; selection/search; worker reuse and Stop/opt-out cleanup; missing model simulation with incomplete status and successful retry. No external HTTP(S) requests or page errors observed. The 380-pixel panel was visually checked. Synthetic UI artifact: `/tmp/sih26-vision-panel.png`. The documented payload example was parsed successfully by the generated `StepRequestSchema`.
 
 ### Wide-screenshot face detection fix — 2026-09-09
 

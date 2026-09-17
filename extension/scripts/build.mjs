@@ -2,6 +2,7 @@ import { build } from 'vite';
 import { cp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import './openredaction.mjs';
 
 await build({ configFile: false, build: {
   outDir: 'dist', emptyOutDir: true,
@@ -16,6 +17,8 @@ await build({ configFile: false, build: {
   lib: { entry: 'src/dom/content.ts', formats: ['iife'], name: 'SIH26Observer', fileName: () => 'content.js' },
 } });
 await cp('manifest.json', 'dist/manifest.json');
+await mkdir('dist/licenses', { recursive: true });
+await cp('vendor/openredaction/LICENSE', 'dist/licenses/OPENREDACTION-LICENSE');
 await cp('../tests/fixtures/assets', 'dist/fixtures', { recursive: true });
 // Ship OCR code and English data with the extension; runtime never uses a CDN.
 await mkdir('dist/ocr/core', { recursive: true });
@@ -38,6 +41,25 @@ await cp('node_modules/@mediapipe/tasks-vision/wasm', 'dist/vision/wasm', { recu
 await cp(faceModel, 'dist/vision/blaze_face_short_range.tflite');
 await cp('assets/mediapipe/README.md', 'dist/vision/README.md');
 await cp('assets/mediapipe/LICENSE', 'dist/vision/LICENSE');
+// Local document/privacy detector. The artifact is the supplied Ultralytics
+// ONNX export; inference and post-processing run entirely inside a worker.
+const documentModel = '../models/best.onnx';
+if (createHash('sha256').update(await readFile(documentModel)).digest('hex') !== 'cef9f1d18e6dd3e56341a2828fc71b2d7b0e13298f7cc74c835d9d76ababbda3') throw new Error('Document model checksum mismatch');
+await build({ configFile: false, build: {
+  outDir: 'dist/vision', emptyOutDir: false,
+  define: { 'import.meta.url': 'self.location.href' },
+  rollupOptions: { input: 'src/vision/documents/onnx.worker.ts', output: { format: 'es', entryFileNames: 'document.worker.js' } },
+} });
+// The ORT browser bundle contains an import.meta URL probe even though this
+// extension uses a classic worker. Replace that probe with the worker URL so
+// the bundled worker remains compatible with Chrome's extension worker loader.
+const documentWorkerPath = 'dist/vision/document.worker.js';
+await writeFile(documentWorkerPath, (await readFile(documentWorkerPath, 'utf8')).replaceAll('import.meta.url', 'self.location.href'));
+await cp(documentModel, 'dist/vision/document.onnx');
+await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm', 'dist/vision/ort-wasm-simd-threaded.wasm');
+await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs', 'dist/vision/ort-wasm-simd-threaded.mjs');
+await cp('assets/onnxruntime/LICENSE', 'dist/licenses/ONNXRUNTIME-LICENSE');
+await cp('../models/README.md', 'dist/vision/DOCUMENT-MODEL.md');
 // Generate the future Python-compatible protocol from the same runtime schemas.
 await build({ configFile: false, build: { outDir: 'dist/contracts', emptyOutDir: true,
   lib: { entry: 'src/contracts.ts', formats: ['es'], fileName: () => 'contracts.mjs' },

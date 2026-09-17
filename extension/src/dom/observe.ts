@@ -1,4 +1,5 @@
 import type { DomSnapshot, ObservedElement } from '../contracts';
+import { collectVisualRegions } from './visuals';
 
 export const candidates = 'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"],[role="checkbox"]';
 function labelText(element: Element | null): string {
@@ -37,8 +38,9 @@ export function collect(observationId: string, documentId: string, revision: num
       bounds: { x: r.x, y: r.y, width: r.width, height: r.height },
     });
   }
+  const visuals = collectVisualRegions();
   return { observationId, documentId, revision, origin: location.origin, elements, hiddenCount,
-    truncated: all.length > 2000 || refs.size === 200,
+    visualRegions: visuals.regions, truncated: visuals.truncated || all.length > 2000 || refs.size === 200,
     viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY, devicePixelRatio,
       visualScale: visualViewport?.scale || 1, offsetX: visualViewport?.offsetLeft || 0, offsetY: visualViewport?.offsetTop || 0 },
   };

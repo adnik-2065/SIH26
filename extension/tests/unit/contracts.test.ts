@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ActionResponseSchema, PanelCommandSchema, StepRequestSchema } from '../../src/contracts';
+import { ActionResponseSchema, CaptureTileSchema, PanelCommandSchema, StepRequestSchema } from '../../src/contracts';
 const envelope = { protocolVersion: 1, requestId: 'request_1', taskId: 'task_1', observationId: 'obs_1' };
 describe('action contract', () => {
   it.each([
@@ -28,5 +28,12 @@ describe('action contract', () => {
     expect(PanelCommandSchema.safeParse({ type: 'START', instruction: '  ' }).success).toBe(false);
     expect(PanelCommandSchema.safeParse({ type: 'START', instruction: 'Read form', tabId: 99 }).success).toBe(false);
     expect(PanelCommandSchema.safeParse({ type: 'STOP' }).success).toBe(true);
+  });
+  it('requires bounded capture images and valid ownership bands', () => {
+    const tile = { screenshot: 'data:image/png;base64,AA==', width: 1400, height: 5500, y: 5000, start: 5256, end: 10244 };
+    expect(CaptureTileSchema.safeParse(tile).success).toBe(true);
+    for (const change of [{ width: 40000 }, { height: 30000 }, { start: 4900 }, { end: 11000 }, { end: 5256 }, { y: -1 }]) {
+      expect(CaptureTileSchema.safeParse({ ...tile, ...change }).success).toBe(false);
+    }
   });
 });

@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "overrides": {
+    "@openredaction/core": {
+      "tesseract.js": "$tesseract.js"
+    }
+  },
   "engines": {
     "node": ">=20.19.0"
   },
@@ -17,7 +22,9 @@
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "1.0.1",
+    "@openredaction/core": "1.1.5",
     "@tesseract.js-data/eng": "1.0.0",
+    "onnxruntime-web": "^1.30.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tesseract.js": "7.0.0",

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { observeTab } from '../../src/capture/observe';
+import { captureTiles } from '../../src/capture/tiles';
 
 const snapshot = { observationId: 'obs_1', documentId: 'doc_1', revision: 0, origin: 'https://example.test',
   viewport: { width: 800, height: 600, scrollX: 0, scrollY: 250, devicePixelRatio: 1, visualScale: 1, offsetX: 0, offsetY: 0 },
@@ -41,12 +42,14 @@ describe('non-scrolling full-page capture', () => {
     expect(sendMessage.mock.calls.map(([, command]) => command.type)).toEqual(['PREPARE_CAPTURE', 'COLLECT', 'CHECK', 'FINISH_CAPTURE']);
     expect(captureVisibleTab).not.toHaveBeenCalled();
     expect(detach).toHaveBeenCalledOnce();
-    expect(insertCSS).not.toHaveBeenCalled();
+    expect(insertCSS).toHaveBeenCalledOnce();
+    expect(insertCSS.mock.calls[0][0].css).toContain('animation-play-state: paused');
+    expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[0][0]);
   });
   it('reserves classic scrollbar space only during capture and removes the exact stylesheet', async () => {
-    executeScript.mockResolvedValueOnce([]).mockResolvedValueOnce([{ result: true }]);
+    executeScript.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ result: true }]);
     await observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
-    expect(insertCSS).toHaveBeenCalledOnce();
+    expect(insertCSS).toHaveBeenCalledTimes(2);
     expect(insertCSS).toHaveBeenCalledWith({ target: { tabId: 1 }, css: ':root { scrollbar-gutter: stable !important; }', origin: 'USER' });
     expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[0][0]);
     expect(removeCSS.mock.invocationCallOrder[0]).toBeGreaterThan(detach.mock.invocationCallOrder[0]);
@@ -60,14 +63,14 @@ describe('non-scrolling full-page capture', () => {
     vi.stubGlobal('innerWidth', 800);
     vi.stubGlobal('document', { documentElement: { clientWidth } });
     vi.stubGlobal('getComputedStyle', () => ({ scrollbarGutter: gutter }));
-    executeScript.mockImplementation(async ({ func }: { func?: () => boolean }) => func ? [{ result: func() }] : []);
+    executeScript.mockImplementation(async ({ func }: { func?: () => boolean }) => func && func.name !== 'waitForStableViewport' ? [{ result: func() }] : []);
     await observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
-    expect(insertCSS).toHaveBeenCalledTimes(reserve ? 1 : 0);
-    expect(removeCSS).toHaveBeenCalledTimes(reserve ? 1 : 0);
+    expect(insertCSS).toHaveBeenCalledTimes(reserve ? 2 : 1);
+    expect(removeCSS).toHaveBeenCalledTimes(reserve ? 2 : 1);
   });
   it.each(['failure', 'stop'])('removes the scrollbar reservation on capture %s', async reason => {
     const controller = new AbortController();
-    executeScript.mockResolvedValueOnce([]).mockResolvedValueOnce([{ result: true }]);
+    executeScript.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ result: true }]);
     sendCommand.mockImplementation(async (_target, method) => {
       if (method === 'Page.getLayoutMetrics') return { cssContentSize: { width: 800, height: 1800 } };
       if (method === 'Page.captureScreenshot') {
@@ -79,6 +82,7 @@ describe('non-scrolling full-page capture', () => {
     await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, controller.signal)).rejects.toThrow();
     expect(detach).toHaveBeenCalledOnce();
     expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[0][0]);
+    expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[1][0]);
   });
   it('rejects real changes during capture and always detaches', async () => {
     sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : command.type === 'CHECK' ? { ...snapshot, revision: 1 } : snapshot);
@@ -103,10 +107,50 @@ describe('non-scrolling full-page capture', () => {
     await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow();
     expect(detach).toHaveBeenCalledOnce();
   });
-  it('bounds allocation before requesting a huge screenshot', async () => {
-    sendCommand.mockResolvedValue({ cssContentSize: { width: 800, height: 100000 } });
+  it.each([{ width: 1400, height: 40000, dpr: 1 }, { width: 1400, height: 18000, dpr: 2 }, { width: 800, height: 100000, dpr: 1.25 }])(
+    'captures every part of a $width × $height page at DPR $dpr with bounded allocations', async ({ width, height, dpr }) => {
+      const dom = { ...snapshot, viewport: { ...snapshot.viewport, devicePixelRatio: dpr } };
+      sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : dom);
+      sendCommand.mockImplementation(async (_target, method, params) => method === 'Page.getLayoutMetrics'
+        ? { cssContentSize: { width, height } } : method === 'Page.captureScreenshot'
+          ? { data: png(Math.round(params.clip.width * dpr), Math.round(params.clip.height * dpr)) } : {});
+      const onTile = vi.fn().mockResolvedValue(undefined);
+      const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, undefined, onTile);
+      expect(result.imageWidth).toBe(width * dpr);
+      expect(result.imageHeight).toBe(height * dpr);
+      expect(result.tileCount).toBeGreaterThan(1);
+      const tiles = onTile.mock.calls.map(([tile]) => tile);
+      expect(new Set(tiles.map(tile => tile.height)).size).toBe(1);
+      expect(tiles[0].height).toBe(dom.viewport.height * dpr);
+      expect(tiles[0].start).toBe(0);
+      expect(tiles.at(-1).end).toBe(result.imageHeight);
+      for (const [index, tile] of tiles.entries()) {
+        expect(tile.width * tile.height).toBeLessThanOrEqual(8_000_000);
+        expect(tile.y).toBeLessThanOrEqual(tile.start);
+        expect(tile.y + tile.height).toBeGreaterThanOrEqual(tile.end);
+        if (index) {
+          expect(tile.start).toBe(tiles[index - 1].end);
+          expect(tile.y).toBeLessThan(tiles[index - 1].y + tiles[index - 1].height);
+        }
+      }
+      expect(captureVisibleTab).not.toHaveBeenCalled();
+      expect(detach).toHaveBeenCalledOnce();
+    });
+  it('bounds unsupported width before requesting a screenshot', async () => {
+    sendCommand.mockResolvedValue({ cssContentSize: { width: 40000, height: 1000 } });
     await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_TOO_LARGE');
     expect(sendCommand).toHaveBeenCalledTimes(1);
+    expect(detach).toHaveBeenCalledOnce();
+  });
+  it('does not continue a long capture after Stop between tiles', async () => {
+    const controller = new AbortController();
+    sendCommand.mockImplementation(async (_target, method, params) => method === 'Page.getLayoutMetrics'
+      ? { cssContentSize: { width: 800, height: 100000 } } : method === 'Page.captureScreenshot'
+        ? { data: png(params.clip.width, params.clip.height) } : {});
+    const onTile = vi.fn().mockImplementation(async () => controller.abort());
+    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, controller.signal, onTile)).rejects.toThrow('STOPPED');
+    expect(onTile).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls.some(([, command]) => command.type === 'FINISH_CAPTURE')).toBe(false);
     expect(detach).toHaveBeenCalledOnce();
   });
   it('rejects invalid PNG dimensions', async () => {
@@ -141,7 +185,7 @@ describe('non-scrolling full-page capture', () => {
     sendCommand.mockReturnValue(new Promise(() => {}));
     const result = observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
     const rejected = expect(result).rejects.toThrow('CAPTURE_FAILED');
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(15_250);
     await rejected;
     expect(detach).toHaveBeenCalledOnce();
   });
@@ -153,5 +197,16 @@ describe('non-scrolling full-page capture', () => {
     await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_FAILED');
     expect(detach).not.toHaveBeenCalled();
     expect(removeListener).toHaveBeenCalledOnce();
+  });
+});
+
+describe('capture tile planning', () => {
+  it('keeps ordinary pages in a single image and bounds extreme aspect ratios', () => {
+    expect(captureTiles(800, 1800)).toEqual([{ y: 0, height: 1800, start: 0, end: 1800 }]);
+    for (const width of [1, 1400, 32767]) for (const tile of captureTiles(width, 50000)) {
+      expect(tile.height).toBeLessThanOrEqual(8192);
+      expect(width * tile.height).toBeLessThanOrEqual(8_000_000);
+    }
+    expect(() => captureTiles(800, Number.MAX_SAFE_INTEGER)).toThrow('CAPTURE_TOO_LARGE');
   });
 });

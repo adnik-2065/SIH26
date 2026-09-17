@@ -45,7 +45,7 @@ The default runs OCR and face detection together. Scan settings lets you turn of
 5. Keep per-detector completion/errors. Add UI results and tests using fictional documents, small/partial images, multiple documents, zoom, blank scenes, failures, and cancellation. Measure recall on held-out layouts; one passing fixture is not sufficient evidence for a privacy gate.
 6. Feed text, face, and document regions into the future privacy stage. Usually the entire ID/card region should be covered. Overlapping face/document masks can be merged; retain the reason/provenance locally. A document detector finds *where a document is*; OCR and sensitive-text rules identify *which text needs protection*.
 
-No trained document detector or extra model runtime is installed by this change.
+The supplied ONNX document detector is integrated separately under `src/vision/documents/`; this MediaPipe adapter remains face-only.
 
 ## Is preprocessing/redaction finished after this?
 
