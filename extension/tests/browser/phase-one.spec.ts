@@ -253,9 +253,24 @@ test('page changes invalidate observations, and Stop prevents delayed results', 
   await portal.getByRole('button', { name: 'Change layout' }).click();
   await expect(panel.getByRole('alert')).toContainText('page or active tab changed');
   await expect(panel.locator('canvas')).toHaveCount(0);
-  await command('OBSERVE'); await readyObservation();
-  await expect(panel.locator('.status')).toHaveText('Analyzing on your device…');
-  await command('STOP');
+  // Hold analysis at image decoding so Stop is tested while work is pending,
+  // even when a warm model can finish before Playwright observes the status.
+  await panel.evaluate(() => {
+    const native = HTMLImageElement.prototype.decode;
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    HTMLImageElement.prototype.decode = async function () { await native.call(this); await pending; };
+    (globalThis as unknown as { releaseDecode: () => void }).releaseDecode = () => {
+      HTMLImageElement.prototype.decode = native; release();
+    };
+  });
+  try {
+    await command('OBSERVE'); await readyObservation();
+    await expect(panel.locator('.status')).toHaveText('Analyzing on your device…');
+    await command('STOP');
+  } finally {
+    await panel.evaluate(() => (globalThis as unknown as { releaseDecode: () => void }).releaseDecode());
+  }
   await expect(panel.locator('canvas')).toHaveCount(0);
   await expect(panel.locator('.ocr-results')).toHaveCount(0);
   await expect(panel.locator('.face-results')).toHaveCount(0);

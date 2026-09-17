@@ -1,10 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { PanelEventSchema, TaskStateSchema, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
+import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
 import { initialState } from '../agent/lifecycle';
 import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
-import { inspectPage } from '../vision/page';
+import { inspectCapturedPage } from '../vision/page';
+import { inspectDocumentTiles, type DocumentEvidence } from '../vision/documents';
+import { OnnxDocumentAdapter } from '../vision/documents/onnx';
+import { PagePreview } from './preview';
+import { PrivacyReview } from '../privacy/review';
 import type { PerceptionResult } from '../vision/contracts';
 import './styles.css';
 
@@ -13,7 +17,7 @@ const messages: Record<ErrorCode, string> = {
   PAGE_CHANGED: 'The page or active tab changed. Observe again to read the updated page.',
   STOPPED: 'Stopped. The screenshot and detections have been cleared.',
   CAPTURE_FAILED: 'Could not capture a stable page. Click the extension icon on this tab, wait for the page to settle, and try again.',
-  CAPTURE_TOO_LARGE: 'This page is too large to scan safely at this zoom. Zoom out and scan again.',
+  CAPTURE_TOO_LARGE: 'This page exceeds the local scan capacity. Try narrowing the page content and scan again.',
   INVALID_MESSAGE: 'A component returned an invalid message.', BUSY: 'An observation is already running.',
   RESTARTED: 'The background worker restarted. Observe again to capture a fresh view.',
 };
@@ -34,6 +38,9 @@ function App() {
   const [faces, setFaces] = useState<PerceptionResult>();
   const [faceBusy, setFaceBusy] = useState(false);
   const [faceError, setFaceError] = useState('');
+  const [documents, setDocuments] = useState<DocumentEvidence>();
+  const [documentBusy, setDocumentBusy] = useState(false);
+  const [documentError, setDocumentError] = useState('');
   const [showFaces, setShowFaces] = useState(true);
   const [selectedFace, setSelectedFace] = useState<number>();
   const [resultTab, setResultTab] = useState<'text' | 'faces'>('text');
@@ -50,20 +57,23 @@ function App() {
   const adapterRef = useRef<TesseractAdapter | null>(null);
   const ocrSectionRef = useRef({ index: 0, count: 1 });
   const faceAdapterRef = useRef<MediaPipeAdapter | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const documentAdapterRef = useRef<OnnxDocumentAdapter | null>(null);
+  const captureTilesRef = useRef<CaptureTile[]>([]);
+  const [captureProgress, setCaptureProgress] = useState<{ index: number; count: number }>();
   const stopPending = useRef(false);
 
   const clearDetections = () => {
     controllerRef.current?.abort();
     setFaces(undefined); setFaceBusy(false); setFaceError(''); setSelectedFace(undefined); setQuery('');
+    setDocuments(undefined); setDocumentBusy(false); setDocumentError('');
     setOcr(undefined); setOcrBusy(false); setProgress(undefined); setOcrError(''); setSelected(undefined);
   };
   const applyState = (next: TaskState) => {
     if (next.generation !== stateRef.current.generation || next.observationId !== stateRef.current.observationId || next.status === 'stopped') {
-      clearDetections(); setObservation(undefined);
+      clearDetections(); setObservation(undefined); captureTilesRef.current = []; setCaptureProgress(undefined);
     }
     stateRef.current = next; setState(next);
-    if (next.status === 'stopped') { adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); setInstruction(''); }
+    if (next.status === 'stopped') { adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setInstruction(''); }
   };
 
   useEffect(() => {
@@ -74,14 +84,29 @@ function App() {
       const event = parsed.data;
       if (event.state.generation < stateRef.current.generation) return;
       applyState(event.state);
-      if (event.type === 'OBSERVATION' && previewRef.current && !stopPending.current) setObservation(event.observation);
+      if (event.type === 'CAPTURE_TILE' && !stopPending.current) {
+        setCaptureProgress({ index: event.index + 1, count: event.count });
+        if (previewRef.current) captureTilesRef.current[event.index] = event.tile;
+      }
+      if (event.type === 'OBSERVATION') {
+        const tiles = captureTilesRef.current;
+        captureTilesRef.current = []; setCaptureProgress(undefined);
+        if (previewRef.current && !stopPending.current) {
+          const info = event.observation;
+          if (tiles.length !== info.tileCount || Array.from({ length: info.tileCount }, (_, i) => tiles[i]).some((tile, i) =>
+            !tile || tile.width !== info.imageWidth || tile.start !== (i ? tiles[i - 1]?.end : 0)) || tiles.at(-1)?.end !== info.imageHeight) {
+            setError(messages.CAPTURE_FAILED); return;
+          }
+          setObservation({ ...info, tiles });
+        }
+      }
     };
     chrome.runtime.onMessage.addListener(listener);
     void chrome.runtime.sendMessage({ type: 'STATUS' }).then(reply => {
       const parsed = TaskStateSchema.safeParse(reply?.state);
       if (parsed.success && parsed.data.generation >= stateRef.current.generation) applyState(parsed.data);
     }).catch(() => setError('Reload the extension and open the panel again.'));
-    const dispose = () => { controllerRef.current?.abort(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); };
+    const dispose = () => { controllerRef.current?.abort(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); };
     window.addEventListener('pagehide', dispose);
     return () => { chrome.runtime.onMessage.removeListener(listener); window.removeEventListener('pagehide', dispose); dispose(); };
   }, []);
@@ -100,22 +125,18 @@ function App() {
       setProgress(p.status === 'recognizing text' ? { ...p, progress: (index + p.progress) / count } : p);
     });
     faceAdapterRef.current ??= new MediaPipeAdapter();
-    const image = new Image();
-    image.src = observation.screenshot;
-    const decoded = image.decode();
-    // Both pipelines share the decoded source, but transfer separate small crops.
+    documentAdapterRef.current ??= new OnnxDocumentAdapter();
+    // Decode only the current capture tile in each pipeline.
     const inspect = async (kind: 'text' | 'face') => {
       try {
-        await decoded;
         if (!current()) return;
         const adapter = kind === 'text' ? adapterRef.current! : faceAdapterRef.current!;
         const update = (result: PerceptionResult) => { if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); } };
-        const result = await inspectPage(image, observation.imageWidth, observation.imageHeight,
-          observation.dom.viewport.height * observation.imageHeight / observation.captureBounds.height,
-          observation.dom.observationId, adapter, controller.signal, update,
+        const result = await inspectCapturedPage(observation, adapter, controller.signal, update,
           (index, count) => { if (kind === 'text') ocrSectionRef.current = { index, count }; });
         if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); }
       } catch (reason) {
+
         if (current()) {
           if (kind === 'text') setOcrError(ocrErrors[reason instanceof Error ? reason.message : ''] || 'Text reading failed. Retry the scan, or rebuild and reload the extension.');
           else setFaceError(reason instanceof Error && reason.message === 'FACE_TIMEOUT' ? 'Face detection took too long. Retry with a smaller browser window.' : 'Face detection failed. Retry the scan, or rebuild and reload the extension.');
@@ -124,52 +145,22 @@ function App() {
         if (current()) { if (kind === 'text') setOcrBusy(false); else setFaceBusy(false); }
       }
     };
-    void Promise.allSettled([inspect('text'), inspect('face')]).then(() => { image.src = ''; });
+    setDocumentBusy(true); setDocuments(undefined); setDocumentError('');
+    const inspectDocuments = async () => {
+      try {
+        const result = await inspectDocumentTiles(observation, documentAdapterRef.current!, controller.signal);
+        if (current()) setDocuments(result);
+      } catch (reason) {
+        if (current()) setDocumentError(reason instanceof Error && reason.message === 'VISION_TIMEOUT' ? 'Document scan took too long. Retry the scan.' : 'Document detection failed. Retry the scan or rebuild the extension.');
+      } finally { if (current()) setDocumentBusy(false); }
+    };
+    void Promise.allSettled([inspect('text'), inspect('face'), inspectDocuments()]);
     return () => controller.abort();
   }, [observation, retry]);
 
-  useEffect(() => {
-    if (!observation || !canvasRef.current) return;
-    const canvas = canvasRef.current;
-    let cancelled = false;
-    const image = new Image();
-    image.onload = () => {
-      if (cancelled) return;
-      canvas.width = observation.imageWidth; canvas.height = observation.imageHeight;
-      const context = canvas.getContext('2d'); if (!context) return;
-      context.drawImage(image, 0, 0);
-      const vp = observation.dom.viewport;
-      const sx = canvas.width / observation.captureBounds.width, sy = canvas.height / observation.captureBounds.height;
-      context.lineWidth = Math.max(2, sx * 2); context.font = `${12 * sx}px sans-serif`;
-      if (showControls) for (const [i, element] of observation.dom.elements.entries()) {
-        const box = element.bounds;
-        context.strokeStyle = element.disabled ? '#c77a13' : '#16816a'; context.fillStyle = context.strokeStyle;
-        const x = (box.x + vp.scrollX - vp.offsetX) * sx, y = (box.y + vp.scrollY - vp.offsetY) * sy;
-        context.strokeRect(x, y, box.width * sx, box.height * sy);
-        context.fillText(String(i + 1), x + 3, y + 13 * sy);
-      }
-      if (showFaces && faces?.observationId === observation.dom.observationId) for (const [i, region] of faces.regions.entries()) {
-        const b = region.bounds;
-        context.strokeStyle = '#e44e70'; context.lineWidth = selectedFace === i ? 4 : 2;
-        context.strokeRect(b.x, b.y, b.width, b.height);
-        if (selectedFace === i) { context.fillStyle = '#e44e7022'; context.fillRect(b.x, b.y, b.width, b.height); }
-        context.fillStyle = '#be2448'; context.fillText(`Face ${i + 1}`, b.x, Math.max(14, b.y - 5));
-      }
-      if (showText && ocr?.observationId === observation.dom.observationId) for (const [i, region] of ocr.regions.entries()) {
-        const b = region.bounds;
-        context.strokeStyle = selected === i ? '#b34408' : '#5d4bdd';
-        context.lineWidth = selected === i ? 3 : 1.5;
-        context.strokeRect(b.x, b.y, b.width, b.height);
-        if (selected === i) { context.fillStyle = '#ffc35d55'; context.fillRect(b.x, b.y, b.width, b.height); }
-      }
-    };
-    image.src = observation.screenshot;
-    return () => { cancelled = true; image.src = ''; canvas.width = 0; canvas.height = 0; };
-  }, [observation, ocr, faces, selected, selectedFace, showControls, showText, showFaces]);
-
   async function command(type: 'START' | 'OBSERVE' | 'STOP') {
-    setError('');
-    if (type === 'STOP') { stopPending.current = true; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); setObservation(undefined); }
+    setError(''); captureTilesRef.current = []; setCaptureProgress(undefined);
+    if (type === 'STOP') { stopPending.current = true; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
     else { stopPending.current = false; clearDetections(); setObservation(undefined); }
     try {
       const response = await chrome.runtime.sendMessage(type === 'START' ? { type, instruction: instruction.trim() || 'Read visible page text' } : { type });
@@ -179,9 +170,9 @@ function App() {
     } catch { setError('The extension disconnected. Reload it and reopen the panel.'); }
   }
 
-  const busy = state.status === 'observing' || ocrBusy || faceBusy;
-  const complete = !!ocr && !!faces && !ocrBusy && !faceBusy && !ocrError && !faceError;
-  const status = state.status === 'observing' ? 'Capturing full page…' : ocrBusy || faceBusy ? 'Analyzing on your device…' : ocrError || faceError ? 'Scan needs attention' : complete ? 'Scan ready to review' : state.status === 'stopped' ? 'Stopped' : state.error ? 'A fresh capture is needed' : state.observationId ? 'Observation ready' : 'Ready to capture';
+  const busy = state.status === 'observing' || ocrBusy || faceBusy || documentBusy;
+  const complete = !!ocr && !!faces && !!documents && !ocrBusy && !faceBusy && !documentBusy && !ocrError && !faceError && !documentError;
+  const status = state.status === 'observing' ? 'Capturing full page…' : busy ? 'Analyzing on your device…' : ocrError || faceError || documentError ? 'Scan needs attention' : complete ? 'Scan ready to review' : state.status === 'stopped' ? 'Stopped' : state.error ? 'A fresh capture is needed' : state.observationId ? 'Observation ready' : 'Ready to capture';
   const recognizing = progress?.status === 'recognizing text';
   const filteredWords = ocr?.regions.map((region, index) => ({ region, index })).filter(({ region }) => region.text?.toLowerCase().includes(query.toLowerCase())) ?? [];
   return <main>
@@ -194,26 +185,26 @@ function App() {
         <li className={complete ? 'complete' : ocrBusy || faceBusy ? 'active' : ''}><span className="node-icon">⌘</span><strong>Detect</strong><small>Text + faces</small></li>
         <li className={complete ? 'active' : ''}><span className="node-icon">≡</span><strong>Review</strong><small>Local results</small></li>
       </ol>
-      <div className="engine-list"><div><span className="engine-icon text-icon">Aa</span><span><strong>Text recognition</strong><small>Tesseract · English</small></span><span className={`engine-state ${ocrError ? 'failed' : ''}`}>{ocrBusy ? 'Reading…' : ocrError ? 'Failed' : ocr ? `${ocr.regions.length} words` : 'Ready'}</span></div><div><span className="engine-icon face-icon">◎</span><span><strong>Face detection</strong><small>MediaPipe · BlazeFace</small></span><span className={`engine-state ${faceError ? 'failed' : ''}`}>{faceBusy ? 'Detecting…' : faceError ? 'Failed' : faces ? `${faces.regions.length} ${faces.regions.length === 1 ? 'face' : 'faces'}` : 'Ready'}</span></div></div>
+      <div className="engine-list"><div><span className="engine-icon text-icon">Aa</span><span><strong>Text recognition</strong><small>Tesseract · English</small></span><span className={`engine-state ${ocrError ? 'failed' : ''}`}>{ocrBusy ? 'Reading…' : ocrError ? 'Failed' : ocr ? `${ocr.regions.length} words` : 'Ready'}</span></div><div><span className="engine-icon face-icon">◎</span><span><strong>Face detection</strong><small>MediaPipe · BlazeFace</small></span><span className={`engine-state ${faceError ? 'failed' : ''}`}>{faceBusy ? 'Detecting…' : faceError ? 'Failed' : faces ? `${faces.regions.length} ${faces.regions.length === 1 ? 'face' : 'faces'}` : 'Ready'}</span></div><div><span className="engine-icon face-icon">▧</span><span><strong>Document detection</strong><small>ONNX · local model</small></span><span className={`engine-state ${documentError ? 'failed' : ''}`}>{documentBusy ? 'Detecting…' : documentError ? 'Failed' : documents ? `${documents.regions.length} regions` : 'Ready'}</span></div></div>
       <details className="task-details"><summary>Scan settings</summary><label className="check"><input type="checkbox" checked={preview} onChange={e => {
         previewRef.current = e.target.checked; setPreview(e.target.checked);
-        if (!e.target.checked) { clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); setObservation(undefined); }
+        if (!e.target.checked) { captureTilesRef.current = []; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); setObservation(undefined); }
       }} />Analyze text and faces locally</label><p className="hint">Turning this off clears the screenshot and detections. Capture will collect page controls only.</p><label htmlFor="instruction">Optional observation note</label><textarea id="instruction" maxLength={2000} value={instruction} onChange={e => setInstruction(e.target.value)} placeholder="What are you inspecting?" /><p className="hint">Kept locally. This note does not change detection.</p></details>
       <div className="actions"><button className="primary" disabled={busy} onClick={() => void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE')}><span aria-hidden="true">▶</span> {busy ? 'Scanning…' : state.taskId && state.status !== 'stopped' ? 'Scan again' : 'Scan current page'}</button><button className="stop" onClick={() => void command('STOP')}>Stop</button></div>
       <div className="status" role="status" aria-live="polite"><span className={`dot ${busy ? 'observing' : complete ? 'paused' : state.status}`} />{status}</div>
       {state.origin && <p className="origin">{state.origin}</p>}
-      {(error || state.error) && <p role="alert" className="notice">{error || (state.error && messages[state.error])}</p>}
+      {(error || state.error || documentError) && <p role="alert" className="notice">{error || documentError || (state.error && messages[state.error])}</p>}
+      {state.status === 'observing' && captureProgress && captureProgress.count > 1 && <div className="progress"><div className="progress-label"><span>Capturing full page</span><span>{Math.round(captureProgress.index / captureProgress.count * 100)}%</span></div><progress aria-label="Capture progress" max={captureProgress.count} value={captureProgress.index} /></div>}
       {ocrBusy && <div className="progress"><div className="progress-label"><span>{recognizing ? 'Reading English text' : 'Loading text engine'}</span>{recognizing && <span>{Math.round(progress.progress * 100)}%</span>}</div><progress aria-label="OCR progress" max={1} value={recognizing ? progress.progress : undefined} /></div>}
       {state.observationId && !preview && <p className="hint">Page controls captured. Enable local analysis in Scan settings, then scan again to see text and faces.</p>}
     </section>
-    <aside className="privacy-note"><span aria-hidden="true">◈</span><div><strong>Detection is the first step</strong><p>Screenshots are still unredacted. PII redaction and server export are not enabled.</p></div></aside>
+    <aside className="privacy-note"><span aria-hidden="true">◈</span><div><strong>Local original preview</strong><p>The captured view is unredacted. Prepare a separate redacted export preview below. Server export is not enabled.</p></div></aside>
     {observation && preview ? <>
       <section aria-label="Local observation" className="preview-card">
         <div className="section-heading"><h2>Captured view</h2><span className="tag">Original · local</span></div>
         <div className="overlay-options"><label className="check"><input type="checkbox" checked={showText} onChange={e => setShowText(e.target.checked)} />Text</label><label className="check face-toggle"><input type="checkbox" checked={showFaces} onChange={e => setShowFaces(e.target.checked)} />Faces</label><label className="check"><input type="checkbox" checked={showControls} onChange={e => setShowControls(e.target.checked)} />Controls</label><label className="check"><input type="checkbox" checked={fullSize} onChange={e => setFullSize(e.target.checked)} />Full size</label></div>
-        <div className={`preview-scroll ${fullSize ? 'full-size' : ''}`}><canvas ref={canvasRef} aria-label="Local screenshot with text and face bounding boxes" onClick={event => {
-          const canvas = event.currentTarget, rect = canvas.getBoundingClientRect();
-          const x = (event.clientX - rect.left) * canvas.width / rect.width, y = (event.clientY - rect.top) * canvas.height / rect.height;
+        <PagePreview observation={observation} ocr={ocr} faces={faces} selected={selected} selectedFace={selectedFace}
+          showControls={showControls} showText={showText} showFaces={showFaces} fullSize={fullSize} onSelect={(x, y) => {
           const hit = ({ bounds: b }: PerceptionResult['regions'][number]) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
           const faceIndex = showFaces ? faces?.regions.findIndex(hit) : undefined;
           const textIndex = showText ? ocr?.regions.findIndex(hit) : undefined;
@@ -221,10 +212,11 @@ function App() {
           setSelected(textIndex !== undefined && textIndex >= 0 ? textIndex : undefined);
           if (faceIndex !== undefined && faceIndex >= 0) setResultTab('faces');
           else if (textIndex !== undefined && textIndex >= 0) setResultTab('text');
-        }} /></div>
+        }} />
         <p className="hint legend"><span>● Text</span><span>● Faces</span><span>{observation.imageWidth} × {observation.imageHeight} px</span></p>
         <div className="metrics"><span>Capture<b>{Math.round(observation.captureMs)} ms</b></span><span>Text<b>{ocr ? `${(ocr.elapsedMs / 1000).toFixed(1)} s` : ocrBusy ? 'Reading…' : '—'}</b></span><span>Faces<b>{faces ? faces.elapsedMs < 1000 ? `${Math.round(faces.elapsedMs)} ms` : `${(faces.elapsedMs / 1000).toFixed(1)} s` : faceBusy ? 'Scanning…' : '—'}</b></span></div>
       </section>
+      <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete} currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={adapterRef.current ?? undefined} />
       <section aria-label="Detection results">
         <div className="section-heading"><h2>Detection results</h2><span className="tag">{busy ? 'Running' : complete ? 'Complete' : 'Incomplete'}</span></div>
         {(ocrError || faceError) && <div role="alert" className="notice"><p>{ocrError}</p><p>{faceError}</p><button disabled={busy} onClick={() => setRetry(value => value + 1)}>Retry detection</button></div>}
@@ -247,7 +239,7 @@ function App() {
       </section>
       <details className="technical"><summary>Page controls and capture details</summary><p className="hint">Controls come from the page structure. Coordinates in detection results use original screenshot pixels.</p><p className="hint">DOM: {observation.domMs.toFixed(1)} ms · {observation.dom.hiddenCount} hidden/offscreen controls omitted. {observation.dom.truncated ? 'Control limit reached.' : ''}</p><ol className="elements">{observation.dom.elements.map(el => <li key={el.id}><strong>{el.label || 'Unlabelled control'}</strong><span>{el.role} · {el.type}{el.disabled ? ' · disabled' : ''}</span></li>)}</ol></details>
     </> : <section className="empty-state"><span className="scan-icon" aria-hidden="true">⌗</span><h2>Your next scan starts here</h2><p>Open a webpage and click the extension’s toolbar icon to connect it. Then scan the current view.</p><div className="empty-chips"><span>Text in images</span><span>Faces</span><span>Page controls</span></div></section>}
-    <details className="roadmap"><summary>What’s coming next?</summary><p>Your trained model will add Aadhaar, PAN, passport, card, and document regions alongside these detectors. Text and pixel redaction will then prepare safe context for the server.</p><span className="tag">Planned · not active</span></details>
+    <details className="roadmap"><summary>What’s coming next?</summary><p>Your trained model will add Aadhaar, PAN, passport, card, and document regions to local redaction. Server transport and browser actions remain future work.</p><span className="tag">Planned · not active</span></details>
     <footer><span className="privacy-dot" />On-device processing · Nothing sent to a server</footer>
   </main>;
 }

@@ -86,15 +86,26 @@ for (const zoom of [1, 1.25]) test(`scan details through the actual browser side
     const originalGutter = await portal.evaluate(() => getComputedStyle(document.documentElement).scrollbarGutter);
     const results: Array<{ scenario: string; metrics: string }> = [];
     const scan = async (scenario: string, faceCount: number) => {
+      await portal.evaluate(() => {
+        const events: unknown[] = [];
+        (window as unknown as { captureEvents: unknown[] }).captureEvents = events;
+        for (const type of ['resize', 'scroll']) window.addEventListener(type, () => events.push({ type, w: innerWidth, h: innerHeight, y: scrollY }), true);
+      });
       const before = await worker.evaluate(async () => (await chrome.storage.session.get('task')).task.generation);
       await expect.poll(() => panel<boolean>('document.querySelector(".primary")?.disabled')).toBe(false);
       await panel('document.querySelector(".primary").click()');
       await expect.poll(async () => worker.evaluate(async () => (await chrome.storage.session.get('task')).task.generation)).toBeGreaterThan(before);
-      await expect.poll(async () => worker.evaluate(async () => (await chrome.storage.session.get('task')).task.status)).not.toBe('observing');
+      await expect.poll(async () => worker.evaluate(async () => (await chrome.storage.session.get('task')).task.status), { timeout: 60_000 }).not.toBe('observing');
       const state = await worker.evaluate(async () => (await chrome.storage.session.get('task')).task);
       const diagnostics = await worker.evaluate(() => (globalThis as unknown as { scanDiagnostics: unknown[] }).scanDiagnostics);
       expect(state.error, JSON.stringify({ scenario, state, diagnostics })).toBeUndefined();
-      await expect.poll(() => panel<string>('document.querySelector(".status")?.textContent'), { timeout: 90_000 }).toContain('Scan ready to review');
+      await expect.poll(() => panel<string>('document.querySelector(".status")?.textContent'), { timeout: 90_000 }).toMatch(/Scan ready to review|A fresh capture is needed|Scan needs attention/);
+      const status = await panel<string>('document.querySelector(".status")?.textContent');
+      expect(status, JSON.stringify({ scenario,
+        events: await portal.evaluate(() => (window as unknown as { captureEvents: unknown[] }).captureEvents.slice(-8)),
+        diagnostics: (await worker.evaluate(() => (globalThis as unknown as { scanDiagnostics: unknown[] }).scanDiagnostics)).slice(-10),
+        state: await worker.evaluate(async () => (await chrome.storage.session.get('task')).task),
+      })).toContain('Scan ready to review');
       // OCR may split an email into neighboring words at different zoom levels.
       expect((await panel<string>('Array.from(document.querySelectorAll(".ocr-results strong"), word => word.textContent).join("")')).replace(/\s+/g, '')).toContain('student@example.test');
       expect(await panel<number>('document.querySelectorAll(".face-results li").length')).toBe(faceCount);
@@ -108,7 +119,7 @@ for (const zoom of [1, 1.25]) test(`scan details through the actual browser side
     await test.step('read a deferred portrait and text below the fold without scrolling', async () => {
       await portal.evaluate(() => {
         const section = document.createElement('section');
-        section.style.cssText = 'padding-top:2500px;background:white;color:black';
+        section.style.cssText = 'padding-top:37000px;background:white;color:black';
         section.innerHTML = '<p style="font:32px Arial">EndOfFacultyList</p><img loading="lazy" src="/assets/synthetic-face.png" width="220" height="220">';
         document.body.append(section);
         document.querySelector<HTMLInputElement>('#name')!.focus({ preventScroll: true });

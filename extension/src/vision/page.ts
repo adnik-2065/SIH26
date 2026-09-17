@@ -1,4 +1,5 @@
 import type { PerceptionAdapter, PerceptionResult } from './contracts';
+import type { LocalObservation } from '../contracts';
 
 // Ownership bands do not overlap, but their image crops do. This preserves
 // words/faces at a seam while assigning each detection to one band only.
@@ -38,6 +39,42 @@ export async function inspectPage(image: HTMLImageElement, width: number, height
     onPartial({ observationId, source: 'model', regions: [...regions], elapsedMs });
     // Allow paint and input between sections; there is no fixed capture delay.
     if (index + 1 < sections.length) await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return { observationId, source: 'model', regions, elapsedMs };
+}
+
+export async function inspectCapturedPage(observation: LocalObservation, adapter: PerceptionAdapter, signal: AbortSignal,
+  onPartial: (result: PerceptionResult) => void,
+  onSection: (index: number, count: number) => void = () => {}): Promise<PerceptionResult> {
+  const { tiles, dom: { observationId } } = observation;
+  const viewportHeight = observation.dom.viewport.height * observation.imageHeight / observation.captureBounds.height;
+  const counts = tiles.map(tile => pageSections(tile.width, tile.height, viewportHeight).length);
+  const count = counts.reduce((sum, value) => sum + value, 0);
+  const regions: PerceptionResult['regions'] = [];
+  let elapsedMs = 0, completedSections = 0;
+  for (const [index, tile] of tiles.entries()) {
+    if (signal.aborted) throw new Error('STOPPED');
+    const image = new Image();
+    const release = () => { image.src = ''; };
+    signal.addEventListener('abort', release, { once: true });
+    try {
+      image.src = tile.screenshot;
+      await image.decode();
+      const translate = (result: PerceptionResult) => result.regions.flatMap(region => {
+        const bounds = { ...region.bounds, y: region.bounds.y + tile.y };
+        const center = bounds.y + bounds.height / 2;
+        return center >= tile.start && center < tile.end ? [{ ...region, bounds }] : [];
+      });
+      const result = await inspectPage(image, tile.width, tile.height, viewportHeight, observationId, adapter, signal,
+        partial => onPartial({ observationId, source: 'model', regions: [...regions, ...translate(partial)], elapsedMs: elapsedMs + partial.elapsedMs }),
+        section => onSection(completedSections + section, count));
+      regions.push(...translate(result));
+      elapsedMs += result.elapsedMs;
+      completedSections += counts[index];
+    } finally {
+      signal.removeEventListener('abort', release);
+      release();
+    }
   }
   return { observationId, source: 'model', regions, elapsedMs };
 }

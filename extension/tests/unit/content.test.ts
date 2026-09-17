@@ -10,6 +10,7 @@ beforeEach(async () => {
   vi.resetModules(); handlers.clear(); sendMessage.mockClear(); sendMessage.mockResolvedValue(undefined);
   vi.stubGlobal('__sih26Installed', undefined);
   vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 600); vi.stubGlobal('devicePixelRatio', 1);
+  vi.stubGlobal('scrollX', 0); vi.stubGlobal('scrollY', 0);
   vi.stubGlobal('visualViewport', undefined);
   vi.stubGlobal('window', { addEventListener: (event: string, callback: () => void) => handlers.set(event, callback) });
   vi.stubGlobal('document', { documentElement: {}, querySelectorAll: () => [] });
@@ -55,6 +56,55 @@ describe('capture viewport tracking', () => {
   it('never suppresses DOM mutations during capture', () => {
     command('PREPARE_CAPTURE'); command('COLLECT'); mutated();
     expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])('preserves the notice inset across Stop and immediate restart (native reset: %s)', reset => {
+    command('PREPARE_CAPTURE');
+    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
+    command('COLLECT');
+    if (reset) {
+      vi.stubGlobal('innerWidth', 1); vi.stubGlobal('innerHeight', 1); handlers.get('resize')!();
+    }
+    command('RELEASE');
+    vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
+    command('PREPARE_CAPTURE'); command('COLLECT'); command('FINISH_CAPTURE');
+    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
+    expect(sendMessage).not.toHaveBeenCalled();
+    vi.stubGlobal('innerHeight', 700); handlers.get('resize')!();
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it('separates the sidebar opening inset from the debugging notice height', () => {
+    command('PREPARE_CAPTURE');
+    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
+    vi.stubGlobal('innerWidth', 640); vi.stubGlobal('innerHeight', 536); handlers.get('resize')!();
+    command('COLLECT'); command('FINISH_CAPTURE');
+    vi.stubGlobal('innerHeight', 592); handlers.get('resize')!();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+  it('allows only the native 1×1 reset and exact return during capture', () => {
+    command('PREPARE_CAPTURE'); command('COLLECT');
+    vi.stubGlobal('innerWidth', 1); vi.stubGlobal('innerHeight', 1); handlers.get('resize')!();
+    vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
+    expect(sendMessage).not.toHaveBeenCalled();
+    vi.stubGlobal('innerWidth', 900); handlers.get('resize')!();
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it.each(['animationstart', 'transitionrun'])('allows native capture CSS %s while motion is paused, then resumes tracking', event => {
+    command('PREPARE_CAPTURE'); command('COLLECT'); handlers.get(event)!();
+    expect(sendMessage).not.toHaveBeenCalled();
+    command('FINISH_CAPTURE'); handlers.get(event)!();
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it('does not add a previous notice height after the viewport already restored but its resize event is still queued', () => {
+    command('PREPARE_CAPTURE');
+    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
+    command('COLLECT'); command('FINISH_CAPTURE'); command('RELEASE');
+    vi.stubGlobal('innerHeight', 600);
+    command('PREPARE_CAPTURE');
+    handlers.get('resize')!();
+    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
+    command('COLLECT'); command('FINISH_CAPTURE');
+    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
   it('tracks notice restoration across a zoom change between scans', () => {
     command('PREPARE_CAPTURE');

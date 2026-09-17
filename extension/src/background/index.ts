@@ -39,7 +39,13 @@ function launch(snapshot: TaskState) {
   if (!taskId || tabId === undefined || windowId === undefined || !origin || !observationId) return;
   const check = () => { if (!acceptsResult(state, taskId, generation)) throw new Error('STOPPED'); };
   captureController = new AbortController();
-  const capture = observeTab(tabId, windowId, origin, observationId, check, captureController.signal);
+  const capture = observeTab(tabId, windowId, origin, observationId, check, captureController.signal, async (tile, index, count) => {
+    check();
+    // Await delivery of each bounded image instead of sending the entire page
+    // in one message. The panel commits only after the final stability check.
+    await chrome.runtime.sendMessage({ type: 'CAPTURE_TILE', state: snapshot, tile, index, count });
+    check();
+  });
   captureDone = capture;
   void capture.then(observation => serial(async () => {
     check();
