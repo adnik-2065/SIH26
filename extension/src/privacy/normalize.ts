@@ -2,7 +2,8 @@ import type { Rect } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
 import { canonical, classify } from './classify';
 import { LIMITS, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
-import { domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
+import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
+import { controlIsMasked } from './policy';
 import { Placeholders, sanitizeText } from './text';
 
 export function reconstructOcr(regions: PerceptionResult['regions']) {
@@ -34,6 +35,7 @@ export function reconstructOcr(regions: PerceptionResult['regions']) {
 export function normalize(data: ExportData, placeholders: Placeholders) {
   const { observation } = data, { imageWidth: width, imageHeight: height } = observation;
   const textPolicy = data.ocrTextPolicy ?? 'all_text';
+  const controlPadding = textPolicy === 'all_text' ? DEFAULT_PADDING : { ...DEFAULT_PADDING, document: 2 };
   const findings: Finding[] = [], masks: Mask[] = [];
   const append = (finding: Finding) => {
     // Suppress repeated normal/compact OCR and DOM/OCR findings only when
@@ -55,9 +57,13 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     result.findings.forEach(finding => append({ ...finding, bounds, elementId: element.id }));
     if (element.sensitive || /password|otp|token|secret/i.test(element.type)) append({ id: 'pending', source: 'dom', kind: 'password',
       confidence: 1, bounds, elementId: element.id, exportPolicy: 'withhold', redactText: true, redactPixels: true });
-    // Control values are intentionally absent from DOM metadata. Mask every
-    // control, including ordinary filled name/address fields and placeholders.
-    masks.push(paddedMask(bounds, 'document', width, height));
+    // Control values are intentionally absent from DOM metadata, so a control
+    // that holds input is masked on the strength of that fact alone. Empty
+    // boxes, buttons and links keep their pixels: blanking them removed the
+    // whole form, and its visible labels, without hiding any private value.
+    // Context mode also trims the document padding: 8px around each of a stack
+    // of form rows bridges the gaps and re-creates the single black slab.
+    if (controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
     const roles = ['textbox', 'combobox', 'button', 'checkbox', 'radio', 'link', 'spinbutton', 'slider', 'listbox', 'switch'];
     return { id: element.id, role: roles.includes(element.role) ? element.role : 'control',
       description: element.sensitive || element.label.length >= 200 || /password|otp|token|secret/i.test(element.type) ? 'Sensitive field' : result.sanitized || 'Unlabelled control' };

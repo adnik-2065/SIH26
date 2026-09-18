@@ -80,6 +80,27 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
   void serial(async () => {
     const command = parsed.data;
     if (command.type === 'STOP') await pause('STOPPED', 'stopped');
+    if (command.type === 'ACT') {
+      // The panel already validated the server's proposal. The worker repeats
+      // the checks it alone owns: the same tab, the same origin, and a settled
+      // observation that is still the current one. `paused` is the state a
+      // finished capture rests in; invalidation drops the observation id, so a
+      // page that moved can no longer be matched here at all.
+      if (state.status !== 'paused' || state.tabId === undefined || command.observationId !== state.observationId) return { ok: false, error: 'PAGE_CHANGED', state };
+      const tab = await chrome.tabs.get(state.tabId).catch(() => undefined);
+      if (!tab?.url || new URL(tab.url).origin !== state.origin) return { ok: false, error: 'PAGE_CHANGED', state };
+      // A wait never reaches the page; holding it here keeps the content
+      // script's element map untouched while time passes.
+      if (command.action.type === 'wait') {
+        await new Promise(resolve => setTimeout(resolve, command.action.type === 'wait' ? command.action.milliseconds : 0));
+        return { ok: true, state };
+      }
+      const forwarded = { type: 'ACT' as const, observationId: command.observationId, action: command.action,
+        resolved: command.resolved, expect: command.expect };
+      const result = await chrome.tabs.sendMessage(state.tabId, forwarded, { frameId: 0 }).catch(() => ({ error: 'PAGE_CHANGED' as const }));
+      if (result?.error) { if (result.error === 'PAGE_CHANGED') await pause('PAGE_CHANGED'); return { ok: false, error: result.error, state }; }
+      return { ok: true, state };
+    }
     if (command.type === 'START' || command.type === 'OBSERVE') {
       if (state.status === 'observing') return { ok: false, error: 'BUSY', state };
       const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });

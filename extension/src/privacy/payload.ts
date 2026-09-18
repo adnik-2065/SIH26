@@ -26,7 +26,13 @@ export function finalCheck(candidate: unknown, knownValues: string[], originals:
       const identifier = /(?:^|\.)(?:id|target|requestId|taskId|observationId)$/.test(path);
       if (identifier && !opaqueIdentifier(value)) throw new PrivacyError('RAW_DATA_LEAK');
       if (containsLeak(value, knownValues, identifier) || vault?.hasLeak(value)) throw new PrivacyError('RAW_DATA_LEAK');
-      if (!identifier && sanitizeText(value, 'element_description').sanitized !== value) throw new PrivacyError('RAW_DATA_LEAK');
+      // Re-sanitizing must use the policy the field was produced under. The
+      // instruction is exempt from the page-text allowlist because it is the
+      // user's own sentence; checking it with element_description rules rewrites
+      // every word outside the small task vocabulary and reads that rewrite as a
+      // leak, which blocks the payload for an ordinary instruction.
+      const context = path === 'sanitizedInstruction' ? 'instruction' : 'element_description';
+      if (!identifier && sanitizeText(value, context).sanitized !== value) throw new PrivacyError('RAW_DATA_LEAK');
     } else if (Array.isArray(value)) value.forEach((item, i) => scan(item, `${path}.${i}`));
     else if (value && typeof value === 'object') Object.entries(value).forEach(([key, child]) => scan(child, path ? `${path}.${key}` : key));
   };

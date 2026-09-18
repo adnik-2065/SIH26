@@ -1,8 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../src/dom/observe', () => ({ collect: vi.fn().mockReturnValue({}) }));
+vi.mock('../../src/dom/observe', () => ({ collect: vi.fn((_observationId, _documentId, _revision, refs: Map<string, unknown>) => {
+  const reviewed = (globalThis as typeof globalThis & { __reviewedControl?: unknown }).__reviewedControl;
+  if (reviewed) refs.set('obs_e1', reviewed);
+  return {};
+}) }));
 let listener: (command: object, sender: object, reply: () => void) => void;
-let mutated: () => void;
+let mutated: (records: object[]) => void;
+// Minimal stand-ins for the only DOM surface the mutation filter reads.
+const element = () => ({ nodeType: 1, parentElement: null, contains: (_node?: unknown) => false });
+const structural = (target = element()) => ({ type: 'childList', target, addedNodes: [element()], removedNodes: [] });
+const attribute = (target = element(), attributeName?: string) => ({ type: 'attributes', target, attributeName });
+const edited = (target = element()) => ({ type: 'characterData', target });
+// A container that holds the reviewed control, the way <body> holds every
+// control on the page. Only `element.contains(reviewed)` is true for it.
+const reviewedControl = () => (globalThis as typeof globalThis & { __reviewedControl: ReturnType<typeof element> }).__reviewedControl;
+const container = () => ({ nodeType: 1, parentElement: null, contains: (node?: unknown) => node === reviewedControl() });
 const handlers = new Map<string, () => void>();
 const sendMessage = vi.fn().mockResolvedValue(undefined);
 const command = (type: string) => listener(type === 'RELEASE' ? { type } : { type, observationId: 'obs' }, { id: 'extension' }, () => {});
@@ -12,10 +25,12 @@ beforeEach(async () => {
   vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 600); vi.stubGlobal('devicePixelRatio', 1);
   vi.stubGlobal('scrollX', 0); vi.stubGlobal('scrollY', 0);
   vi.stubGlobal('visualViewport', undefined);
+  vi.stubGlobal('__reviewedControl', element());
   vi.stubGlobal('window', { addEventListener: (event: string, callback: () => void) => handlers.set(event, callback) });
   vi.stubGlobal('document', { documentElement: {}, querySelectorAll: () => [] });
+  vi.stubGlobal('Node', { ELEMENT_NODE: 1 });
   vi.stubGlobal('MutationObserver', class {
-    constructor(callback: () => void) { mutated = callback; }
+    constructor(callback: (records: object[]) => void) { mutated = callback; }
     observe() {}
     takeRecords() { return []; }
   });
@@ -54,7 +69,42 @@ describe('capture viewport tracking', () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
   it('never suppresses DOM mutations during capture', () => {
-    command('PREPARE_CAPTURE'); command('COLLECT'); mutated();
+    command('PREPARE_CAPTURE'); command('COLLECT'); mutated([structural()]);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it.each([['text', edited], ['structural', structural], ['attribute', attribute]])('keeps observation through an unrelated %s change after capture', (_name, record) => {
+    // A ticking clock would otherwise retire the observation within a second,
+    // long before the reasoning server has answered.
+    command('COLLECT'); mutated([record()]);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+  it.each([['text', edited], ['structural', structural], ['attribute', attribute]])('retires observation when %s change touches reviewed control', (_name, record) => {
+    command('COLLECT');
+    const reviewed = (globalThis as typeof globalThis & { __reviewedControl: ReturnType<typeof element> }).__reviewedControl;
+    mutated([record(reviewed)]);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  // Regression: a live application appends a toast to <body> and toggles a
+  // class on <html> every few seconds. Both contain every reviewed control, so
+  // counting containment upwards retired the observation before the reasoning
+  // server answered, and every proposed step came back PAGE_CHANGED.
+  it.each([['structural', structural], ['attribute', attribute]])('keeps observation when an unrelated %s change lands on a container of the reviewed control', (_name, record) => {
+    command('COLLECT'); mutated([record(container())]);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+  it('retires observation when the reviewed control itself is detached', () => {
+    command('COLLECT');
+    mutated([{ type: 'childList', target: container(), addedNodes: [], removedNodes: [reviewedControl()] }]);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it('retires observation when a replacement subtree brings the reviewed control with it', () => {
+    command('COLLECT');
+    const replacement = container();
+    mutated([{ type: 'childList', target: container(), addedNodes: [replacement], removedNodes: [] }]);
+    expect(sendMessage).toHaveBeenCalledOnce();
+  });
+  it.each(['src', 'srcset', 'poster'])('retires observation when an unrelated %s change replaces captured pixels', attributeName => {
+    command('COLLECT'); mutated([attribute(element(), attributeName)]);
     expect(sendMessage).toHaveBeenCalledOnce();
   });
   it.each([false, true])('preserves the notice inset across Stop and immediate restart (native reset: %s)', reset => {

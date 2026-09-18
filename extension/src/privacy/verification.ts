@@ -4,14 +4,17 @@ import { classify } from './classify';
 import { PrivacyError, type ExportData, type Finding, type Mask, type StepRequest } from './contracts';
 import { domBounds } from './geometry';
 import { reconstructOcr } from './normalize';
+import { controlIsMasked, visualIsMasked } from './policy';
 
 export function verifyMaskCoverage(data: ExportData, masks: Mask[], findings: Finding[] = []) {
   const ocrBoxes = data.ocrTextPolicy === 'sensitive_only' ? [] : data.ocr.result!.regions;
   const expected = [...ocrBoxes, ...data.faces.result!.regions, ...data.documents.regions].map(r => r.bounds);
   expected.push(...findings.filter(finding => finding.redactPixels && finding.bounds).map(finding => finding.bounds!));
-  expected.push(...data.observation.dom.elements.map(e => domBounds(e.bounds, data.observation)));
+  const policy = data.ocrTextPolicy ?? 'all_text';
+  expected.push(...data.observation.dom.elements.filter(e => controlIsMasked(e, policy))
+    .map(e => domBounds(e.bounds, data.observation)));
   expected.push(...(data.observation.dom.visualRegions ?? [])
-    .filter(r => data.ocrTextPolicy !== 'sensitive_only' || r.category !== 'sensitive_image')
+    .filter(r => visualIsMasked(r.category, policy))
     .map(r => domBounds(r.bounds, data.observation)));
   for (const box of expected) if (!masks.some(({ bounds: b }) => b.x <= box.x && b.y <= box.y &&
     b.x + b.width >= box.x + box.width && b.y + b.height >= box.y + box.height)) throw new PrivacyError('VERIFICATION_FAILED');

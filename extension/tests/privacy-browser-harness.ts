@@ -8,6 +8,8 @@ export { LIMITS } from '../src/privacy/contracts';
 export { fixture } from './privacy-fixture';
 export { inspectDocumentTiles, detectLocalDocuments } from '../src/vision/documents';
 export { collect } from '../src/dom/observe';
+export { act } from '../src/dom/act';
+export { planActions, executableNow } from '../src/agent/protocol';
 
 export function visualFixture(scale = 1, long = false) {
   const data = fixture();

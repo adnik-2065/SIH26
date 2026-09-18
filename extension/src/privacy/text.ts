@@ -36,12 +36,19 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
   // and control characters instead of pretending the rules classified them.
   if ((context !== 'ocr' || ocrPolicy === 'all_text') && /[^\x20-\x7E\n\r\t]/.test(normalized)) throw new PrivacyError('TEXT_WITHHELD');
   const matches = classify(normalized), spans: Span[] = [];
-  if (context !== 'ocr' || ocrPolicy === 'all_text') {
+  // The allowlist below is the answer to untrusted page content: with no NER
+  // model, a word the rules do not recognise cannot be cleared, so it is
+  // withheld. The instruction is different in kind. The user typed it into this
+  // panel to say what to do, so replacing every unrecognised word leaves the
+  // server "[DOCUMENT_1] [DOCUMENT_2] this [DOCUMENT_3] portal" for "login into
+  // this lms portal" — unusable, and no safer, since the sentence is the user's
+  // own and never came off the page. Classified PII is still redacted from it.
+  if (context !== 'instruction' && (context !== 'ocr' || ocrPolicy === 'all_text')) {
     const placeholders = [...normalized.matchAll(placeholderPattern)].map(match => ({ start: match.index!, end: match.index! + match[0].length }));
     for (const match of normalized.matchAll(/[A-Za-z0-9_'-]+/g)) {
       const start = match.index!, end = start + match[0].length;
       if (!safeWords.has(match[0].toLowerCase()) && !placeholders.some(span => start >= span.start && end <= span.end) &&
-        !matches.some(span => start < span.end && end > span.start)) matches.push({ start, end, kind: 'document' });
+        !matches.some(span => start < span.end && end > span.start)) matches.push({ start, end, kind: 'document', unclassified: true });
     }
     matches.sort((a, b) => a.start - b.start || b.end - a.end);
   }
@@ -49,6 +56,8 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
     const last = spans.at(-1);
     if (last && span.start < last.end) {
       last.end = Math.max(last.end, span.end);
+      // A merged span is only unclassified if every part of it was.
+      if (!span.unclassified) last.unclassified = false;
       if (credentialKinds.has(span.kind)) last.kind = span.kind;
       if ((span.confidence ?? 1) > (last.confidence ?? 1)) { last.detector = span.detector; last.confidence = span.confidence; }
     } else spans.push({ ...span });
@@ -61,7 +70,7 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
     findings.push({ id: `finding_${index}`, source: context === 'element_description' ? 'dom' : context === 'ocr' ? 'ocr' : 'instruction',
       kind: span.kind, confidence: span.confidence ?? 1, detector: span.detector ?? 'existing_text_detector',
       textRange: { start: span.start, end: span.end }, text, exportPolicy: credentialKinds.has(span.kind) ? 'withhold' : 'replace',
-      redactText: true, redactPixels: context !== 'instruction' });
+      redactText: true, redactPixels: context !== 'instruction', ...(span.unclassified ? { unclassified: true } : {}) });
     cursor = span.end;
   }
   sanitized += normalized.slice(cursor);

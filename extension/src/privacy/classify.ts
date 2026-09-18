@@ -2,7 +2,11 @@ import { LIMITS, PrivacyError, type PiiKind } from './contracts';
 import { additionalTextCandidates } from './openredaction';
 
 export interface Span { start: number; end: number; kind: PiiKind;
-  detector?: 'existing_text_detector' | 'openredaction'; confidence?: number }
+  detector?: 'existing_text_detector' | 'openredaction'; confidence?: number;
+  // True when nothing classified this span and it is withheld only because the
+  // allowlist could not clear it. Such a span is an absence of clearance, not a
+  // detected value, and must not be treated as a known secret.
+  unclassified?: boolean }
 export const credentialKinds = new Set<PiiKind>(['password', 'otp', 'token', 'api_key']);
 export function canonical(raw: string) {
   if (raw.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
@@ -46,7 +50,12 @@ export function classify(raw: string): Span[] {
   add('date_of_birth', /\b(?:dob|date\s*of\s*birth|born)\s*[:=]?\s*[^\n;,]+/gi);
   add('address', /\b(?:address|resides?\s+at|lives?\s+at)\s*[:=]?\s*[^\n;]+/gi);
   add('person_name', /\b(?:[Nn]ame\s*(?:is|:|=)|[Cc]ontact|[Dd]ear|[Aa]pplicant:)\s+\p{Lu}[\p{L}'-]*(?:\s+\p{Lu}[\p{L}'-]*){0,4}/gu);
-  add('person_name', /\b(?:for|as|to|from|with)\s+\p{Lu}[\p{L}'-]+(?:\s+\p{Lu}[\p{L}'-]+){0,4}/gu);
+  // A capital followed by a lowercase letter: "for Mira Fictional" is a name,
+  // "for CS2201" and "for AI" are an acronym and a course code. Page text does
+  // not rely on this distinction — anything unrecognised there is withheld by
+  // the allowlist regardless — but the instruction is passed through, so an
+  // acronym must not become [PERSON_1] in the middle of it.
+  add('person_name', /\b(?:for|as|to|from|with)\s+\p{Lu}\p{Ll}[\p{L}'-]*(?:\s+\p{Lu}\p{Ll}[\p{L}'-]*){0,4}/gu);
   add('address', /\b\d{1,6}\s+(?:[A-Za-z]+\s+){1,5}(?:street|st|road|rd|lane|ln|avenue|ave|drive|dr)\b[^\n;]*/gi);
   add('date_of_birth', /\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b/g);
   add('passport', /\b[A-Z][0-9]{7}\b/g);

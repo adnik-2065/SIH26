@@ -1,7 +1,7 @@
 # SIH26 — Project context and conversation handoff
 
 **Last updated:** 2026-09-09, Asia/Kolkata.  
-**Current stage:** Phase 1 foundation plus local Tesseract OCR, MediaPipe face detection, the fail-closed redaction pipeline, and the supplied ONNX document detector. AI integration remains future work.
+**Current stage:** Phase 1 foundation, local Tesseract OCR, MediaPipe face detection, the fail-closed redaction pipeline, the supplied ONNX document detector, and an end-to-end round against the hosted reasoning server: observe → detect → redact → send → translate → perform one step.
 **Purpose:** Give a new collaborator or conversation enough context to continue without mistaking plans or mock results for completed features.
 
 This is a dated handoff, not a substitute for inspecting current code. Read this file first, then check the relevant source files and `git status` before making changes. Tests reported here were run during the prior implementation, not rerun merely to create this document.
@@ -133,8 +133,8 @@ Important distinctions:
 - DOM control descriptions omit field values and include a limited sensitive-field marker. This is not a complete PII detector or privacy gateway.
 - The fixture submits only when filled/submitted manually. Its JavaScript prevents network submission and increments a local counter.
 - The mock worker returns predetermined data for a known image. It neither reads pixels nor detects text/faces.
-- The action schemas define message shapes. There is no browser action executor or complete action-authorization validator.
-- A `StepRequestSchema` existing in code does not mean that a sanitized payload builder, privacy check, backend, or network transport exists.
+- An action executor now exists (`extension/src/dom/act.ts`), but it performs one reviewed step at a time against one settled observation. It is not an autonomous loop, and it is not a complete action-authorization validator.
+- A sanitized payload builder, a response translator, and an HTTP transport now exist and are connected to the project's reasoning server. The manifest permits that one origin and no other, so any other endpoint fails closed. The server itself is not in this repository.
 
 ## 6. Source map and implementation details
 
@@ -146,6 +146,10 @@ Important distinctions:
 | [extension/src/ui/main.tsx](../extension/src/ui/main.tsx) | Panel controls, local task text, opt-in screenshot overlay, statuses, and mock fixture button |
 | [extension/src/background/index.ts](../extension/src/background/index.ts) | Chrome messaging, serialized state updates, session metadata, capture coordination, tab events |
 | [extension/src/agent/lifecycle.ts](../extension/src/agent/lifecycle.ts) | State invalidation, generation checks, restart recovery |
+| [extension/src/agent/transport.ts](../extension/src/agent/transport.ts) | Endpoint policy, the default endpoint, the single outbound POST, response size and status handling |
+| [extension/src/agent/wire.ts](../extension/src/agent/wire.ts) | Maps the redacted payload onto the server's `/agent` body and unwraps its reply |
+| [extension/src/agent/protocol.ts](../extension/src/agent/protocol.ts) | Server response translation, target and literal-text policy, one-step-per-observation gating |
+| [extension/src/dom/act.ts](../extension/src/dom/act.ts) | Per-action execution: target re-verification, value writing, pointer and option handling |
 | [extension/src/dom/content.ts](../extension/src/dom/content.ts) | Single injected listener/observer, local element map, page-change notifications |
 | [extension/src/dom/observe.ts](../extension/src/dom/observe.ts) | Visible control collection, labels, bounds, viewport metadata |
 | [extension/src/capture/observe.ts](../extension/src/capture/observe.ts) | Active-tab/origin checks, DOM snapshots, native screenshot, capture pacing and dimension checks |
@@ -157,7 +161,7 @@ Important distinctions:
 | [tests/fixtures/](../tests/fixtures/) | Synthetic portal, scripts, styling, and assets |
 | [extension/tests/](../extension/tests/) | Unit and browser tests; distinct from top-level fixture directory |
 
-Current manifest permissions are `activeTab`, `scripting`, `sidePanel`, and `storage`. There are no external host permissions. The extension's connection policy is `connect-src 'self'`. External backend permissions/configuration must be introduced deliberately with a later approved integration.
+Current manifest permissions are `activeTab`, `scripting`, `sidePanel`, `storage`, and `debugger`. One external host is permitted: `https://awareness-psp-estimates-rising.trycloudflare.com/*`, which is also the only origin in `connect-src`. Any further backend origin must be added to both, deliberately. A Cloudflare quick tunnel changes hostname when it is restarted; the value appears in `manifest.json` and as `DEFAULT_ENDPOINT` in `extension/src/agent/transport.ts`, and both must be updated together.
 
 Task states are `idle`, `observing`, `paused`, `stopped`, and `failed`. A successful single observation is stored as `paused` with an observation ID; the panel can display “Observation ready.” This is not an autonomous planning loop.
 
@@ -178,18 +182,46 @@ These files are build artifacts for future backend compatibility, not a Python b
 
 The future request/response envelope uses `protocolVersion: 1`, `requestId`, `taskId`, and `observationId`. IDs use letters, digits, underscores, and hyphens. Conceptual bracketed tokens in older planning prose, such as `[EMAIL_1]`, are not valid literal IDs under the current schema; use an opaque ID such as `value_email_1`.
 
-Current future action shapes:
+Current action shapes:
 
 | Type | Required arguments beyond `type` |
 | --- | --- |
 | `click` | `target` |
 | `fill` | `target`, `valueRef` |
+| `type` | `target`, `text` (literal, 1–200 characters) |
 | `select` | `target`, `optionRef` |
+| `choose` | `target`, `optionText` (literal, 1–200 characters) |
 | `scroll` | `direction` (`up`/`down`), `pixels` (integer 1–2000) |
 | `wait` | `milliseconds` (integer 1–5000) |
 | `done` | None |
 
-Unknown fields are rejected. Direct private fill values, arbitrary JavaScript, and unrestricted navigation are not accepted action forms. A future safe literal-text fill mechanism, if needed, requires a deliberate contract and policy change.
+Unknown fields are rejected. Direct private fill values, arbitrary JavaScript, and unrestricted navigation are not accepted action forms. `type` and `choose` carry literal server text and were added deliberately for public form content such as a course name or a date. They are refused twice: `literalTextAllowed` in `extension/src/agent/protocol.ts` rejects credential- and PII-shaped text and text aimed at a control the observer marked sensitive, and `sensitiveControl` in `extension/src/dom/observe.ts` refuses the keystroke at execution time regardless of what was planned. Private values still travel only as a `valueRef` resolved from the local vault.
+
+### The end-to-end round
+
+`Run task` in the panel repeats one round at a time, at most `RUN_LIMIT` (8) of them. Each round is a scan the user could have requested by hand:
+
+1. Observe the tab (DOM controls plus a tiled screenshot).
+2. Run OCR, face and document detection locally; a failure in any of them stops the run.
+3. Build the redacted payload through the privacy gateway; a blocked payload stops the run and is never sent.
+4. `POST /agent` with `{ ss, page_info, instruction, problem_context }`, where `ss` is the redacted PNG, `page_info` lists only opaque element ids with redacted labels, and `instruction` is the sanitized instruction.
+5. Translate the reply, perform the single step this observation still permits, and observe again.
+
+A `finish` step, a refused step, a transport failure, or the round cap ends the run.
+
+A server reply is not executed as written. `extension/src/agent/transport.ts` posts the sanitized payload; `planActions` translates each returned step, accepting only an element `id` the payload itself exported and discarding `className`/`xpath`; `executableNow` releases the leading `wait` steps plus a single page-touching step, because performing it retires the observation the user reviewed. The remainder is deferred until the page is scanned again. A refusal of `PAGE_CHANGED` during an automatic run is not a failure: the page simply moved on while the server was thinking, so the run observes again and continues within its round limit.
+
+## Which page changes retire an observation — 2026-09-18
+
+While a capture is running, every mutation still invalidates it: the DOM snapshot and the screenshot must describe one moment or the masks are positioned over pixels that have moved.
+
+Once capture has finished, the question is narrower — is the control the user reviewed still the control that would be acted on, on the page that was reviewed? A mutation retires the observation when it reaches a reviewed control itself or its contents, when a reviewed control is detached, re-parented or replaced, when an image source changes pixels that were reviewed and redacted, or when the change **moves** a reviewed control: after any other mutation burst the reviewed boxes are re-measured, and a drift of more than 2px in any direction retires the observation. Churn that leaves every reviewed control exactly where the user saw it does not.
+
+An *ancestor* of a reviewed control is deliberately not treated as touching it by containment alone — only by what it does to the control's box. This was the cause of a real failure: `touchesReviewed` also counted `target.contains(reviewedControl)`, so appending a notification toast to `<body>` or toggling a class on `<html>` — which every live application does every few seconds — retired the observation while the detectors and the reasoning server were still working. The server answered correctly, the reply translated correctly, and then every step was refused with `PAGE_CHANGED`: on a real site nothing was ever executed. Nothing is lost by the narrower rule, because the executor re-checks connection, visibility, disabled state, reviewed geometry and occlusion against the element at the instant of the action, so an ancestor change that does hide, move or cover the target is still refused there (`TARGET_CHANGED`).
+
+The measurement is what keeps the narrower rule honest: toggling a class on a container that re-orders its children (the fixture's layout toggle) still retires the observation, because the controls move, while a toast pinned to a corner does not.
+
+`extension/tests/browser/execute.spec.ts` runs the whole path through the shipped extension — panel → service worker → content script → page — for both halves of that rule, and `privacy-panel.spec.ts` covers the export lifecycle around it.
 
 The perception interface in `extension/src/vision/contracts.ts` is:
 

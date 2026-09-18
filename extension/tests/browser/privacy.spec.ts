@@ -223,6 +223,25 @@ test('DOM visual metadata covers offscreen containers without copying raw attrib
   expect(evidence.regions!.length).toBeGreaterThanOrEqual(7);
 });
 
+test('the filled flag reports that a control holds input, never the input itself', async ({ page }) => {
+  const elements = await page.evaluate(() => {
+    document.body.innerHTML = `<input id="empty" placeholder="Full name">
+      <input id="typed" value="fictional-typed-secret"><textarea id="blank"></textarea>
+      <input id="unchecked" type="checkbox"><input id="checked" type="checkbox" checked>
+      <select id="chosen"><option selected>fictional-option-secret</option></select>
+      <button id="press">Submit</button><a id="away" href="/next">Next</a>
+      <div id="widget" role="textbox" style="width:120px;height:20px">fictional-widget-secret</div>
+      <div id="idle" role="textbox" style="width:120px;height:20px"></div>`;
+    const refs = new Map<string, HTMLElement>();
+    const snapshot = window.PrivacyHarness.collect('observation', 'document', 0, refs);
+    const named = new Map([...refs].map(([id, element]) => [element.id, snapshot.elements.find(e => e.id === id)!.filled]));
+    return { filled: Object.fromEntries(named), json: JSON.stringify(snapshot) };
+  });
+  expect(elements.filled).toEqual({ empty: false, typed: true, blank: false, unchecked: false, checked: true,
+    chosen: true, press: false, away: false, widget: true, idle: false });
+  for (const raw of ['typed', 'option', 'widget']) expect(elements.json).not.toContain(`fictional-${raw}-secret`);
+});
+
 test('context mode preserves safe page pixels while masking PII; strict mode masks the same OCR line', async ({ page }) => {
   const result = await page.evaluate(async () => {
     const h = window.PrivacyHarness, data = h.visualFixture();

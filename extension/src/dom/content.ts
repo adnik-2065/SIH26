@@ -1,5 +1,6 @@
-import { ContentCommandSchema } from '../contracts';
+import { ContentCommandSchema, type Rect } from '../contracts';
 import { collect } from './observe';
+import { act } from './act';
 import { prepareImages } from './images';
 
 // Reinjection must not add another observer or message listener.
@@ -8,6 +9,9 @@ if (!scope.__sih26Installed) {
   scope.__sih26Installed = true;
   const documentId = crypto.randomUUID();
   const refs = new Map<string, HTMLElement>();
+  // Where each reviewed control was when the observation was collected, in
+  // viewport pixels. Surrounding churn is judged against this.
+  const reviewedRects = new Map<HTMLElement, Rect>();
   let revision = 0;
   let observationId: string | undefined;
   const size = () => `${innerWidth}:${innerHeight}:${devicePixelRatio}:${visualViewport?.scale}:${visualViewport?.offsetLeft}:${visualViewport?.offsetTop}`;
@@ -19,13 +23,76 @@ if (!scope.__sih26Installed) {
   const changed = () => {
     revision++;
     refs.clear();
+    reviewedRects.clear();
     if (observationId) {
       const previous = observationId;
       observationId = undefined;
       void chrome.runtime.sendMessage({ type: 'PAGE_CHANGED', observationId: previous }).catch(() => {});
     }
   };
-  const observer = new MutationObserver(changed);
+  // Does this mutation touch a control the observation actually described? A
+  // reviewed control itself, or something inside it: its label, state or size
+  // may have just changed.
+  //
+  // An ancestor is deliberately not counted. Appending a notification toast to
+  // <body>, or toggling a class on <html>, contains every control on the page
+  // while changing none of them, and live applications do that every few
+  // seconds. Counting containment upwards therefore retired the observation
+  // before the reasoning server could answer, so every proposed step came back
+  // PAGE_CHANGED and nothing was ever performed. An ancestor change that does
+  // move, hide or cover the target is still caught: the executor re-checks
+  // connection, visibility, disabled state, geometry and occlusion against the
+  // reviewed bounds at the instant of the action.
+  const touchesReviewed = (node: Node | null): boolean => {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node as Element : node?.parentElement ?? null;
+    if (!element) return true;
+    for (const ref of refs.values()) if (ref === element || ref.contains(element)) return true;
+    return false;
+  };
+  // Layout settles by fractions of a pixel between reads; a real change to a
+  // container moves its contents by much more than this.
+  const DRIFT = 2;
+  // Did the surrounding change actually move what the user reviewed? A toast
+  // pinned to a corner does not; a container that re-orders, collapses or hides
+  // its children does, and then the reviewed screenshot no longer describes the
+  // page. Hiding a control zeroes its box, which counts as moved.
+  const movedReviewed = () => {
+    for (const [element, rect] of reviewedRects) {
+      const now = element.getBoundingClientRect();
+      if (Math.abs(now.x - rect.x) > DRIFT || Math.abs(now.y - rect.y) > DRIFT ||
+        Math.abs(now.width - rect.width) > DRIFT || Math.abs(now.height - rect.height) > DRIFT) return true;
+    }
+    return false;
+  };
+  // A reviewed control that was itself detached, re-parented or replaced, named
+  // in the record rather than merely surrounded by it.
+  const movesReviewed = (nodes: NodeList): boolean => {
+    for (const node of nodes) {
+      if (node.nodeType !== Node.ELEMENT_NODE) continue;
+      for (const ref of refs.values()) if (node === ref || (node as Element).contains(ref)) return true;
+    }
+    return false;
+  };
+  // Capture remains strict: any mutation can make its DOM snapshot and image
+  // describe different moments. Once capture has finished, however, many live
+  // applications keep changing unrelated badges, timers and notification
+  // containers while the reasoning server is working. Retiring every target
+  // for those changes makes a valid server action impossible to execute.
+  //
+  // After capture, preserve the reviewed element map unless a mutation reaches
+  // a reviewed control itself or its contents, moves one, replaces pixels that
+  // were reviewed, or shifts a reviewed control on the page. The executor still
+  // checks connection, visibility, disabled state, geometry and occlusion at
+  // the instant of the action. Navigation, input, scroll and resize continue to
+  // invalidate through their dedicated listeners below.
+  const significant = (records: MutationRecord[]) => {
+    if (capture && !capture.restoreUntil) return records.length > 0;
+    if (records.some(record => touchesReviewed(record.target) ||
+      record.type === 'childList' && (movesReviewed(record.removedNodes) || movesReviewed(record.addedNodes)) ||
+      record.type === 'attributes' && ['src', 'srcset', 'poster'].includes(record.attributeName || ''))) return true;
+    return records.length > 0 && movedReviewed();
+  };
+  const observer = new MutationObserver(records => { if (significant(records)) changed(); });
   observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
   for (const event of ['input', 'change', 'popstate', 'hashchange', 'pagehide']) {
     window.addEventListener(event, changed, { capture: true, passive: true });
@@ -82,7 +149,7 @@ if (!scope.__sih26Installed) {
     if (sender.id !== chrome.runtime.id) return;
     const parsed = ContentCommandSchema.safeParse(raw);
     if (!parsed.success) { reply({ error: 'INVALID_MESSAGE' }); return; }
-    if (observer.takeRecords().length) changed();
+    if (significant(observer.takeRecords())) changed();
     const command = parsed.data;
     if (command.type === 'PREPARE_CAPTURE') {
       // A quick Scan again can start before Chrome removes the previous notice.
@@ -121,11 +188,24 @@ if (!scope.__sih26Installed) {
       }
       imagePreparation?.abort(); refs.clear(); observationId = undefined; capture = undefined; reply({ ok: true }); return;
     }
+    if (command.type === 'ACT') {
+      // takeRecords above already cleared the map for any pending mutation, so
+      // an action can only run against the exact page state that was reviewed.
+      if (observationId !== command.observationId) { reply({ error: 'PAGE_CHANGED' }); return; }
+      reply(act({ action: command.action, refs, expect: command.expect, resolved: command.resolved }));
+      return;
+    }
     if (command.type === 'CHECK' && observationId !== command.observationId) { reply({ error: 'PAGE_CHANGED' }); return; }
     observationId = command.observationId;
     if (command.type === 'COLLECT' && capture?.observationId === observationId) {
       capture.layoutSize = size(); capture.scrollX = scrollX; capture.scrollY = scrollY;
     }
-    reply(collect(observationId, documentId, revision, refs));
+    const snapshot = collect(observationId, documentId, revision, refs);
+    reviewedRects.clear();
+    for (const element of snapshot.elements ?? []) {
+      const reviewed = refs.get(element.id);
+      if (reviewed) reviewedRects.set(reviewed, element.bounds);
+    }
+    reply(snapshot);
   });
 }

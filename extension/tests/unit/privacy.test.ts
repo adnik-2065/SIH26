@@ -49,10 +49,27 @@ describe('local PII and text policy', () => {
     expect(containsLeak('ＭＩＲＡ@EXAMPLE.TEST', fictional)).toBe(true);
     expect(containsLeak('Name: Mira Fictional', ['Mira Fictional'])).toBe(true);
   });
-  it('withholds unclassified names, prose and identifiers while retaining task grammar', () => {
-    const result = sanitizeText('Fill Mira Fictional using my profile', 'instruction');
+  it('withholds unclassified names, prose and identifiers in text taken from the page', () => {
+    // Page text cannot be cleared word by word without a NER model, so anything
+    // the rules do not recognise is withheld.
+    const result = sanitizeText('Fill Mira Fictional using my profile', 'element_description');
     expect(result.sanitized).toBe('Fill [DOCUMENT_1] [DOCUMENT_2] using my profile');
-    expect(sanitizeText(result.sanitized, 'instruction').sanitized).toBe(result.sanitized);
+    expect(sanitizeText(result.sanitized, 'element_description').sanitized).toBe(result.sanitized);
+  });
+  it('keeps the user\'s own instruction readable and still redacts PII inside it', () => {
+    // The instruction is typed into this panel, not read off the page. Replacing
+    // every unrecognised word made it meaningless: "login into this lms portal"
+    // became "[DOCUMENT_1] [DOCUMENT_2] this [DOCUMENT_3] portal".
+    expect(sanitizeText('login into this lms portal', 'instruction').sanitized).toBe('login into this lms portal');
+    expect(sanitizeText('Register for CS2201 in Block B', 'instruction').sanitized).toBe('Register for CS2201 in Block B');
+    // Classification still runs, so recognisable identifiers never leave.
+    const tokens = new Placeholders();
+    expect(sanitizeText('email nora@example.test about my card 4111 1111 1111 1111', 'instruction', tokens).sanitized)
+      .toBe('email [EMAIL_1] about my card [PAYMENT_CARD_1]');
+    // An unrecognised personal name typed by the user is no longer withheld:
+    // the panel warns about this directly under the instruction box.
+    expect(sanitizeText('Fill Mira Fictional using my profile', 'instruction').sanitized)
+      .toBe('Fill Mira Fictional using my profile');
   });
 });
 
@@ -110,6 +127,31 @@ describe('one fail-closed payload gateway', () => {
     for (const value of [...fictional, 'Contact Mira', ...fixture().observation.tiles.map(t => t.screenshot.slice(22))]) expect(json).not.toContain(value);
     expect(Object.keys(result.request).sort()).toEqual(['protocolVersion', 'requestId', 'taskId', 'observationId', 'sanitizedInstruction', 'elements', 'valueRefs'].sort());
     expect(result.request.valueRefs).toEqual([]);
+  });
+  it('sends an ordinary instruction whose words also appear on the page', async () => {
+    // Two gates used to block this. The final check re-sanitized every field
+    // with the page-text allowlist, which rewrote the instruction it had just
+    // exempted and read the rewrite as a leak; and every page word the
+    // allowlist could not clear was treated as a known secret, so an
+    // instruction sharing vocabulary with the page ("lms") looked like one too.
+    const data = fixture();
+    data.instruction = 'login into this lms portal';
+    data.observation.dom.elements[0].label = 'Sign in to the lms';
+    const result = await run(data);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.request.sanitizedInstruction).toBe('login into this lms portal');
+    // The page's own wording is still withheld; only the user's sentence is not.
+    expect(result.request.elements[0].description).not.toContain('lms');
+  });
+  it('still redacts classified PII from the instruction and withholds page values', async () => {
+    const data = fixture();
+    data.instruction = 'email mira@example.test about the lms portal';
+    const result = await run(data);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.request.sanitizedInstruction).toBe('email [EMAIL_1] about the lms portal');
+    expect(JSON.stringify(result.request)).not.toContain('mira@example.test');
   });
   it('does not classify compacted public OCR prose as an authentication token', async () => {
     const data = fixture();

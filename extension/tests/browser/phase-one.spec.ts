@@ -2,6 +2,7 @@ import { test, expect, chromium, type BrowserContext, type Page, type Worker } f
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
+import { DEFAULT_ENDPOINT } from '../../src/agent/transport';
 
 let context: BrowserContext, worker: Worker, panel: Page, portal: Page;
 let extensionId: string;
@@ -42,6 +43,24 @@ async function command(type: 'START' | 'OBSERVE' | 'STOP') {
     }, { intervals: [200] }).toBeGreaterThanOrEqual(3);
   }
   return panel.evaluate(async type => chrome.runtime.sendMessage(type === 'START' ? { type, instruction: 'Inspect the synthetic form' } : { type }), type);
+}
+async function openPanelDetail(name: 'Activity' | 'Settings') {
+  await panel.getByRole('button', { name: 'Open menu' }).click();
+  await panel.getByRole('menuitem', { name }).click();
+}
+// The drawer is modal: nothing below it can be operated until it closes.
+async function closePanelDetail() {
+  await panel.getByRole('button', { name: 'Close details' }).click();
+  await expect(panel.getByRole('dialog')).toHaveCount(0);
+}
+// Local analysis is toggled from the panel's own scan settings. Open that
+// disclosure first, so the checkbox is operable rather than merely present.
+async function analysisToggle() {
+  const settings = panel.locator('.scan-settings');
+  if (!await settings.evaluate(element => (element as HTMLDetailsElement).open)) {
+    await panel.getByText('Scan settings', { exact: true }).click();
+  }
+  return panel.getByLabel('Analyze text and faces locally');
 }
 async function readyObservation() {
   await expect.poll(async () => panel.evaluate(async () => (await chrome.runtime.sendMessage({ type: 'STATUS' })).state.status)).toBe('paused');
@@ -106,11 +125,18 @@ async function assertFace() {
 
 test('production extension loads with scoped permissions and bundled OCR', async () => {
   const manifest = JSON.parse(await readFile('dist/manifest.json', 'utf8'));
-  expect(manifest.host_permissions).toBeUndefined();
+  // The reasoning endpoint is the one host this extension may reach, and MV3
+  // needs it in both host_permissions and connect-src or the fetch fails
+  // closed. Derived from the transport so a moved tunnel cannot silently
+  // widen the grant or drift out of step with the code.
+  const origin = new URL(DEFAULT_ENDPOINT).origin;
+  expect(manifest.host_permissions).toEqual([`${origin}/*`]);
+  expect(manifest.content_security_policy.extension_pages).toContain(`connect-src 'self' ${origin}`);
   expect(manifest.permissions).toEqual(['activeTab', 'scripting', 'sidePanel', 'storage', 'debugger']);
   expect(manifest.content_security_policy.extension_pages).toContain("'wasm-unsafe-eval'");
-  await expect(panel.getByRole('heading', { name: 'See what’s on the page.' })).toBeVisible();
-  await expect(panel.getByText('Your next scan starts here')).toBeVisible();
+  await expect(panel.getByRole('heading', { name: 'What can I do for you?' })).toBeVisible();
+  await expect(panel.getByText('Completed tasks will appear here.')).toBeVisible();
+  await panel.screenshot({ path: '/tmp/sih26-assistant-home.png', fullPage: true });
   expect((await readFile('dist/ocr/lang/eng.traineddata.gz')).byteLength).toBeGreaterThan(1_000_000);
 });
 
@@ -140,9 +166,8 @@ test('user action grants access; DOM and screenshot are captured locally', async
   const tabTarget = targetInfos.find(target => target.url === portal.url());
   expect(tabTarget, JSON.stringify(targetInfos)).toBeTruthy();
   await browserSession.send('Extensions.triggerAction', { id: extensionId, targetId: tabTarget!.targetId });
-  await panel.getByText('Scan settings', { exact: true }).click();
-  await panel.getByLabel('Optional observation note').fill('Inspect the synthetic form');
-  await panel.getByLabel('Analyze text and faces locally').check();
+  await panel.getByLabel('What should be done on this page?').fill('Inspect the synthetic form');
+  await (await analysisToggle()).check();
   await portal.bringToFront();
   expect((await command('START')).ok).toBe(true);
   const state = await readyObservation();
@@ -224,9 +249,9 @@ test('face review supports selection and reacts to changed portrait pixels', asy
   await panel.getByRole('tab', { name: 'Faces 1' }).click();
   await panel.locator('.face-results button').click();
   await expect(panel.locator('.face-results button')).toHaveAttribute('aria-pressed', 'true');
-  await panel.getByText('Scan settings', { exact: true }).click();
-  await panel.getByText('Page controls and capture details', { exact: true }).click();
+  await openPanelDetail('Activity');
   await panel.screenshot({ path: '/tmp/sih26-vision-panel.png', fullPage: true });
+  await closePanelDetail();
   await portal.evaluate(async () => {
     const image = document.querySelector<HTMLImageElement>('.portrait')!;
     const canvas = document.createElement('canvas'); canvas.width = 220; canvas.height = 220;
@@ -282,8 +307,9 @@ test('page changes invalidate observations, and Stop prevents delayed results', 
 
 test('fresh scan works after Stop and preview opt-out clears OCR', async () => {
   await command('START'); await readyObservation(); await readyOcr();
-  await panel.getByText('Scan settings', { exact: true }).click();
-  await panel.getByLabel('Analyze text and faces locally').uncheck();
+  await openPanelDetail('Settings');
+  await panel.getByLabel('Local page analysis').uncheck();
+  await closePanelDetail();
   await expect(panel.locator('canvas')).toHaveCount(0);
   await expect(panel.locator('.ocr-results')).toHaveCount(0);
   await expect(panel.locator('.face-results')).toHaveCount(0);
@@ -294,7 +320,7 @@ test('fresh scan works after Stop and preview opt-out clears OCR', async () => {
 
 
 test('missing face model shows an incomplete scan and retry recovers', async () => {
-  await panel.getByLabel('Analyze text and faces locally').check();
+  await (await analysisToggle()).check();
   // chrome-extension resources bypass HTTP routing. Inject the failure in a
   // temporary worker bootstrap, leaving the production worker/model unchanged.
   const failureWorker = 'dist/vision/failing-face.worker.js';

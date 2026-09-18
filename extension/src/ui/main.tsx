@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
-import { initialState } from '../agent/lifecycle';
+import { initialState, roundVerdict } from '../agent/lifecycle';
 import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
 import { inspectCapturedPage } from '../vision/page';
@@ -20,7 +20,35 @@ const messages: Record<ErrorCode, string> = {
   CAPTURE_TOO_LARGE: 'This page exceeds the local scan capacity. Try narrowing the page content and scan again.',
   INVALID_MESSAGE: 'A component returned an invalid message.', BUSY: 'An observation is already running.',
   RESTARTED: 'The background worker restarted. Observe again to capture a fresh view.',
+  TARGET_CHANGED: 'That control moved or is no longer reachable. Observe again before acting.',
+  TARGET_UNSAFE: 'The step targeted a password or one-time-code field. It was not performed.',
+  ACTION_FAILED: 'The step could not be completed on this page.',
 };
+// One 16px icon set, drawn inline: the panel loads no remote font or sprite.
+const paths: Record<string, string> = {
+  send: 'M4 11.5 12 3.5M12 3.5v6M12 3.5H6',
+  square: 'M4.5 4.5h7v7h-7z',
+  scan: 'M2.5 5.5v-3h3M10.5 2.5h3v3M13.5 10.5v3h-3M5.5 13.5h-3v-3M2.5 8h11',
+  check: 'M3 8.4l3.2 3.1L13 4.8',
+  alert: 'M8 5.2v3.6M8 11.3v.2M8 2.4 1.9 13.1h12.2z',
+  shield: 'M8 2.2 13.2 4v4.1c0 3-2.2 4.8-5.2 5.7-3-.9-5.2-2.7-5.2-5.7V4z',
+  activity: 'M2.5 8.4h2.8l1.7-4.6 2.6 8.4 1.6-3.8h2.3',
+  settings: 'M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM8 1.8v1.6M8 12.6v1.6M2.6 8H1M15 8h-1.6M4.2 4.2 3 3M13 13l-1.2-1.2M11.8 4.2 13 3M3 13l1.2-1.2',
+  more: 'M4 8h.01M8 8h.01M12 8h.01',
+  close: 'M4 4l8 8M12 4l-8 8',
+};
+function Glyph({ name }: { name: keyof typeof paths | string }) {
+  return <svg className="glyph" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor"
+    strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d={paths[name]} /></svg>;
+}
+function Meter({ label, value, max, detail }: { label: string; value?: number; max: number; detail?: string }) {
+  return <div className="meter">
+    <div className="meter-label"><span>{label}</span>{detail && <span>{detail}</span>}</div>
+    <progress aria-label={label} max={max} value={value} />
+  </div>;
+}
+interface LogLine { at: string; kind: 'info' | 'server' | 'action' | 'error'; text: string }
+type DetailView = 'activity' | 'privacy' | 'settings';
 const ocrErrors: Record<string, string> = {
   OCR_TIMEOUT: 'Reading took too long. Try again, or capture a smaller browser window.',
   OCR_TOO_MUCH_TEXT: 'This view exceeds the 500-word limit. Make the browser window smaller and observe again.',
@@ -29,11 +57,31 @@ const ocrErrors: Record<string, string> = {
 function App() {
   const [state, setState] = useState<TaskState>(initialState);
   const stateRef = useRef(state);
-  const [instruction, setInstruction] = useState('Inspect this application form');
+  const [instruction, setInstruction] = useState('');
   const [observation, setObservation] = useState<LocalObservation>();
   const [preview, setPreview] = useState(true);
   const previewRef = useRef(true);
   const [error, setError] = useState('');
+  const [autoRun, setAutoRun] = useState(false);
+  const [round, setRound] = useState(1);
+  // The generation this round's capture was launched at, and the generation a
+  // retry has already been issued for. See `roundVerdict`.
+  const [roundGeneration, setRoundGeneration] = useState<number | undefined>(undefined);
+  const retriedGeneration = useRef<number | undefined>(undefined);
+  const retries = useRef(0);
+  const [runNotice, setRunNotice] = useState('');
+  const [log, setLog] = useState<LogLine[]>([]);
+  const [detailView, setDetailView] = useState<DetailView>();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const addLog = (kind: LogLine['kind'], text: string, detail?: unknown) => {
+    // The panel has its own devtools console (right-click the panel → Inspect),
+    // which is the only place the untruncated server reply can be read.
+    console.info(`[SIH26] ${kind}: ${text}`, detail ?? '');
+    setLog(lines => [...lines, { at: new Date().toLocaleTimeString(), kind, text }].slice(-200));
+  };
   const [ocr, setOcr] = useState<PerceptionResult>();
   const [faces, setFaces] = useState<PerceptionResult>();
   const [faceBusy, setFaceBusy] = useState(false);
@@ -49,6 +97,7 @@ function App() {
   const [ocrError, setOcrError] = useState('');
   const [progress, setProgress] = useState<OcrProgress>();
   const [selected, setSelected] = useState<number>();
+  const [ocrAdapter, setOcrAdapter] = useState<TesseractAdapter>();
   const [showText, setShowText] = useState(true);
   const [showControls, setShowControls] = useState(false);
   const [fullSize, setFullSize] = useState(false);
@@ -120,10 +169,13 @@ function App() {
     setOcrBusy(true); setOcr(undefined); setOcrError(''); setProgress(undefined); setSelected(undefined);
     setFaceBusy(true); setFaces(undefined); setFaceError(''); setSelectedFace(undefined); setQuery('');
     ocrSectionRef.current = { index: 0, count: 1 };
-    adapterRef.current ??= new TesseractAdapter(p => {
-      const { index, count } = ocrSectionRef.current;
-      setProgress(p.status === 'recognizing text' ? { ...p, progress: (index + p.progress) / count } : p);
-    });
+    if (!adapterRef.current) {
+      adapterRef.current = new TesseractAdapter(p => {
+        const { index, count } = ocrSectionRef.current;
+        setProgress(p.status === 'recognizing text' ? { ...p, progress: (index + p.progress) / count } : p);
+      });
+      setOcrAdapter(adapterRef.current);
+    }
     faceAdapterRef.current ??= new MediaPipeAdapter();
     documentAdapterRef.current ??= new OnnxDocumentAdapter();
     // Decode only the current capture tile in each pipeline.
@@ -158,89 +210,358 @@ function App() {
     return () => controller.abort();
   }, [observation, retry]);
 
-  async function command(type: 'START' | 'OBSERVE' | 'STOP') {
+  // A run is a chain of ordinary rounds, each one a scan the user could have
+  // asked for by hand. The cap stops a model that keeps proposing steps.
+  function startRun() {
+    if (!instruction.trim()) { setRunNotice('Describe the task first.'); return; }
+    setRunNotice(''); setRound(1); setAutoRun(true); setLog([]);
+    setRoundGeneration(undefined); retriedGeneration.current = undefined; retries.current = 0;
+    addLog('info', `Run started: ${instruction.trim()}`);
+    void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE');
+  }
+  function stopRun(notice: string) { setAutoRun(false); setRunNotice(notice); addLog('info', notice); }
+
+  async function command(type: 'START' | 'OBSERVE' | 'STOP'): Promise<ErrorCode | undefined> {
     setError(''); captureTilesRef.current = []; setCaptureProgress(undefined);
     if (type === 'STOP') { stopPending.current = true; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
     else { stopPending.current = false; clearDetections(); setObservation(undefined); }
     try {
       const response = await chrome.runtime.sendMessage(type === 'START' ? { type, instruction: instruction.trim() || 'Read visible page text' } : { type });
       const parsed = TaskStateSchema.safeParse(response?.state);
-      if (parsed.success && parsed.data.generation >= stateRef.current.generation) applyState(parsed.data);
-      if (!response?.ok) setError(messages[response?.error as ErrorCode] || 'The operation could not be completed.');
-    } catch { setError('The extension disconnected. Reload it and reopen the panel.'); }
+      // The generation the worker accepted this command at is what later marks
+      // an error as this round's own. It is recorded even when the panel keeps
+      // a newer state, because the round still began here.
+      if (parsed.success) { if (parsed.data.generation >= stateRef.current.generation) applyState(parsed.data); if (response?.ok && type !== 'STOP') setRoundGeneration(parsed.data.generation); }
+      if (!response?.ok) { setError(messages[response?.error as ErrorCode] || 'The operation could not be completed.'); setAutoRun(false); return (response?.error as ErrorCode) ?? 'INVALID_MESSAGE'; }
+    } catch { setError('The extension disconnected. Reload it and reopen the panel.'); setAutoRun(false); return 'RESTARTED'; }
+    return undefined;
+  }
+  // Scan the page again inside a run that is already going. A move that crossed
+  // an origin is refused by OBSERVE — the paused task still describes the site
+  // the user left — so the honest recovery there is a fresh task, not a dead run.
+  async function observeAgain() {
+    const refused = await command(state.taskId && state.status !== 'stopped' ? 'OBSERVE' : 'START');
+    if (refused === 'ACCESS_REQUIRED') { setError(''); setAutoRun(true); await command('START'); }
   }
 
+  const RUN_LIMIT = 8;
+  const RETRY_LIMIT = 4;
+  // A run cannot continue past a failed scan: the next round would have nothing
+  // trustworthy to redact or act on.
   const busy = state.status === 'observing' || ocrBusy || faceBusy || documentBusy;
   const complete = !!ocr && !!faces && !!documents && !ocrBusy && !faceBusy && !documentBusy && !ocrError && !faceError && !documentError;
+  const taskRunning = autoRun || busy;
+  // Escape closes whatever is on top before it reaches the run: a menu, then a
+  // drawer, and only then the task itself.
+  useEffect(() => {
+    const handleKeyboard = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (menuOpen) { event.preventDefault(); setMenuOpen(false); return; }
+      if (detailView) { event.preventDefault(); setDetailView(undefined); return; }
+      if (!taskRunning) return;
+      event.preventDefault();
+      stopRun('Task stopped');
+      void command('STOP');
+    };
+    window.addEventListener('keydown', handleKeyboard);
+    return () => window.removeEventListener('keydown', handleKeyboard);
+  }, [taskRunning, menuOpen, detailView]);
+  useEffect(() => {
+    if (!detailView) return;
+    drawerRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
+    return () => menuButtonRef.current?.focus();
+  }, [detailView]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const dismiss = (event: MouseEvent) => { if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false); };
+    window.addEventListener('mousedown', dismiss);
+    return () => window.removeEventListener('mousedown', dismiss);
+  }, [menuOpen]);
+  useEffect(() => {
+    if (!autoRun) return;
+    // Detector errors are cleared at the start of every round, so they always
+    // belong to this one. A task error counts only from `roundGeneration` on,
+    // for the reason spelled out in `roundVerdict`.
+    const outcome = roundVerdict({ detectorError: ocrError || faceError || documentError,
+      status: state.status, error: state.error, generation: state.generation, roundGeneration });
+    if (outcome.verdict === 'halt') { stopRun(outcome.notice); return; }
+    // A capture that published an observation earns the round a clean slate.
+    if (outcome.verdict === 'continue') { if (state.observationId && roundGeneration !== undefined && state.generation >= roundGeneration) retries.current = 0; return; }
+    // One retry per invalidated generation. Without the guard an unrelated
+    // re-render would send a second OBSERVE, which the worker answers with BUSY
+    // and which would stop the run for no reason.
+    if (retriedGeneration.current === state.generation) return;
+    retriedGeneration.current = state.generation;
+    // Retries are counted apart from rounds. A round is a step performed on the
+    // page; a retry is the same round starting over because the page would not
+    // hold still. Letting retries spend rounds would end a run silently, having
+    // done nothing, which is exactly the failure this whole path exists to fix.
+    if (retries.current >= RETRY_LIMIT) {
+      stopRun('The page kept changing while it was being scanned, so the run stopped. Let it finish loading, or scroll to the part you want acted on, then run the task again.');
+      return;
+    }
+    retries.current++;
+    addLog('info', `${outcome.notice} (attempt ${retries.current} of ${RETRY_LIMIT})`);
+    void observeAgain();
+  }, [autoRun, ocrError, faceError, documentError, state.status, state.error, state.generation, state.observationId, roundGeneration]);
   const status = state.status === 'observing' ? 'Capturing full page…' : busy ? 'Analyzing on your device…' : ocrError || faceError || documentError ? 'Scan needs attention' : complete ? 'Scan ready to review' : state.status === 'stopped' ? 'Stopped' : state.error ? 'A fresh capture is needed' : state.observationId ? 'Observation ready' : 'Ready to capture';
   const recognizing = progress?.status === 'recognizing text';
   const filteredWords = ocr?.regions.map((region, index) => ({ region, index })).filter(({ region }) => region.text?.toLowerCase().includes(query.toLowerCase())) ?? [];
-  return <main>
-    <header className="app-header"><span className="mark" aria-hidden="true">S<span /></span><div className="brand"><strong>SIH26</strong><span>Vision workspace</span></div><span className="badge"><i />Local only</span></header>
-    <div className="workspace-title"><p className="eyebrow">WORKSPACE / PAGE INSPECTION</p><h1>See what’s on the page.</h1><p>Capture a view. Find text and faces. Review everything on your device.</p></div>
-    <section className="workflow" aria-label="Detection workflow">
-      <div className="section-heading"><h2>Page inspection</h2><span className="tag">Manual run</span></div>
-      <ol className="steps" aria-label="How it works">
-        <li className={observation ? 'complete' : 'active'}><span className="node-icon">▣</span><strong>Capture</strong><small>Full page</small></li>
-        <li className={complete ? 'complete' : ocrBusy || faceBusy ? 'active' : ''}><span className="node-icon">⌘</span><strong>Detect</strong><small>Text + faces</small></li>
-        <li className={complete ? 'active' : ''}><span className="node-icon">≡</span><strong>Review</strong><small>Local results</small></li>
-      </ol>
-      <div className="engine-list"><div><span className="engine-icon text-icon">Aa</span><span><strong>Text recognition</strong><small>Tesseract · English</small></span><span className={`engine-state ${ocrError ? 'failed' : ''}`}>{ocrBusy ? 'Reading…' : ocrError ? 'Failed' : ocr ? `${ocr.regions.length} words` : 'Ready'}</span></div><div><span className="engine-icon face-icon">◎</span><span><strong>Face detection</strong><small>MediaPipe · BlazeFace</small></span><span className={`engine-state ${faceError ? 'failed' : ''}`}>{faceBusy ? 'Detecting…' : faceError ? 'Failed' : faces ? `${faces.regions.length} ${faces.regions.length === 1 ? 'face' : 'faces'}` : 'Ready'}</span></div><div><span className="engine-icon face-icon">▧</span><span><strong>Document detection</strong><small>ONNX · local model</small></span><span className={`engine-state ${documentError ? 'failed' : ''}`}>{documentBusy ? 'Detecting…' : documentError ? 'Failed' : documents ? `${documents.regions.length} regions` : 'Ready'}</span></div></div>
-      <details className="task-details"><summary>Scan settings</summary><label className="check"><input type="checkbox" checked={preview} onChange={e => {
-        previewRef.current = e.target.checked; setPreview(e.target.checked);
-        if (!e.target.checked) { captureTilesRef.current = []; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); setObservation(undefined); }
-      }} />Analyze text and faces locally</label><p className="hint">Turning this off clears the screenshot and detections. Capture will collect page controls only.</p><label htmlFor="instruction">Optional observation note</label><textarea id="instruction" maxLength={2000} value={instruction} onChange={e => setInstruction(e.target.value)} placeholder="What are you inspecting?" /><p className="hint">Kept locally. This note does not change detection.</p></details>
-      <div className="actions"><button className="primary" disabled={busy} onClick={() => void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE')}><span aria-hidden="true">▶</span> {busy ? 'Scanning…' : state.taskId && state.status !== 'stopped' ? 'Scan again' : 'Scan current page'}</button><button className="stop" onClick={() => void command('STOP')}>Stop</button></div>
-      <div className="status" role="status" aria-live="polite"><span className={`dot ${busy ? 'observing' : complete ? 'paused' : state.status}`} />{status}</div>
-      {state.origin && <p className="origin">{state.origin}</p>}
-      {(error || state.error || documentError) && <p role="alert" className="notice">{error || documentError || (state.error && messages[state.error])}</p>}
-      {state.status === 'observing' && captureProgress && captureProgress.count > 1 && <div className="progress"><div className="progress-label"><span>Capturing full page</span><span>{Math.round(captureProgress.index / captureProgress.count * 100)}%</span></div><progress aria-label="Capture progress" max={captureProgress.count} value={captureProgress.index} /></div>}
-      {ocrBusy && <div className="progress"><div className="progress-label"><span>{recognizing ? 'Reading English text' : 'Loading text engine'}</span>{recognizing && <span>{Math.round(progress.progress * 100)}%</span>}</div><progress aria-label="OCR progress" max={1} value={recognizing ? progress.progress : undefined} /></div>}
-      {state.observationId && !preview && <p className="hint">Page controls captured. Enable local analysis in Scan settings, then scan again to see text and faces.</p>}
-    </section>
-    <aside className="privacy-note"><span aria-hidden="true">◈</span><div><strong>Local original preview</strong><p>The captured view is unredacted. Prepare a separate redacted export preview below. Server export is not enabled.</p></div></aside>
-    {observation && preview ? <>
-      <section aria-label="Local observation" className="preview-card">
-        <div className="section-heading"><h2>Captured view</h2><span className="tag">Original · local</span></div>
-        <div className="overlay-options"><label className="check"><input type="checkbox" checked={showText} onChange={e => setShowText(e.target.checked)} />Text</label><label className="check face-toggle"><input type="checkbox" checked={showFaces} onChange={e => setShowFaces(e.target.checked)} />Faces</label><label className="check"><input type="checkbox" checked={showControls} onChange={e => setShowControls(e.target.checked)} />Controls</label><label className="check"><input type="checkbox" checked={fullSize} onChange={e => setFullSize(e.target.checked)} />Full size</label></div>
-        <PagePreview observation={observation} ocr={ocr} faces={faces} selected={selected} selectedFace={selectedFace}
-          showControls={showControls} showText={showText} showFaces={showFaces} fullSize={fullSize} onSelect={(x, y) => {
-          const hit = ({ bounds: b }: PerceptionResult['regions'][number]) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
-          const faceIndex = showFaces ? faces?.regions.findIndex(hit) : undefined;
-          const textIndex = showText ? ocr?.regions.findIndex(hit) : undefined;
-          setSelectedFace(faceIndex !== undefined && faceIndex >= 0 ? faceIndex : undefined);
-          setSelected(textIndex !== undefined && textIndex >= 0 ? textIndex : undefined);
-          if (faceIndex !== undefined && faceIndex >= 0) setResultTab('faces');
-          else if (textIndex !== undefined && textIndex >= 0) setResultTab('text');
-        }} />
-        <p className="hint legend"><span>● Text</span><span>● Faces</span><span>{observation.imageWidth} × {observation.imageHeight} px</span></p>
-        <div className="metrics"><span>Capture<b>{Math.round(observation.captureMs)} ms</b></span><span>Text<b>{ocr ? `${(ocr.elapsedMs / 1000).toFixed(1)} s` : ocrBusy ? 'Reading…' : '—'}</b></span><span>Faces<b>{faces ? faces.elapsedMs < 1000 ? `${Math.round(faces.elapsedMs)} ms` : `${(faces.elapsedMs / 1000).toFixed(1)} s` : faceBusy ? 'Scanning…' : '—'}</b></span></div>
-      </section>
-      <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete} currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={adapterRef.current ?? undefined} />
-      <section aria-label="Detection results">
-        <div className="section-heading"><h2>Detection results</h2><span className="tag">{busy ? 'Running' : complete ? 'Complete' : 'Incomplete'}</span></div>
-        {(ocrError || faceError) && <div role="alert" className="notice"><p>{ocrError}</p><p>{faceError}</p><button disabled={busy} onClick={() => setRetry(value => value + 1)}>Retry detection</button></div>}
-        <div className="result-tabs" role="tablist" aria-label="Detection type" onKeyDown={event => {
-          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-          event.preventDefault();
-          const next = event.key === 'Home' ? 'text' : event.key === 'End' ? 'faces' : resultTab === 'text' ? 'faces' : 'text';
-          setResultTab(next); document.getElementById(`${next}-tab`)?.focus();
-        }}><button id="text-tab" role="tab" tabIndex={resultTab === 'text' ? 0 : -1} aria-selected={resultTab === 'text'} aria-controls="text-results" onClick={() => setResultTab('text')}>Text <span>{ocr?.regions.length ?? '—'}</span></button><button id="faces-tab" role="tab" tabIndex={resultTab === 'faces' ? 0 : -1} aria-selected={resultTab === 'faces'} aria-controls="face-results" onClick={() => setResultTab('faces')}>Faces <span>{faces?.regions.length ?? '—'}</span></button></div>
-        <div id="text-results" role="tabpanel" aria-labelledby="text-tab" hidden={resultTab !== 'text'}>
-          <label className="search-label" htmlFor="word-search">Find detected text</label><input id="word-search" className="search" type="search" placeholder="Search words…" value={query} onChange={e => setQuery(e.target.value)} />
-          {ocrBusy && <p className="empty-text">Reading the screenshot. Words will appear here.</p>}
-          {ocr && <>{ocr.regions.length === 0 ? <p className="empty-text">No readable text found. Zoom in on the page and scan again.</p> : <><p className="hint">Select a word to locate it in the captured view. Scores are estimates.</p><ol className="ocr-results">{filteredWords.map(({ region, index: i }) => <li key={i}><button aria-pressed={selected === i} onClick={() => { setSelected(i); setSelectedFace(undefined); setShowText(true); }}><span className="word-heading"><strong>{region.text}</strong><span className={`confidence ${(region.confidence ?? 0) < .7 ? 'uncertain' : ''}`}>{Math.round((region.confidence ?? 0) * 100)}%</span></span><span className="coordinates">x {region.bounds.x} · y {region.bounds.y} · {region.bounds.width} × {region.bounds.height} px</span></button></li>)}</ol>{filteredWords.length === 0 && <p className="empty-text">No words match your search.</p>}</>}</>}
+  const recentActivity = [...log].reverse().filter(line => line.kind === 'action' || line.kind === 'error' || /finished|stopped/i.test(line.text)).slice(0, 3);
+  const workingLabel = state.status === 'observing' ? 'Protecting page…' : ocrBusy || faceBusy || documentBusy ? 'Understanding page…' : 'Working on your request…';
+  const openDetail = (view: DetailView) => { setDetailView(view); setMenuOpen(false); };
+  const togglePreview = (checked: boolean) => {
+    previewRef.current = checked; setPreview(checked);
+    if (!checked) { captureTilesRef.current = []; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
+  };
+  // The dot never reports success while something needs attention: a green dot
+  // over "A fresh capture is needed" is the kind of detail that makes a panel
+  // feel untrustworthy.
+  const dot = state.status === 'observing' ? 'observing'
+    : error || state.error || ocrError || faceError || documentError ? 'failed'
+    : complete ? 'paused' : state.status;
+  const scanLabel = busy ? 'Scanning…' : state.taskId && state.status !== 'stopped' ? 'Scan again' : 'Scan current page';
+  const host = state.origin ? state.origin.replace(/^https?:\/\//, '') : 'Current page';
+  const drawerTitle = detailView === 'activity' ? 'Task activity' : detailView === 'privacy' ? 'Privacy details' : 'Settings';
+  const alert = error || documentError || (state.error && messages[state.error]) || '';
+  return <div className="app">
+    <header className="app-bar">
+      <div className="identity">
+        <span className="logo" aria-hidden="true">S</span>
+        <span className="identity-text"><strong>SIH26</strong><small>Private browser agent</small></span>
+      </div>
+      <div className="bar-actions">
+        <span className={`shield${complete || taskRunning ? ' is-on' : ''}`}><i aria-hidden="true" />{complete || taskRunning ? 'Protected' : 'Local'}</span>
+        <div className="menu-host" ref={menuRef}>
+          <button type="button" className="icon-button" ref={menuButtonRef} aria-label="Open menu" aria-haspopup="menu" aria-expanded={menuOpen}
+            onClick={() => setMenuOpen(open => !open)}><Glyph name="more" /></button>
+          {menuOpen && <div className="menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => openDetail('activity')}><Glyph name="activity" />Activity</button>
+            <button type="button" role="menuitem" onClick={() => openDetail('privacy')}><Glyph name="shield" />Privacy details</button>
+            <button type="button" role="menuitem" onClick={() => openDetail('settings')}><Glyph name="settings" />Settings</button>
+          </div>}
         </div>
-        <div id="face-results" role="tabpanel" aria-labelledby="faces-tab" hidden={resultTab !== 'faces'}>
-          <p className="hint">Faces are located, not identified. Small, angled, or obscured faces may be missed.</p>
-          {faceBusy && <p className="empty-text">Looking for faces in the screenshot…</p>}
-          {faces && (faces.regions.length === 0 ? <p className="empty-text">No faces detected. This does not mean the page contains no private information.</p> : <ol className="face-results">{faces.regions.map((region, i) => <li key={i}><button aria-pressed={selectedFace === i} onClick={() => { setSelectedFace(i); setSelected(undefined); setShowFaces(true); }}><span className="word-heading"><strong>Face {i + 1}</strong><span className="confidence">{Math.round((region.confidence ?? 0) * 100)}%</span></span><span className="coordinates">x {region.bounds.x} · y {region.bounds.y} · {region.bounds.width} × {region.bounds.height} px</span></button></li>)}</ol>)}
-        </div>
+      </div>
+    </header>
+
+    <main className="column">
+      <section className="panel task-panel" aria-label="Task">
+        <h1 className="headline">{taskRunning ? 'Working on it' : 'What can I do for you?'}</h1>
+        <p className="sub">{taskRunning ? 'Everything is inspected and redacted on this device first.' : 'Describe what should happen on the page you have open.'}</p>
+        <form className={`composer${taskRunning ? ' is-running' : ''}`} onSubmit={event => { event.preventDefault(); if (!taskRunning) startRun(); }}>
+          <label className="sr-only" htmlFor="instruction">What should be done on this page?</label>
+          <textarea id="instruction" maxLength={2000} value={instruction} disabled={taskRunning} rows={3}
+            onChange={event => setInstruction(event.target.value)}
+            onKeyDown={event => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); if (!taskRunning) startRun(); } }}
+            placeholder="Ask SIH26 to do something on this page…" />
+          <div className="composer-bar">
+            <span className="page-chip" title={state.origin || undefined}><i aria-hidden="true" />{host}</span>
+            {!taskRunning
+              ? <button className="run-action" type="submit" aria-label="Run task" disabled={!instruction.trim()}><Glyph name="send" /></button>
+              : <button className="stop-task" type="button" aria-label="Stop task" title="Stop task"
+                  onClick={() => { stopRun('Task stopped'); void command('STOP'); }}><Glyph name="square" /></button>}
+          </div>
+        </form>
+        {!taskRunning && !instruction && <div className="suggestions" aria-label="Suggested tasks">
+          {['Summarize this page', 'Find information', 'Complete a task'].map(suggestion =>
+            <button type="button" key={suggestion} onClick={() => setInstruction(suggestion)}>{suggestion}</button>)}
+        </div>}
       </section>
-      <details className="technical"><summary>Page controls and capture details</summary><p className="hint">Controls come from the page structure. Coordinates in detection results use original screenshot pixels.</p><p className="hint">DOM: {observation.domMs.toFixed(1)} ms · {observation.dom.hiddenCount} hidden/offscreen controls omitted. {observation.dom.truncated ? 'Control limit reached.' : ''}</p><ol className="elements">{observation.dom.elements.map(el => <li key={el.id}><strong>{el.label || 'Unlabelled control'}</strong><span>{el.role} · {el.type}{el.disabled ? ' · disabled' : ''}</span></li>)}</ol></details>
-    </> : <section className="empty-state"><span className="scan-icon" aria-hidden="true">⌗</span><h2>Your next scan starts here</h2><p>Open a webpage and click the extension’s toolbar icon to connect it. Then scan the current view.</p><div className="empty-chips"><span>Text in images</span><span>Faces</span><span>Page controls</span></div></section>}
-    <details className="roadmap"><summary>What’s coming next?</summary><p>Your trained model will add Aadhaar, PAN, passport, card, and document regions to local redaction. Server transport and browser actions remain future work.</p><span className="tag">Planned · not active</span></details>
-    <footer><span className="privacy-dot" />On-device processing · Nothing sent to a server</footer>
-  </main>;
+
+      {taskRunning && <section className="panel run-panel" aria-label="Run progress">
+        <div className="run-head">
+          <span className="spinner" aria-hidden="true" />
+          <div><strong>{workingLabel}</strong><small>Round {round} of {RUN_LIMIT}</small></div>
+        </div>
+        <ol className="stages">
+          <li className={state.status !== 'observing' ? 'done' : 'active'}>Protected</li>
+          <li className={state.status === 'observing' ? '' : complete ? 'done' : 'active'}>Understanding</li>
+          <li className={complete ? 'active' : ''}>Acting</li>
+        </ol>
+        {recentActivity[0] && <p className="run-line">{recentActivity[0].text}</p>}
+      </section>}
+
+      <section className="panel scan-panel" aria-label="Page scan">
+        <div className="status" role="status" aria-live="polite"><span className={`dot ${dot}`} />{status}</div>
+        <div className="scan-actions">
+          <button type="button" className="btn primary scan-action" disabled={busy}
+            onClick={() => void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE')}><Glyph name="scan" />{scanLabel}</button>
+          <button type="button" className="btn stop" title="Stop and clear this run"
+            onClick={() => { stopRun('Stopped.'); void command('STOP'); }}><Glyph name="square" /><span className="stop-label">Stop</span></button>
+        </div>
+        {state.status === 'observing' && captureProgress && captureProgress.count > 1 &&
+          <Meter label="Capturing full page" value={captureProgress.index} max={captureProgress.count}
+            detail={`${Math.round(captureProgress.index / captureProgress.count * 100)}%`} />}
+        {ocrBusy && <Meter label={recognizing ? 'Reading English text' : 'Loading text engine'} value={recognizing ? progress!.progress : undefined} max={1}
+          detail={recognizing ? `${Math.round(progress!.progress * 100)}%` : undefined} />}
+        <details className="scan-settings">
+          <summary>Scan settings</summary>
+          <label className="switch-row">
+            <input type="checkbox" checked={preview} onChange={event => togglePreview(event.target.checked)} />
+            <span><strong>Analyze text and faces locally</strong><small>Turning this off clears the screenshot and detections. Capture then collects page controls only.</small></span>
+          </label>
+          <button type="button" className="link" onClick={() => openDetail('privacy')}>What leaves this device?</button>
+        </details>
+        {state.origin && <p className="origin" title={state.origin}>{state.origin}</p>}
+      </section>
+
+      {alert && <p role="alert" className="banner is-danger"><Glyph name="alert" />{alert}</p>}
+      {!alert && runNotice && !taskRunning && <p className="banner"><Glyph name={/stopped/i.test(runNotice) ? 'square' : 'check'} />{runNotice}</p>}
+
+      {observation && preview ? <>
+        <section id="page-view" className="panel" aria-label="Captured view">
+          <div className="panel-head"><h2>Captured view</h2><span className="pill">Original · local</span></div>
+          <div className="overlay-options">
+            <label className="chip"><input type="checkbox" checked={showText} onChange={e => setShowText(e.target.checked)} />Text</label>
+            <label className="chip"><input type="checkbox" checked={showFaces} onChange={e => setShowFaces(e.target.checked)} />Faces</label>
+            <label className="chip"><input type="checkbox" checked={showControls} onChange={e => setShowControls(e.target.checked)} />Controls</label>
+            <label className="chip"><input type="checkbox" checked={fullSize} onChange={e => setFullSize(e.target.checked)} />Full size</label>
+          </div>
+          <PagePreview observation={observation} ocr={ocr} faces={faces} selected={selected} selectedFace={selectedFace}
+            showControls={showControls} showText={showText} showFaces={showFaces} fullSize={fullSize} onSelect={(x, y) => {
+            const hit = ({ bounds: b }: PerceptionResult['regions'][number]) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
+            const faceIndex = showFaces ? faces?.regions.findIndex(hit) : undefined;
+            const textIndex = showText ? ocr?.regions.findIndex(hit) : undefined;
+            setSelectedFace(faceIndex !== undefined && faceIndex >= 0 ? faceIndex : undefined);
+            setSelected(textIndex !== undefined && textIndex >= 0 ? textIndex : undefined);
+            if (faceIndex !== undefined && faceIndex >= 0) setResultTab('faces');
+            else if (textIndex !== undefined && textIndex >= 0) setResultTab('text');
+          }} />
+          <p className="legend"><span className="key key-text">Text</span><span className="key key-face">Faces</span><span className="key-size">{observation.imageWidth} × {observation.imageHeight} px</span></p>
+          <div className="metrics">
+            <span>Capture<b>{Math.round(observation.captureMs)} ms</b></span>
+            <span>Text<b>{ocr ? `${(ocr.elapsedMs / 1000).toFixed(1)} s` : ocrBusy ? 'Reading…' : '—'}</b></span>
+            <span>Faces<b>{faces ? faces.elapsedMs < 1000 ? `${Math.round(faces.elapsedMs)} ms` : `${(faces.elapsedMs / 1000).toFixed(1)} s` : faceBusy ? 'Scanning…' : '—'}</b></span>
+          </div>
+        </section>
+
+        <section className="panel" aria-label="Detection results">
+          <div className="panel-head"><h2>Detection results</h2><span className={`pill${ocrError || faceError ? ' is-danger' : complete ? ' is-good' : ''}`}>{busy ? 'Running' : complete ? 'Complete' : 'Incomplete'}</span></div>
+          {(ocrError || faceError) && <div role="alert" className="banner is-danger">
+            <Glyph name="alert" />
+            <span>{ocrError}{ocrError && faceError ? ' ' : ''}{faceError}</span>
+            <button type="button" className="btn ghost" disabled={busy} onClick={() => setRetry(value => value + 1)}>Retry detection</button>
+          </div>}
+          <div className="tabs" role="tablist" aria-label="Detection type" onKeyDown={event => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === 'Home' ? 'text' : event.key === 'End' ? 'faces' : resultTab === 'text' ? 'faces' : 'text';
+            setResultTab(next); document.getElementById(`${next}-tab`)?.focus();
+          }}>
+            <button id="text-tab" role="tab" tabIndex={resultTab === 'text' ? 0 : -1} aria-selected={resultTab === 'text'} aria-controls="text-results" onClick={() => setResultTab('text')}>Text <span>{ocr?.regions.length ?? '—'}</span></button>
+            <button id="faces-tab" role="tab" tabIndex={resultTab === 'faces' ? 0 : -1} aria-selected={resultTab === 'faces'} aria-controls="face-results" onClick={() => setResultTab('faces')}>Faces <span>{faces?.regions.length ?? '—'}</span></button>
+          </div>
+          <div id="text-results" role="tabpanel" aria-labelledby="text-tab" hidden={resultTab !== 'text'}>
+            <label className="sr-only" htmlFor="word-search">Find detected text</label>
+            <input id="word-search" className="search" type="search" placeholder="Find detected text…" value={query} onChange={e => setQuery(e.target.value)} />
+            {ocrBusy && <p className="empty-text">Reading the screenshot. Words will appear here.</p>}
+            {ocr && (ocr.regions.length === 0
+              ? <p className="empty-text">No readable text found. Zoom in on the page and scan again.</p>
+              : <><ol className="ocr-results">{filteredWords.map(({ region, index: i }) => <li key={i}>
+                  <button type="button" aria-pressed={selected === i} onClick={() => { setSelected(i); setSelectedFace(undefined); setShowText(true); }}>
+                    <span className="word-heading"><strong>{region.text}</strong><span className={`confidence${(region.confidence ?? 0) < .7 ? ' uncertain' : ''}`}>{Math.round((region.confidence ?? 0) * 100)}%</span></span>
+                    <span className="coordinates">x {region.bounds.x} · y {region.bounds.y} · {region.bounds.width} × {region.bounds.height} px</span>
+                  </button></li>)}</ol>
+                {filteredWords.length === 0 && <p className="empty-text">No words match your search.</p>}</>)}
+          </div>
+          <div id="face-results" role="tabpanel" aria-labelledby="faces-tab" hidden={resultTab !== 'faces'}>
+            {faceBusy && <p className="empty-text">Looking for faces in the screenshot…</p>}
+            {faces && (faces.regions.length === 0
+              ? <p className="empty-text">No faces detected. This does not mean the page contains no private information.</p>
+              : <ol className="face-results">{faces.regions.map((region, i) => <li key={i}>
+                  <button type="button" aria-pressed={selectedFace === i} onClick={() => { setSelectedFace(i); setSelected(undefined); setShowFaces(true); }}>
+                    <span className="word-heading"><strong>Face {i + 1}</strong><span className="confidence">{Math.round((region.confidence ?? 0) * 100)}%</span></span>
+                    <span className="coordinates">x {region.bounds.x} · y {region.bounds.y} · {region.bounds.width} × {region.bounds.height} px</span>
+                  </button></li>)}</ol>)}
+            <p className="foot-note">Faces are located, not identified. Small, angled or obscured faces may be missed.</p>
+          </div>
+        </section>
+
+        <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete}
+          currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={ocrAdapter}
+          auto={autoRun} onHalt={stopRun} onLog={addLog} onContinue={() => {
+            if (round >= RUN_LIMIT) { stopRun(`Stopped after ${RUN_LIMIT} rounds. Run the task again to continue.`); return; }
+            setRound(round + 1);
+            addLog('info', `Round ${round} done. Observing the page again.`);
+            void command('OBSERVE');
+          }} />
+
+        <details className="panel technical">
+          <summary>Page controls and capture details</summary>
+          <p className="foot-note">Controls come from the page structure. Coordinates in detection results use original screenshot pixels.</p>
+          <p className="foot-note">DOM {observation.domMs.toFixed(1)} ms · {observation.dom.hiddenCount} hidden or offscreen controls omitted.{observation.dom.truncated ? ' Control limit reached.' : ''}</p>
+          <ol className="elements">{observation.dom.elements.map(el => <li key={el.id}>
+            <strong>{el.label || 'Unlabelled control'}</strong><span>{el.role} · {el.type}{el.disabled ? ' · disabled' : ''}</span>
+          </li>)}</ol>
+        </details>
+      </> : <section className="panel empty-state">
+        <span className="empty-mark" aria-hidden="true"><Glyph name="scan" /></span>
+        <h2>{state.observationId && !preview ? 'Page controls captured' : 'Your next scan starts here'}</h2>
+        <p>{state.observationId && !preview
+          ? 'Local analysis is off, so no screenshot or detections are kept. Turn it on in scan settings, then scan again.'
+          : 'Open a webpage, click the extension icon on that tab, then run a task or scan the current view.'}</p>
+        <div className="empty-chips"><span>Text in images</span><span>Faces</span><span>Page controls</span></div>
+      </section>}
+
+      <section className="panel recent" aria-label="Recent activity">
+        <div className="panel-head"><h2>Recent</h2>{log.length > 0 && <button type="button" className="link" onClick={() => openDetail('activity')}>View activity</button>}</div>
+        {recentActivity.length
+          ? <ol className="feed">{recentActivity.map((line, index) => <li key={`${line.at}-${index}`} className={line.kind === 'error' ? 'is-error' : ''}>
+              <span className="feed-mark" aria-hidden="true"><Glyph name={line.kind === 'error' ? 'alert' : 'check'} /></span>
+              <div><strong>{line.text}</strong><small>{index === 0 ? 'Just now' : line.at}</small></div>
+            </li>)}</ol>
+          : <p className="muted">Completed tasks will appear here.</p>}
+      </section>
+
+      <footer className="app-foot"><span className="privacy-dot" aria-hidden="true" />Detection and redaction run on this device</footer>
+    </main>
+
+    {detailView && <div className="scrim" onMouseDown={event => { if (event.target === event.currentTarget) setDetailView(undefined); }}>
+      <aside className="drawer" ref={drawerRef} role="dialog" aria-modal="true" aria-label={drawerTitle}>
+        <header className="drawer-head">
+          <div><small>{detailView === 'privacy' ? 'Protection' : detailView === 'activity' ? 'Diagnostics' : 'Preferences'}</small><h2>{drawerTitle}</h2></div>
+          <button type="button" className="icon-button" aria-label="Close details" onClick={() => setDetailView(undefined)}><Glyph name="close" /></button>
+        </header>
+        <div className="drawer-body">
+          {detailView === 'activity' && <>
+            <ul className="diagnostic-list">
+              <li><span>Capture</span><b>{observation ? 'Completed' : state.status === 'observing' ? 'Working…' : 'Waiting'}</b></li>
+              <li><span>Text recognition</span><b>{ocr ? 'Completed' : ocrBusy ? 'Working…' : ocrError ? 'Needs attention' : 'Waiting'}</b></li>
+              <li><span>Face detection</span><b>{faces ? 'Completed' : faceBusy ? 'Working…' : faceError ? 'Needs attention' : 'Waiting'}</b></li>
+              <li><span>Document detection</span><b>{documents ? 'Completed' : documentBusy ? 'Working…' : documentError ? 'Needs attention' : 'Waiting'}</b></li>
+              <li><span>PII redaction</span><b>{complete ? 'Protected' : 'Waiting'}</b></li>
+              <li><span>Server reasoning</span><b>{log.some(line => line.kind === 'server') ? 'Completed' : autoRun ? 'Working…' : 'Waiting'}</b></li>
+              <li><span>Action execution</span><b>{log.some(line => line.kind === 'action') ? 'Completed' : 'Waiting'}</b></li>
+            </ul>
+            {log.length > 0 ? <div className="raw-log">
+              <div className="panel-head"><h3>Run log</h3><button type="button" className="link" onClick={() => void navigator.clipboard.writeText(log.map(line => `${line.at} [${line.kind}] ${line.text}`).join('\n'))}>Copy</button></div>
+              <ol>{log.map((line, index) => <li key={index} className={`is-${line.kind}`}><small>{line.at} · {line.kind}</small><span>{line.text}</span></li>)}</ol>
+              <p className="foot-note">The untruncated server reply is printed to the panel console: right-click the panel and choose Inspect.</p>
+            </div> : <p className="muted">No run has started yet.</p>}
+          </>}
+          {detailView === 'privacy' && <div className="privacy-details">
+            <h3>Processed locally</h3>
+            <ul><li>Screenshot analysis</li><li>OCR text extraction</li><li>DOM inspection</li><li>Face detection</li><li>Sensitive document detection</li><li>PII detection and redaction</li></ul>
+            <h3>Sent for reasoning</h3>
+            <ul><li>Sanitized page context</li><li>Sanitized user instruction</li><li>A separately masked screenshot</li></ul>
+            <h3 className="never">Never sent</h3>
+            <ul className="never-list"><li>Original detected PII</li><li>Password and one-time-code fields</li><li>The original screenshot</li></ul>
+          </div>}
+          {detailView === 'settings' && <div className="settings-list">
+            <label className="switch-row">
+              <input type="checkbox" checked={preview} onChange={event => togglePreview(event.target.checked)} />
+              <span><strong>Local page analysis</strong><small>Read text, locate faces and detect documents on this device.</small></span>
+            </label>
+            <button type="button" className="btn" disabled={busy} onClick={() => { setDetailView(undefined); void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE'); }}>{scanLabel}</button>
+            <dl className="meta-list">
+              <div><dt>Connected page</dt><dd>{state.origin || 'None'}</dd></div>
+              <div><dt>Task state</dt><dd>{state.status}</dd></div>
+              <div><dt>Rounds allowed</dt><dd>{RUN_LIMIT} per run</dd></div>
+            </dl>
+          </div>}
+        </div>
+      </aside>
+    </div>}
+  </div>;
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);

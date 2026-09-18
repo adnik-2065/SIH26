@@ -8,7 +8,7 @@ This document describes the implemented Phase 1 foundation. The original archite
 
 The project owner explicitly excluded training and real model integration from this implementation. The perception work in PH1-07 is therefore limited to a typed adapter interface and a clearly labelled synthetic mock worker. Another member will supply real OCR/vision. There are no model dependencies, weights, download scripts, real inference, or accuracy claims in this implementation.
 
-The extension observes one user-invoked HTTP(S) tab locally. It does not fill, click, submit, redact, or call a backend. These are later-phase responsibilities. The six action schemas define the future contract only; no executor is registered.
+The extension observes one user-invoked HTTP(S) tab locally. At the time of this Phase 1 deliverable it did not fill, click, submit, redact, or call a backend, and the action schemas defined a future contract with no executor registered. Redaction, a reasoning-server transport, and a per-step action executor were added later; see [the redaction engine](redaction-engine.md) and section 7 of [the project context](project-context.md). Outbound connections remain closed by the manifest until a server origin is added deliberately.
 
 ## Implemented issue mapping
 

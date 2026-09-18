@@ -57,7 +57,12 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
     check();
     if (image && input.verificationOcr) await verifyWithOcr(image, binding.observationId, input.verificationOcr, input.signal, check);
     const candidate = payload(binding, plan, placeholders, image);
-    const request = finalCheck(candidate, plan.findings.flatMap(finding => finding.text ? [finding.text] : []), observation.tiles.map(tile => tile.screenshot), input.vault);
+    // Known values are the raw texts the detectors positively classified. Words
+    // the allowlist merely could not clear are excluded: they are ordinary page
+    // vocabulary, and on any real site they overlap the user's own instruction
+    // ("lms", "attendance"), which would block every such request as a leak.
+    const request = finalCheck(candidate, plan.findings.flatMap(finding => finding.text && !finding.unclassified ? [finding.text] : []),
+      observation.tiles.map(tile => tile.screenshot), input.vault);
     check();
     // Return the *exact* validated object for local review. No transport exists.
     return { ok: true, request, decision: image ? 'safe' : 'safe_without_image', withheldReasons,

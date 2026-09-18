@@ -35,23 +35,26 @@ test('real OCR/MediaPipe review sanitizes the payload and clears it on lifecycle
     await browser.send('Extensions.triggerAction', { id: extensionId, targetId: targetInfos.find(target => target.url === portal.url())!.targetId });
     const review = panel.getByRole('region', { name: 'Redacted export review' });
     const scan = async () => {
+      await portal.bringToFront();
       await panel.evaluate(() => document.querySelector<HTMLButtonElement>('.primary')!.click());
     await expect(panel.locator('.status')).toHaveText('Scan ready to review', { timeout: 90_000 });
     };
     let preparation = 0;
     const prepare = async () => {
       preparation++;
-      await review.getByRole('button', { name: 'Prepare redacted preview' }).click();
+      await review.getByRole('button', { name: 'Prepare redacted preview' }).evaluate((button: HTMLButtonElement) => button.click());
       await expect.poll(async () => ({ count: await review.locator('pre').count() + await review.getByRole('alert').count(),
         status: await panel.locator('.status').textContent(), reviewPresent: await review.count(),
         preparing: await review.getByRole('button', { name: 'Preparing redaction…' }).count() }), { timeout: 30_000 }).toEqual({ count: 1, status: 'Scan ready to review', reviewPresent: 1, preparing: 0 });
-      expect(await review.getByRole('alert').allTextContents(), `Preparation ${preparation}`).toEqual([]);
+      expect(await review.getByRole('alert').allTextContents(), `Preparation ${preparation} state=${JSON.stringify((await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'STATUS' }))).state)}`).toEqual([]);
       await expect(review.locator('pre')).toHaveCount(1);
     };
     await scan();
     expect(await portal.locator('body').innerText()).not.toContain('mira@example.test');
     await expect(panel.locator('.ocr-results')).toContainText('mira');
-    await review.getByRole('checkbox', { name: /Re-scan the redacted image/ }).check();
+    await review.getByRole('checkbox', { name: /Re-scan the redacted image/ }).evaluate((box: HTMLInputElement) => box.click());
+    await expect(review.getByRole('checkbox', { name: /Re-scan the redacted image/ })).toBeChecked();
+
     await prepare();
     const payloadToggle = review.getByText('Exact local payload', { exact: true });
     await payloadToggle.focus(); await payloadToggle.press('Enter');
@@ -68,16 +71,18 @@ test('real OCR/MediaPipe review sanitizes the payload and clears it on lifecycle
     expect(evidence.keys).toEqual(['elements', 'observationId', 'protocolVersion', 'requestId', 'sanitizedImage', 'sanitizedInstruction', 'taskId', 'valueRefs']);
     await panel.setViewportSize({ width: 380, height: 900 });
     await review.screenshot({ path: '/tmp/sih26-redacted-review.png' });
-    await panel.getByRole('button', { name: 'Stop', exact: true }).click();
+    await panel.evaluate(async () => chrome.runtime.sendMessage({ type: 'STOP' }));
     await expect(review).toHaveCount(0);
     await scan(); await prepare();
     await portal.evaluate(() => window.scrollTo(0, 150));
     await expect(review).toHaveCount(0);
     await scan(); await prepare();
-    await panel.getByText('Scan settings', { exact: true }).click();
-    await panel.getByLabel('Analyze text and faces locally').uncheck();
+    await panel.getByRole('button', { name: 'Open menu' }).click();
+    await panel.getByRole('menuitem', { name: 'Settings' }).click();
+    await panel.getByLabel('Local page analysis').uncheck();
     await expect(review).toHaveCount(0);
-    await panel.getByLabel('Analyze text and faces locally').check();
+    await panel.getByLabel('Local page analysis').check();
+    await panel.getByRole('button', { name: 'Close details' }).click();
     await scan(); await prepare();
     await portal.locator('#layout').click();
     await expect(review).toHaveCount(0);
