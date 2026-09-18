@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { CaptureObservationSchema, CaptureTileSchema, StepRequestSchema, VisualCategorySchema } from '../contracts';
+import type { StepRequest } from '../contracts';
+export type { StepRequest };
 import { PerceptionResultSchema } from '../vision/contracts';
 
 // Local resource budgets, independent of the version-1 wire contract.
@@ -17,7 +19,7 @@ export const FindingSchema = z.object({ id: IdSchema, source: z.enum(['ocr', 'fa
   textRange: z.object({ start: z.number().int().nonnegative(), end: z.number().int().positive() }).strict().optional(),
   kind: PiiKindSchema, confidence: z.number().finite().min(0).max(1), text: z.string().max(LIMITS.text).optional(),
   bounds: BoundsSchema.optional(), elementId: IdSchema.optional(), exportPolicy: z.enum(['replace', 'mask', 'withhold', 'block']),
-  redactText: z.boolean(), redactPixels: z.boolean() }).strict();
+  redactText: z.boolean(), redactPixels: z.boolean(), unclassified: z.boolean().optional() }).strict();
 export type Finding = z.infer<typeof FindingSchema>;
 export const MaskSchema = z.object({ bounds: BoundsSchema, reasons: z.array(PiiKindSchema).min(1).max(19) }).strict();
 export type Mask = z.infer<typeof MaskSchema>;
@@ -56,7 +58,6 @@ export const ExportDataSchema = z.object({ binding: BindingSchema, observation: 
   ocrTextPolicy: z.enum(['all_text', 'sensitive_only']).optional(),
   image: z.enum(['none', 'optional', 'required']) }).strict();
 export type ExportData = z.infer<typeof ExportDataSchema>;
-export type StepRequest = z.infer<typeof StepRequestSchema>;
 export type ExportResult = { ok: true; request: StepRequest; decision: 'safe' | 'safe_without_image';
   summary: { text: number; faces: number; documents: number; masks: number }; withheldReasons: BlockReason[] }
   | { ok: false; blockedReasons: BlockReason[] };

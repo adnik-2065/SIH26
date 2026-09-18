@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import { VisualCategorySchema, type LocalObservation } from '../contracts';
 import type { PerceptionResult } from './contracts';
-import { ocrDocumentCategory } from '../dom/visuals';
+import { ocrDocumentCue } from '../dom/visuals';
 import { BoundsSchema, DocumentEvidenceSchema, LIMITS, PrivacyError } from '../privacy/contracts';
-import { domBounds, validateBounds } from '../privacy/geometry';
+import { domBounds, union, validateBounds } from '../privacy/geometry';
+import { reconstructOcr } from '../privacy/normalize';
+import { visualIsMasked } from '../privacy/policy';
 import { bounded, pngBytes, validateTiles } from '../privacy/image';
 
 export const VisionDocumentResultSchema = z.object({ observationId: z.string(), truncated: z.literal(false),
@@ -27,18 +29,27 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
   textPolicy: 'all_text' | 'sensitive_only' = 'all_text'): DocumentEvidence {
   if (observation.dom.truncated || ocr.observationId !== observation.dom.observationId || ocr.source !== 'model') throw new PrivacyError('INCOMPLETE_DETECTION');
   const regions: DocumentEvidence['regions'] = (observation.dom.visualRegions ?? [])
-    .filter(region => textPolicy === 'all_text' || region.category !== 'sensitive_image').map(region => ({
+    .filter(region => visualIsMasked(region.category, textPolicy)).map(region => ({
     kind: kind(region.category), category: region.category, confidence: region.confidence,
     bounds: domBounds(region.bounds, observation),
   }));
-  // OCR gives cues, not a trustworthy document boundary. When a cue exists,
-  // mask the full captured page rather than inventing a smaller document box.
-  // This also protects documents spanning many tiles and their non-text marks.
-  const text = ocr.regions.map(region => region.text ?? '').join(' ');
-  if (text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
-  const category = ocrDocumentCategory(text);
-  if (category) regions.push({ kind: kind(category), category, confidence: .5,
-    bounds: { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight } });
+  // OCR gives cues, not a trustworthy document boundary. Strict mode answers
+  // that by masking the full captured page: it also covers a document spanning
+  // many tiles and its non-text marks. Context mode cannot afford a whole-page
+  // rectangle for one phrase, so it masks the lines the cue actually sits on;
+  // individual identifiers inside them are still caught by the text rules.
+  const reconstructed = reconstructOcr(ocr.regions);
+  if (reconstructed.text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
+  const cue = ocrDocumentCue(reconstructed.text);
+  if (cue) {
+    const page = { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight };
+    // Every word box the cue touches, widened to the lines holding them.
+    const boxes = reconstructed.spans.filter(span => span.start < cue.end && span.end > cue.start).map(span => span.bounds);
+    const bounds = textPolicy === 'all_text' || !boxes.length ? page
+      : { ...boxes.reduce(union), x: 0, width: observation.imageWidth };
+    regions.push({ kind: kind(cue.category), category: cue.category, confidence: .5,
+      bounds: validateBounds(bounds, page.width, page.height) });
+  }
   return DocumentEvidenceSchema.parse({ status: 'complete', required: true, detector: 'document_rules',
     observationId: observation.dom.observationId, regions });
 }

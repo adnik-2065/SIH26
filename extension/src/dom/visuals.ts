@@ -15,12 +15,22 @@ export function documentCategory(label: string): z.infer<typeof VisualCategorySc
 
 // OCR document cues need specific phrases. Common words such as "bank" or
 // "statement" on a general page must not mask the entire screenshot.
+const cues: Array<[z.infer<typeof VisualCategorySchema>, RegExp]> = [
+  ['aadhaar_card', /\b(?:aadhaar|aadhar|uidai)\s+(?:card|number|no\.?|enrolment|enrollment)\b/i],
+  ['pan_card', /\bpan\s+card\b|permanent\s+account\s+number/i],
+  ['passport', /\bpassport\s+(?:number|no\.?|authority|expiry|issued)\b/i],
+  ['financial_document', /\b(?:bank|credit|debit)\s+statement\b|\bcheque\s+book\b/i],
+  ['private_document', /\bconfidential\s+(?:document|record)|\bprivate\s+medical\s+record\b/i],
+];
+// Offsets let a caller mask where the cue is instead of the whole capture.
+export function ocrDocumentCue(text: string) {
+  for (const [category, expression] of cues) {
+    const match = expression.exec(text);
+    if (match) return { category, start: match.index, end: match.index + match[0].length };
+  }
+}
 export function ocrDocumentCategory(text: string): z.infer<typeof VisualCategorySchema> | undefined {
-  if (/\b(?:aadhaar|aadhar|uidai)\s+(?:card|number|no\.?|enrolment|enrollment)\b/i.test(text)) return 'aadhaar_card';
-  if (/\bpan\s+card\b|permanent\s+account\s+number/i.test(text)) return 'pan_card';
-  if (/\bpassport\s+(?:number|no\.?|authority|expiry|issued)\b/i.test(text)) return 'passport';
-  if (/\b(?:bank|credit|debit)\s+statement\b|\bcheque\s+book\b/i.test(text)) return 'financial_document';
-  if (/\bconfidential\s+(?:document|record)|\bprivate\s+medical\s+record\b/i.test(text)) return 'private_document';
+  return ocrDocumentCue(text)?.category;
 }
 
 export function collectVisualRegions() {

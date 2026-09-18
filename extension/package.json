@@ -17,6 +17,7 @@
     "lint": "eslint src tests",
     "test": "vitest run",
     "test:browser": "playwright test",
+    "live-check": "npx -y tsx tests/live-check.ts",
     "fixtures": "node scripts/fixtures.mjs",
     "hardware": "node scripts/hardware.mjs"
   },

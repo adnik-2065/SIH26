@@ -8,7 +8,7 @@ import { buildSafeStepRequest } from '../../src/privacy/gateway';
 import { LIMITS } from '../../src/privacy/contracts';
 import { detectLocalDocuments, VisionDocumentResultSchema } from '../../src/vision/documents';
 import { tileMasks } from '../../src/privacy/geometry';
-import { fixture } from '../privacy-fixture';
+import { binding, fixture } from '../privacy-fixture';
 
 describe('curated OpenRedaction additions', () => {
   it.each([
@@ -157,5 +157,76 @@ describe('freshness and minimal transport boundary', () => {
     if (!result.ok) return;
     const json = JSON.stringify(result.request);
     for (const forbidden of [raw, 'redactionMap', 'findings', 'visualRegions', 'rawValue', 'textRange', 'detector']) expect(json).not.toContain(forbidden);
+  });
+});
+
+describe('context mode masks private values, not the whole page', () => {
+  // A form is a stack of controls. Masking all of them, padded, fused the rows
+  // into one black slab that also swallowed their visible labels.
+  const form = () => {
+    const data = fixture();
+    data.ocrTextPolicy = 'sensitive_only';
+    data.observation.dom.elements = [
+      { id: `${binding.observationId}_e1`, role: 'button', type: 'button', label: 'Change layout', sensitive: false, disabled: false, filled: false,
+        bounds: { x: 10, y: 10, width: 80, height: 20 } },
+      { id: `${binding.observationId}_e2`, role: 'textbox', type: 'text', label: 'Full name', sensitive: false, disabled: false, filled: false,
+        bounds: { x: 10, y: 40, width: 100, height: 20 } },
+      { id: `${binding.observationId}_e3`, role: 'textbox', type: 'tel', label: 'Phone number', sensitive: false, disabled: false, filled: true,
+        bounds: { x: 10, y: 70, width: 100, height: 20 } },
+      { id: `${binding.observationId}_e4`, role: 'textbox', type: 'password', label: 'Sensitive field', sensitive: true, disabled: false, filled: false,
+        bounds: { x: 10, y: 100, width: 100, height: 20 } },
+    ];
+    data.faces.result!.regions = [];
+    data.ocr.result!.regions = [{ kind: 'text', text: 'Workshop', confidence: .99, bounds: { x: 10, y: 150, width: 60, height: 10 } }];
+    return data;
+  };
+  const covers = (masks: { bounds: { x: number; y: number; width: number; height: number } }[], box: { x: number; y: number; width: number; height: number }) =>
+    masks.some(({ bounds: b }) => b.x <= box.x && b.y <= box.y && b.x + b.width >= box.x + box.width && b.y + b.height >= box.y + box.height);
+
+  it('leaves empty controls and buttons visible while covering filled and secret ones', () => {
+    const data = form();
+    const plan = normalize(data, new Placeholders());
+    expect(covers(plan.masks, data.observation.dom.elements[0].bounds)).toBe(false);
+    expect(covers(plan.masks, data.observation.dom.elements[1].bounds)).toBe(false);
+    expect(covers(plan.masks, data.observation.dom.elements[2].bounds)).toBe(true);
+    expect(covers(plan.masks, data.observation.dom.elements[3].bounds)).toBe(true);
+    // The gateway must accept exactly what the planner produced.
+    expect(() => verifyMaskCoverage(data, plan.masks, plan.findings)).not.toThrow();
+  });
+  it('still covers every control in strict mode', () => {
+    const data = form(); data.ocrTextPolicy = 'all_text';
+    const plan = normalize(data, new Placeholders());
+    for (const element of data.observation.dom.elements) expect(covers(plan.masks, element.bounds)).toBe(true);
+    expect(() => verifyMaskCoverage(data, plan.masks, plan.findings)).not.toThrow();
+  });
+  it('withholds a control whose observation predates the filled flag', () => {
+    const data = form();
+    delete data.observation.dom.elements[1].filled;
+    const plan = normalize(data, new Placeholders());
+    expect(covers(plan.masks, data.observation.dom.elements[1].bounds)).toBe(true);
+  });
+  it('treats form controls and unlabelled images as context, not documents', () => {
+    const data = form();
+    data.observation.dom.visualRegions = [
+      { category: 'form_control', confidence: .8, bounds: { x: 10, y: 40, width: 100, height: 20 } },
+      { category: 'sensitive_image', confidence: .5, bounds: { x: 120, y: 40, width: 40, height: 40 } },
+      { category: 'aadhaar_card', confidence: .8, bounds: { x: 120, y: 100, width: 40, height: 40 } },
+    ];
+    const documents = detectLocalDocuments(data.observation, data.ocr.result!, 'sensitive_only');
+    expect(documents.regions.map(r => r.category)).toEqual(['aadhaar_card']);
+    expect(detectLocalDocuments(data.observation, data.ocr.result!, 'all_text').regions).toHaveLength(3);
+  });
+  it('bounds an OCR document cue to its own lines instead of the whole capture', () => {
+    const data = form();
+    data.ocr.result!.regions = [
+      { kind: 'text', text: 'Passport', confidence: .99, bounds: { x: 10, y: 150, width: 40, height: 10 } },
+      { kind: 'text', text: 'number', confidence: .99, bounds: { x: 55, y: 150, width: 40, height: 10 } },
+      { kind: 'text', text: 'Unrelated', confidence: .99, bounds: { x: 10, y: 20, width: 40, height: 10 } },
+    ];
+    const region = detectLocalDocuments(data.observation, data.ocr.result!, 'sensitive_only').regions[0];
+    expect(region.category).toBe('passport');
+    expect(region.bounds).toEqual({ x: 0, y: 150, width: 200, height: 10 });
+    expect(detectLocalDocuments(data.observation, data.ocr.result!, 'all_text').regions[0].bounds)
+      .toEqual({ x: 0, y: 0, width: 200, height: 200 });
   });
 });

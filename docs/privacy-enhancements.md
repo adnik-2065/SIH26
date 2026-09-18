@@ -53,8 +53,8 @@ The existing canonical word-offset reconstruction remains. Multi-line text maps 
 `vision/documents.ts` extends the existing document evidence contract. The panel enables `document_rules`, a conservative fallback:
 
 - Collect image, SVG, canvas, video, embedded-document/frame, CSS-background and control containers across the page, including below the viewport. Export only geometry, category and rule confidence locally; labels/URLs/values do not enter this metadata.
-- Recognize Aadhaar, PAN, passport, ID, financial/private-document, signature and QR cues. Strict mode masks unclassified visual containers too; context mode preserves generic images so unrelated page context remains visible. Specifically identified visual regions are masked in both modes.
-- Reuse OCR. Specific document cues without a trustworthy boundary trigger a whole-page mask. Ordinary words such as “bank” or “statement” alone do not trigger this fallback.
+- Recognize Aadhaar, PAN, passport, ID, financial/private-document, signature and QR cues. Strict mode masks unclassified visual containers and control containers too; context mode preserves generic images so unrelated page context remains visible, and leaves control containers to the per-control rule below. Specifically identified visual regions are masked in both modes.
+- Reuse OCR. Specific document cues have no trustworthy boundary: strict mode answers that with a whole-page mask, context mode with a mask over the lines the cue sits on, leaving the individual identifiers inside them to the text rules. Ordinary words such as “bank” or “statement” alone do not trigger this fallback.
 - Bind document evidence to the observation. Truncated collection and invalid/off-page geometry block; no empty-success fallback is used after failure.
 
 `DocumentVisionAdapter` and `inspectDocumentTiles` also accept real local model outputs when a compatible model becomes available. Strict normalized outputs contain category, source, confidence and tile-pixel bbox, without raw PII. The runner validates PNG dimensions before decoding, processes one tile at a time, translates every box to page coordinates, retains overlap-margin detections, limits resources, checks cancellation/timeouts and releases bitmaps. Low-confidence boxes still mask. No model weights or worker are falsely presented as installed.
@@ -63,7 +63,7 @@ Eka Care informed the separation between OCR words/boxes, classified entities an
 
 ## Verification and gateway
 
-Before rendering, the gateway requires masks for every positively classified OCR PII finding and all face, document, form-control and selected visual-region boxes. Strict mode also requires masks for every OCR box. It decodes the newly encoded PNG into a bounded alpha-preserving canvas and verifies every masked pixel is opaque black.
+Before rendering, the gateway requires masks for every positively classified OCR PII finding and all face, document, selected visual-region and masked-control boxes. Planner and verifier share one set of predicates in `privacy/policy.ts`, so a relaxed rule cannot produce a plan the gateway then rejects. Strict mode also requires masks for every OCR box and every control. It decodes the newly encoded PNG into a bounded alpha-preserving canvas and verifies every masked pixel is opaque black.
 
 The review offers optional OCR re-scan of the actual sanitized image using the existing local Tesseract adapter. Known residual PII, malformed/stale results, inference failure or timeout block. It is supplemental: resized OCR can miss content, so no claim of universal PII absence is made. Re-running face/model inference is unnecessary for verifying already known mask regions.
 
