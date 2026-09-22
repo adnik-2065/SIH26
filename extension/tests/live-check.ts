@@ -44,10 +44,11 @@ for (const secret of ['mira@example.test', '9876543210', 'Mira']) {
 }
 console.log('no raw personal value reached the payload\n');
 console.log('--- page_info sent ---\n' + toAgentBody(request).page_info + '\n');
-// Print what the server actually said. `requestStep` collapses every bad reply
-// into MALFORMED_RESPONSE, which is right for the panel and useless here.
+// Every stage the transport passes through, in order, with the failing one
+// carrying its code and context. This is the same stream the panel records.
 const result = await requestStep({ endpoint, request, signal: new AbortController().signal,
-  onTrace: trace => { if (trace.body !== undefined) console.log(`--- raw reply (${trace.status}) ---\n${trace.body}\n`); } });
+  onEvent: event => console.log(`[${event.stage}] +${event.elapsedMs}ms ${JSON.stringify(event.detail ?? {})}`
+    + (event.error ? `\n  ERROR ${event.error.code}: ${event.error.message}\n  ${JSON.stringify(event.error.context)}` : '')) });
 console.log('--- translated plan ---');
 console.log(JSON.stringify(result, null, 2));
 if (result.ok) console.log('--- runnable now ---', JSON.stringify(executableNow(result.steps).runnable.map(s => s.action)));

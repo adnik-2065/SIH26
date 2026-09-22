@@ -1,6 +1,8 @@
-import { PanelCommandSchema, PageChangedSchema, TaskStateSchema, type ErrorCode, type TaskState } from '../contracts';
+import { PanelCommandSchema, PageChangedSchema, TaskStateSchema, type ErrorCode, type ExtensionError, type TaskState } from '../contracts';
 import { acceptsResult, initialState, invalidate, recover } from '../agent/lifecycle';
 import { observeTab } from '../capture/observe';
+import { emptyMutationSummary, PageChangedError, pageChangedDetail } from '../capture/stability';
+import { CaptureError, captureErrorCategory } from '../capture/errors';
 
 let state = initialState();
 let captureController: AbortController | undefined;
@@ -25,9 +27,9 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
 async function release(tabId?: number) {
   if (tabId !== undefined) await chrome.tabs.sendMessage(tabId, { type: 'RELEASE' }, { frameId: 0 }).catch(() => {});
 }
-async function pause(error: ErrorCode, status: 'paused' | 'failed' | 'stopped' = 'paused') {
+async function pause(error: ErrorCode, status: 'paused' | 'failed' | 'stopped' = 'paused', detail?: ExtensionError) {
   const tabId = state.tabId;
-  state = invalidate(state, status, error);
+  state = invalidate(state, status, error, detail);
   captureController?.abort();
   if (status === 'stopped') state = { status, generation: state.generation, error };
   await persist();
@@ -55,7 +57,10 @@ function launch(snapshot: TaskState) {
     // Raw images exist only in this call and an opt-in panel preview, never storage.
   })).catch(error => serial(async () => {
     if (acceptsResult(state, taskId, generation)) {
-      if (error instanceof Error && error.message === 'PAGE_CHANGED') await pause('PAGE_CHANGED');
+      if (error instanceof CaptureError) await pause(captureErrorCategory(error.detail.code),
+        captureErrorCategory(error.detail.code) === 'PAGE_CHANGED' ? 'paused' : 'failed', error.detail);
+      else if (error instanceof PageChangedError) await pause('PAGE_CHANGED', 'paused', error.detail);
+      else if (error instanceof Error && error.message === 'PAGE_CHANGED') await pause('PAGE_CHANGED');
       else await pause(error instanceof Error && error.message === 'CAPTURE_TOO_LARGE' ? 'CAPTURE_TOO_LARGE' : 'CAPTURE_FAILED', 'failed');
     }
   }));
@@ -70,7 +75,8 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
   if (sender.tab && !isPanel) {
     const parsed = PageChangedSchema.safeParse(raw);
     if (parsed.success && sender.frameId === 0) void serial(async () => {
-      if (sender.tab?.id === state.tabId && parsed.data.observationId === state.observationId) await pause('PAGE_CHANGED');
+      if (sender.tab?.id === state.tabId && parsed.data.observationId === state.observationId)
+        await pause('PAGE_CHANGED', 'paused', parsed.data.detail);
     });
     return;
   }
@@ -119,8 +125,10 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
 });
 chrome.tabs.onRemoved.addListener(tabId => { void serial(async () => { if (state.tabId === tabId) await pause('STOPPED', 'stopped'); }); });
 chrome.tabs.onUpdated.addListener((tabId, change) => { if (change.status === 'loading' || change.url) void serial(async () => {
-  if (state.tabId === tabId && state.status !== 'stopped') await pause('PAGE_CHANGED');
+  if (state.tabId === tabId && state.status !== 'stopped') await pause('PAGE_CHANGED', 'paused',
+    pageChangedDetail('PAGE_CHANGED_NAVIGATION', emptyMutationSummary(), undefined, undefined, 'The tab navigated while its capture was active.'));
 }); });
 chrome.tabs.onActivated.addListener(info => { void serial(async () => {
-  if (state.tabId !== undefined && state.windowId === info.windowId && state.tabId !== info.tabId) await pause('PAGE_CHANGED');
+  if (state.tabId !== undefined && state.windowId === info.windowId && state.tabId !== info.tabId) await pause('PAGE_CHANGED', 'paused',
+    pageChangedDetail('PAGE_CHANGED_NAVIGATION', emptyMutationSummary(), undefined, undefined, 'The active tab changed while its capture was active.'));
 }); });

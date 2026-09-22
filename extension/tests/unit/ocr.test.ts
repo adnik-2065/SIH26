@@ -16,7 +16,7 @@ describe('OCR normalization', () => {
   });
   it('distinguishes no text from missing layout output', () => {
     expect(normalizeOcr({ blocks: [] }, 'obs_1', 800, 600, 0).regions).toEqual([]);
-    expect(() => normalizeOcr({ blocks: null }, 'obs_1', 800, 600, 0)).toThrow('OCR_LAYOUT_MISSING');
+    expect(() => normalizeOcr({ blocks: null }, 'obs_1', 800, 600, 0)).toThrow('OCR_NORMALIZATION_FAILED');
   });
   it('rejects out-of-image coordinates, invalid confidence, and overflowing output', () => {
     expect(() => normalizeOcr(data(), 'obs_1', 100, 100, 0)).toThrow('OCR_INVALID_BOUNDS');
@@ -82,7 +82,7 @@ describe('OCR worker lifecycle', () => {
     const input = setup(), adapter = new TesseractAdapter();
     const pending = adapter.inspect(input, new AbortController().signal);
     FakeWorker.instances[0].reply({ type: 'result', result: { ...result(), observationId: 'old' } });
-    await expect(pending).rejects.toThrow('OCR_INVALID_RESULT');
+    await expect(pending).rejects.toThrow('OCR_INVALID_OBSERVATION');
     expect(FakeWorker.instances[0].terminate).toHaveBeenCalledOnce();
   });
   it('closes already aborted inputs and rejects concurrent scans', async () => {

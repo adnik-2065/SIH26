@@ -94,7 +94,7 @@ for (const stage of ['decode', 'mask', 'encode'] as const) test(`Stop during ${s
     await new Promise(resolve => setTimeout(resolve, 30));
     return { stopped, retried: retry.ok, calls, released: canvases.every(c => !c.width && !c.height) };
   }, stage);
-  expect(result.stopped).toEqual({ ok: false, blockedReasons: ['STOPPED'] }); expect(result.retried).toBe(true);
+  expect(result.stopped).toMatchObject({ ok: false, blockedReasons: ['STOPPED'] }); expect(result.retried).toBe(true);
   expect(result.calls).toBeGreaterThan(0); expect(result.released).toBe(true);
 });
 
@@ -182,7 +182,7 @@ for (const corruption of ['white', 'transparent', 'dimensions']) test(`encoded-o
     try { return await h.buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal }); }
     finally { OffscreenCanvas.prototype.convertToBlob = encode; }
   }, corruption);
-  expect(result).toEqual({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
 });
 
 test('optional OCR verifies sanitized output and blocks remaining PII, failures and stale results', async ({ page }) => {
@@ -201,7 +201,7 @@ test('optional OCR verifies sanitized output and blocks remaining PII, failures 
     return results;
   });
   expect(results[0].ok).toBe(true);
-  for (const result of results.slice(1)) expect(result).toEqual({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  for (const result of results.slice(1)) expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
   expect(JSON.stringify(results)).not.toContain('mira@example.test');
 });
 

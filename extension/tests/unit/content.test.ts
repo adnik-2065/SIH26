@@ -1,36 +1,40 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../src/dom/observe', () => ({ collect: vi.fn((_observationId, _documentId, _revision, refs: Map<string, unknown>) => {
+vi.mock('../../src/dom/observe', () => ({ candidates: 'input,button,a[href]', collect: vi.fn((_observationId, _documentId, _revision, refs: Map<string, unknown>) => {
   const reviewed = (globalThis as typeof globalThis & { __reviewedControl?: unknown }).__reviewedControl;
   if (reviewed) refs.set('obs_e1', reviewed);
-  return {};
+  return { elements: reviewed ? [{ id: 'obs_e1', bounds: { x: 0, y: 0, width: 100, height: 30 } }] : [] };
 }) }));
-let listener: (command: object, sender: object, reply: () => void) => void;
-let mutated: (records: object[]) => void;
-// Minimal stand-ins for the only DOM surface the mutation filter reads.
-const element = () => ({ nodeType: 1, parentElement: null, contains: (_node?: unknown) => false });
-const structural = (target = element()) => ({ type: 'childList', target, addedNodes: [element()], removedNodes: [] });
-const attribute = (target = element(), attributeName?: string) => ({ type: 'attributes', target, attributeName });
-const edited = (target = element()) => ({ type: 'characterData', target });
-// A container that holds the reviewed control, the way <body> holds every
-// control on the page. Only `element.contains(reviewed)` is true for it.
-const reviewedControl = () => (globalThis as typeof globalThis & { __reviewedControl: ReturnType<typeof element> }).__reviewedControl;
-const container = () => ({ nodeType: 1, parentElement: null, contains: (node?: unknown) => node === reviewedControl() });
-const handlers = new Map<string, () => void>();
+let listener: (command: object, sender: object, reply: (value?: unknown) => void) => void;
+const bounds = () => ({ x: 0, y: 0, width: 100, height: 30, top: 0, left: 0, right: 100, bottom: 30 });
+const element = () => ({ nodeType: 1, parentElement: null, childNodes: [], contains: (_node?: unknown) => false,
+  closest: () => null, matches: () => false, querySelector: () => null, getBoundingClientRect: bounds });
+const handlers = new Map<string, Array<() => void>>();
+const fire = (event: string) => { for (const handler of handlers.get(event) ?? []) handler(); };
 const sendMessage = vi.fn().mockResolvedValue(undefined);
-const command = (type: string) => listener(type === 'RELEASE' ? { type } : { type, observationId: 'obs' }, { id: 'extension' }, () => {});
+let observerConstructed = 0;
+const command = (type: string, extra: object = {}) => {
+  let result: unknown;
+  listener(type === 'RELEASE' ? { type } : { type, observationId: 'obs', ...extra }, { id: 'extension' }, value => { result = value; });
+  return result;
+};
+const act = () => command('ACT', { action: { type: 'click', target: 'obs_e1' } });
 beforeEach(async () => {
-  vi.resetModules(); handlers.clear(); sendMessage.mockClear(); sendMessage.mockResolvedValue(undefined);
+  vi.resetModules(); handlers.clear(); sendMessage.mockClear(); sendMessage.mockResolvedValue(undefined); observerConstructed = 0;
   vi.stubGlobal('__sih26Installed', undefined);
   vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 600); vi.stubGlobal('devicePixelRatio', 1);
   vi.stubGlobal('scrollX', 0); vi.stubGlobal('scrollY', 0);
   vi.stubGlobal('visualViewport', undefined);
+  vi.stubGlobal('location', { href: 'https://example.test/form' });
+  vi.stubGlobal('getComputedStyle', () => ({ display: 'block', visibility: 'visible', opacity: '1' }));
   vi.stubGlobal('__reviewedControl', element());
-  vi.stubGlobal('window', { addEventListener: (event: string, callback: () => void) => handlers.set(event, callback) });
-  vi.stubGlobal('document', { documentElement: {}, querySelectorAll: () => [] });
+  vi.stubGlobal('window', { addEventListener: (event: string, callback: () => void) => {
+    handlers.set(event, [...(handlers.get(event) ?? []), callback]);
+  } });
+  vi.stubGlobal('document', { documentElement: {}, body: {}, querySelectorAll: () => [], getElementsByTagName: () => [] });
   vi.stubGlobal('Node', { ELEMENT_NODE: 1 });
   vi.stubGlobal('MutationObserver', class {
-    constructor(callback: (records: object[]) => void) { mutated = callback; }
+    constructor() { observerConstructed++; }
     observe() {}
     takeRecords() { return []; }
   });
@@ -39,139 +43,70 @@ beforeEach(async () => {
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-describe('capture viewport tracking', () => {
-  it('ignores a resize event only when the viewport did not change', () => {
-    command('COLLECT'); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-    vi.stubGlobal('innerWidth', 900); handlers.get('resize')!();
-    expect(sendMessage).toHaveBeenCalledWith({ type: 'PAGE_CHANGED', observationId: 'obs' });
+// The content script no longer watches the DOM. A live application mutates
+// constantly — counters, badges, re-renders, lazy images — and none of it means
+// the captured pixels stopped describing the page.
+describe('page churn no longer retires an observation', () => {
+  it('installs no MutationObserver at all', () => {
+    command('COLLECT');
+    expect(observerConstructed).toBe(0);
   });
-  it('permits the debugging notice to restore the original size without discarding results', () => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
+  it.each(['resize', 'scroll', 'input', 'change', 'animationstart', 'transitionrun'])(
+    'does not report %s as a page change', event => {
+      command('COLLECT');
+      fire(event);
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+  it('does not report a viewport change on its own', () => {
+    command('COLLECT');
+    vi.stubGlobal('innerWidth', 900); fire('resize');
+    vi.stubGlobal('innerHeight', 300); fire('resize');
     expect(sendMessage).not.toHaveBeenCalled();
-    vi.stubGlobal('innerHeight', 700); handlers.get('resize')!();
-    expect(sendMessage).toHaveBeenCalledOnce();
+    // The capture check is what compares the viewport, and it still answers.
+    expect(command('CHECK')).toMatchObject({ snapshot: expect.anything(), stability: expect.anything() });
   });
-  it.each(['input', 'scroll'])('never suppresses user %s during capture', event => {
+  it('keeps answering CHECK with a snapshot after ordinary churn', () => {
     command('PREPARE_CAPTURE'); command('COLLECT');
-    handlers.get(event)!();
-    expect(sendMessage).toHaveBeenCalledOnce();
+    fire('scroll'); fire('resize'); fire('input');
+    const checked = command('CHECK') as { snapshot?: unknown; stability?: { url: string }; error?: string };
+    expect(checked.error).toBeUndefined();
+    expect(checked.stability?.url).toBe('https://example.test/form');
   });
-  it('preserves the original viewport across Scan again while the notice is still visible', () => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE'); command('RELEASE');
-    command('PREPARE_CAPTURE'); command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
+});
+
+// Navigation is the one thing the page itself can still report, because the
+// document the screenshots describe no longer exists.
+describe('navigation still retires an observation', () => {
+  it.each(['popstate', 'hashchange', 'pagehide'])('reports %s as a navigation', event => {
+    command('COLLECT');
+    fire(event);
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'PAGE_CHANGED', observationId: 'obs',
+      detail: expect.objectContaining({ code: 'PAGE_CHANGED', cause: 'PAGE_CHANGED_NAVIGATION' }),
+    }));
+  });
+  it('fails the capture check when navigation happened mid-capture', () => {
+    command('PREPARE_CAPTURE'); command('COLLECT');
+    fire('hashchange');
+    // Nothing is published mid-capture; the check is where it surfaces.
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(command('CHECK')).toMatchObject({ error: 'PAGE_CHANGED', detail: { cause: 'PAGE_CHANGED_NAVIGATION' } });
   });
-  it('never suppresses DOM mutations during capture', () => {
-    command('PREPARE_CAPTURE'); command('COLLECT'); mutated([structural()]);
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it.each([['text', edited], ['structural', structural], ['attribute', attribute]])('keeps observation through an unrelated %s change after capture', (_name, record) => {
-    // A ticking clock would otherwise retire the observation within a second,
-    // long before the reasoning server has answered.
-    command('COLLECT'); mutated([record()]);
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-  it.each([['text', edited], ['structural', structural], ['attribute', attribute]])('retires observation when %s change touches reviewed control', (_name, record) => {
+  it('refuses an action once the page has navigated', () => {
     command('COLLECT');
-    const reviewed = (globalThis as typeof globalThis & { __reviewedControl: ReturnType<typeof element> }).__reviewedControl;
-    mutated([record(reviewed)]);
-    expect(sendMessage).toHaveBeenCalledOnce();
+    fire('popstate');
+    expect(act()).toMatchObject({ error: 'PAGE_CHANGED' });
   });
-  // Regression: a live application appends a toast to <body> and toggles a
-  // class on <html> every few seconds. Both contain every reviewed control, so
-  // counting containment upwards retired the observation before the reasoning
-  // server answered, and every proposed step came back PAGE_CHANGED.
-  it.each([['structural', structural], ['attribute', attribute]])('keeps observation when an unrelated %s change lands on a container of the reviewed control', (_name, record) => {
-    command('COLLECT'); mutated([record(container())]);
-    expect(sendMessage).not.toHaveBeenCalled();
+});
+
+describe('capture bookkeeping', () => {
+  it('reports a stability snapshot beside the DOM snapshot', () => {
+    const response = command('COLLECT') as { stability: { url: string; viewportWidth: number; interactiveElementCount: number } };
+    expect(response.stability).toMatchObject({ url: 'https://example.test/form', viewportWidth: 800, interactiveElementCount: 1 });
   });
-  it('retires observation when the reviewed control itself is detached', () => {
+  it('clears its element map on RELEASE', () => {
     command('COLLECT');
-    mutated([{ type: 'childList', target: container(), addedNodes: [], removedNodes: [reviewedControl()] }]);
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it('retires observation when a replacement subtree brings the reviewed control with it', () => {
-    command('COLLECT');
-    const replacement = container();
-    mutated([{ type: 'childList', target: container(), addedNodes: [replacement], removedNodes: [] }]);
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it.each(['src', 'srcset', 'poster'])('retires observation when an unrelated %s change replaces captured pixels', attributeName => {
-    command('COLLECT'); mutated([attribute(element(), attributeName)]);
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it.each([false, true])('preserves the notice inset across Stop and immediate restart (native reset: %s)', reset => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT');
-    if (reset) {
-      vi.stubGlobal('innerWidth', 1); vi.stubGlobal('innerHeight', 1); handlers.get('resize')!();
-    }
     command('RELEASE');
-    vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('PREPARE_CAPTURE'); command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-    vi.stubGlobal('innerHeight', 700); handlers.get('resize')!();
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it('separates the sidebar opening inset from the debugging notice height', () => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    vi.stubGlobal('innerWidth', 640); vi.stubGlobal('innerHeight', 536); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 592); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-  it('allows only the native 1×1 reset and exact return during capture', () => {
-    command('PREPARE_CAPTURE'); command('COLLECT');
-    vi.stubGlobal('innerWidth', 1); vi.stubGlobal('innerHeight', 1); handlers.get('resize')!();
-    vi.stubGlobal('innerWidth', 800); vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-    vi.stubGlobal('innerWidth', 900); handlers.get('resize')!();
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it.each(['animationstart', 'transitionrun'])('allows native capture CSS %s while motion is paused, then resumes tracking', event => {
-    command('PREPARE_CAPTURE'); command('COLLECT'); handlers.get(event)!();
-    expect(sendMessage).not.toHaveBeenCalled();
-    command('FINISH_CAPTURE'); handlers.get(event)!();
-    expect(sendMessage).toHaveBeenCalledOnce();
-  });
-  it('does not add a previous notice height after the viewport already restored but its resize event is still queued', () => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE'); command('RELEASE');
-    vi.stubGlobal('innerHeight', 600);
-    command('PREPARE_CAPTURE');
-    handlers.get('resize')!();
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-  it('tracks notice restoration across a zoom change between scans', () => {
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE'); command('RELEASE');
-    vi.stubGlobal('innerWidth', 640); vi.stubGlobal('innerHeight', 435); vi.stubGlobal('devicePixelRatio', 1.25); handlers.get('resize')!();
-    command('PREPARE_CAPTURE'); command('COLLECT'); command('FINISH_CAPTURE');
-    vi.stubGlobal('innerHeight', 480); handlers.get('resize')!();
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-  it('does not allow a delayed resize exception after the notice deadline', () => {
-    const now = vi.spyOn(performance, 'now').mockReturnValue(0);
-    command('PREPARE_CAPTURE');
-    vi.stubGlobal('innerHeight', 544); handlers.get('resize')!();
-    command('COLLECT'); command('FINISH_CAPTURE');
-    now.mockReturnValue(10_001);
-    vi.stubGlobal('innerHeight', 600); handlers.get('resize')!();
-    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(act()).toMatchObject({ error: 'PAGE_CHANGED' });
   });
 });

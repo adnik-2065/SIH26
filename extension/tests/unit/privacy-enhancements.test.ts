@@ -135,17 +135,17 @@ describe('freshness and minimal transport boundary', () => {
   it('blocks missing capture age and missing masks for known visual containers', async () => {
     const data = fixture(); delete data.observation.capturedAt;
     expect(await buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal }))
-      .toEqual({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
+      .toMatchObject({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
     data.observation.capturedAt = Date.now();
     data.observation.dom.visualRegions = [{ category: 'signature', confidence: .5, bounds: { x: 160, y: 160, width: 20, height: 20 } }];
     expect(await buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal }))
-      .toEqual({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+      .toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
   });
   it('blocks old and future capture timestamps', async () => {
     for (const capturedAt of [Date.now() - LIMITS.ttlMs - 1, Date.now() + 10000]) {
       const data = fixture(); data.observation.capturedAt = capturedAt;
       expect(await buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal }))
-        .toEqual({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
+        .toMatchObject({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
     }
   });
   it('exports no added-detector values, findings, document metadata or restoration map', async () => {

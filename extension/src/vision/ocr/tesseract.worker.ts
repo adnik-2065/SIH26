@@ -17,7 +17,7 @@ self.onmessage = async (event: MessageEvent<PerceptionInput & { assetRoot: strin
       workerPath: `${input.assetRoot}/worker.min.js`, corePath: `${input.assetRoot}/core`,
       langPath: `${input.assetRoot}/lang`, workerBlobURL: false, cacheMethod: 'none',
       logger: message => self.postMessage({ type: 'progress', observationId, status: message.status, progress: message.progress }),
-      errorHandler: () => self.postMessage({ type: 'error', observationId, code: 'OCR_FAILED' }),
+      errorHandler: () => self.postMessage({ type: 'error', observationId, code: 'OCR_WORKER_INIT_FAILED' }),
     }).then(async worker => {
       await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
       return worker;
@@ -25,14 +25,14 @@ self.onmessage = async (event: MessageEvent<PerceptionInput & { assetRoot: strin
     const worker = await engine;
     canvas = new OffscreenCanvas(width, height);
     const context = canvas.getContext('2d');
-    if (!context) throw new Error('OCR_FAILED');
+    if (!context) throw new Error('OCR_EXECUTION_FAILED');
     context.drawImage(input.image, 0, 0);
     input.image.close();
     const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
     const result = normalizeOcr(data, observationId, width, height, performance.now() - started);
     self.postMessage({ type: 'result', result });
   } catch (error) {
-    const code = error instanceof Error && ['OCR_TOO_MUCH_TEXT', 'OCR_LAYOUT_MISSING', 'OCR_INVALID_BOUNDS'].includes(error.message) ? error.message : 'OCR_FAILED';
+    const code = error instanceof Error && error.message.startsWith('OCR_') ? error.message : 'OCR_EXECUTION_FAILED';
     self.postMessage({ type: 'error', observationId, code });
   } finally {
     input.image.close();

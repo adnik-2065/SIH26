@@ -83,11 +83,13 @@ describe('translating a server response into actions', () => {
     ['an empty output list', reply([])],
     ['prose instead of JSON', 'I will click the submit button'],
   ])('rejects %s outright', (_label, payload) => {
-    expect(planActions(payload, request)).toEqual({ ok: false, reason: 'MALFORMED_RESPONSE' });
+    expect(planActions(payload, request)).toMatchObject({ ok: false, reason: 'MALFORMED_RESPONSE',
+      error: { code: 'AGENT_RESPONSE_SCHEMA_INVALID', stage: 'response_validated' } });
   });
   it('rejects a reply that echoes a different request', () => {
-    expect(planActions(reply([{ action: 'finish' }], { requestId: 'request_9' }), request)).toEqual({ ok: false, reason: 'WRONG_REQUEST' });
-    expect(planActions(reply([{ action: 'finish' }], { observationId: 'obs_9' }), request)).toEqual({ ok: false, reason: 'WRONG_REQUEST' });
+    expect(planActions(reply([{ action: 'finish' }], { requestId: 'request_9' }), request)).toMatchObject({ ok: false, reason: 'WRONG_REQUEST',
+      error: { code: 'AGENT_PLAN_VALIDATION_FAILED', context: { mismatchedField: 'requestId' } } });
+    expect(planActions(reply([{ action: 'finish' }], { observationId: 'obs_9' }), request)).toMatchObject({ ok: false, reason: 'WRONG_REQUEST' });
     expect(planActions(reply([{ action: 'finish' }], { requestId: 'request_1', taskId: 'task_1' }), request).ok).toBe(true);
   });
   it('runs one page-touching step per observation and defers the rest', () => {
@@ -128,21 +130,21 @@ describe('sending the redacted payload', () => {
   it('refuses a plain http endpoint before any payload is built', async () => {
     const fetchImpl = ok(wrapped([{ action: 'finish' }]));
     expect(await requestStep({ endpoint: 'http://tracker.example.test/step', request, signal: signal(), fetchImpl }))
-      .toEqual({ ok: false, reason: 'ENDPOINT_REJECTED' });
+      .toMatchObject({ ok: false, reason: 'ENDPOINT_REJECTED', error: { code: 'AGENT_ENDPOINT_REJECTED' } });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
   it.each([
-    ['a server error', vi.fn().mockResolvedValue(new Response('no', { status: 500 })), 'SERVER_REFUSED'],
-    ['an unreachable server', vi.fn().mockRejectedValue(new Error('offline')), 'SERVER_UNREACHABLE'],
-    ['a non-JSON body', vi.fn().mockResolvedValue(new Response('<html>', { status: 200 })), 'MALFORMED_RESPONSE'],
-  ])('fails closed on %s', async (_label, fetchImpl, reason) => {
-    expect(await requestStep({ endpoint: 'https://agent.example.test/step', request, signal: signal(), fetchImpl }))
-      .toEqual({ ok: false, reason });
+    ['a server error', () => vi.fn().mockResolvedValue(new Response('no', { status: 500 })), 'SERVER_REFUSED', 'AGENT_HTTP_ERROR'],
+    ['an unreachable server', () => vi.fn().mockRejectedValue(new Error('offline')), 'SERVER_UNREACHABLE', 'AGENT_UNKNOWN_ERROR'],
+    ['a non-JSON body', () => vi.fn().mockResolvedValue(new Response('<html>', { status: 200 })), 'MALFORMED_RESPONSE', 'AGENT_JSON_PARSE_FAILED'],
+  ])('fails closed on %s', async (_label, fetchImpl, reason, code) => {
+    expect(await requestStep({ endpoint: 'https://agent.example.test/step', request, signal: signal(), fetchImpl: fetchImpl() }))
+      .toMatchObject({ ok: false, reason, error: { code } });
   });
   it('refuses an oversized reply instead of parsing it', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response('x'.repeat(200_001), { status: 200 }));
     expect(await requestStep({ endpoint: 'https://agent.example.test/step', request, signal: signal(), fetchImpl }))
-      .toEqual({ ok: false, reason: 'RESPONSE_TOO_LARGE' });
+      .toMatchObject({ ok: false, reason: 'RESPONSE_TOO_LARGE', error: { code: 'AGENT_RESPONSE_TOO_LARGE' } });
   });
   it('abandons the call when the task stops', async () => {
     const controller = new AbortController();
@@ -151,7 +153,10 @@ describe('sending the redacted payload', () => {
     }));
     const pending = requestStep({ endpoint: 'https://agent.example.test/step', request, signal: controller.signal, fetchImpl });
     controller.abort();
-    expect(await pending).toEqual({ ok: false, reason: 'SERVER_UNREACHABLE' });
+    // The category older callers read is unchanged; the cancellation itself is
+    // now named, so it can no longer be mistaken for an unreachable server.
+    expect(await pending).toMatchObject({ ok: false, reason: 'SERVER_UNREACHABLE',
+      error: { code: 'AGENT_FETCH_ABORTED', context: { callerSignalAborted: true, timeoutReached: false, responseReceived: false } } });
   });
 });
 
@@ -165,6 +170,16 @@ describe('the body sent to the reasoning server', () => {
     for (const id of body.page_info.match(/id=\S+/g) ?? []) expect(request.elements.some(element => id === `id=${element.id}`)).toBe(true);
     expect(body.page_info).toContain('value_1 fills obs_1_e1');
     expect(body.problem_context).toContain('Never invent an id');
+  });
+  it('includes a safe execution report without allowing another action', () => {
+    const body = toAgentBody({ ...request }, {
+      observationId: 'obs_previous', actionType: 'click', target: 'obs_previous_e1', status: 'executed',
+    });
+    expect(body.problem_context).toContain('Execution report from the previous observation');
+    expect(body.problem_context).toContain('"actionType":"click"');
+    expect(body.problem_context).toContain('"target":"obs_previous_e1"');
+    expect(body.problem_context).toContain('do not execute another action');
+    expect(body.problem_context).not.toContain('student@example.com');
   });
   it('describes an empty view without pretending controls exist', () => {
     expect(describePage({ ...request, elements: [], valueRefs: [] })).toContain('no interactive element');

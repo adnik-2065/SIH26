@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { observeTab } from '../../src/capture/observe';
+import { CaptureError, captureErrorCategory } from '../../src/capture/errors';
 import { captureTiles } from '../../src/capture/tiles';
 
 const snapshot = { observationId: 'obs_1', documentId: 'doc_1', revision: 0, origin: 'https://example.test',
   viewport: { width: 800, height: 600, scrollX: 0, scrollY: 250, devicePixelRatio: 1, visualScale: 1, offsetX: 0, offsetY: 0 },
   elements: [], hiddenCount: 0, truncated: false };
+const stability = { url: 'https://example.test/form', documentId: 'doc_1', documentWidth: 800, documentHeight: 1800,
+  scrollWidth: 800, scrollHeight: 1800, viewportWidth: 800, viewportHeight: 600, scrollX: 0, scrollY: 250,
+  totalElementCount: 20, interactiveElementCount: 0 };
+const mutationSummary = { total: 0, ignored: 0, significant: 0, categories: {} };
+const response = (dom = snapshot, stable = stability, mutations = mutationSummary) => ({ snapshot: dom, stability: stable, mutations });
 function png(width = 800, height = 1800) {
   const bytes = new Uint8Array(33);
   bytes.set([137, 80, 78, 71, 13, 10, 26, 10]);
@@ -18,7 +24,7 @@ const addListener = vi.fn(), removeListener = vi.fn(), captureVisibleTab = vi.fn
 const executeScript = vi.fn(), insertCSS = vi.fn(), removeCSS = vi.fn();
 beforeEach(() => {
   query.mockResolvedValue([{ id: 1, url: 'https://example.test/form' }]);
-  sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : snapshot);
+  sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : response());
   attach.mockResolvedValue(undefined); detach.mockResolvedValue(undefined);
   executeScript.mockResolvedValue([]); insertCSS.mockResolvedValue(undefined); removeCSS.mockResolvedValue(undefined);
   sendCommand.mockImplementation(async (_target, method: string) => method === 'Page.getLayoutMetrics'
@@ -84,20 +90,28 @@ describe('non-scrolling full-page capture', () => {
     expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[0][0]);
     expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[1][0]);
   });
-  it('rejects real changes during capture and always detaches', async () => {
-    sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : command.type === 'CHECK' ? { ...snapshot, revision: 1 } : snapshot);
+  it('rejects a major document-size change during capture and always detaches', async () => {
+    sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true }
+      : command.type === 'CHECK' ? response(snapshot, { ...stability, documentHeight: 4000, scrollHeight: 4000 }) : response());
     await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('PAGE_CHANGED');
     expect(detach).toHaveBeenCalledOnce();
   });
-  it('does not touch a different active tab', async () => {
+  it('does not touch a different active tab, and says the tab changed', async () => {
     query.mockResolvedValue([{ id: 2, url: 'https://example.test' }]);
-    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('PAGE_CHANGED');
+    // The coarse task error is still PAGE_CHANGED; the detail names the tab.
+    const failure = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}).catch(error => error as CaptureError);
+    expect(failure).toBeInstanceOf(CaptureError);
+    expect((failure as CaptureError).detail).toMatchObject({ code: 'CAPTURE_ACTIVE_TAB_CHANGED', stage: 'CAPTURE',
+      context: { expectedTabId: 1, activeTabId: 2 } });
+    expect(captureErrorCategory((failure as CaptureError).detail.code)).toBe('PAGE_CHANGED');
     expect(attach).not.toHaveBeenCalled();
     expect(detach).not.toHaveBeenCalled();
   });
   it('does not detach someone else or fall back to scrolling if attach fails', async () => {
     attach.mockRejectedValue(new Error('Already attached'));
-    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('Already attached');
+    const failure = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}).catch(error => error as CaptureError);
+    expect((failure as CaptureError).detail).toMatchObject({ code: 'CAPTURE_DEBUGGER_ATTACH_FAILED',
+      context: { errorMessage: 'Already attached' } });
     expect(detach).not.toHaveBeenCalled();
     expect(sendCommand).not.toHaveBeenCalled();
     expect(captureVisibleTab).not.toHaveBeenCalled();
@@ -110,7 +124,8 @@ describe('non-scrolling full-page capture', () => {
   it.each([{ width: 1400, height: 40000, dpr: 1 }, { width: 1400, height: 18000, dpr: 2 }, { width: 800, height: 100000, dpr: 1.25 }])(
     'captures every part of a $width × $height page at DPR $dpr with bounded allocations', async ({ width, height, dpr }) => {
       const dom = { ...snapshot, viewport: { ...snapshot.viewport, devicePixelRatio: dpr } };
-      sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : dom);
+      const dimensions = { ...stability, documentWidth: width, documentHeight: height, scrollWidth: width, scrollHeight: height };
+      sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : response(dom, dimensions));
       sendCommand.mockImplementation(async (_target, method, params) => method === 'Page.getLayoutMetrics'
         ? { cssContentSize: { width, height } } : method === 'Page.captureScreenshot'
           ? { data: png(Math.round(params.clip.width * dpr), Math.round(params.clip.height * dpr)) } : {});
@@ -138,7 +153,7 @@ describe('non-scrolling full-page capture', () => {
     });
   it('bounds unsupported width before requesting a screenshot', async () => {
     sendCommand.mockResolvedValue({ cssContentSize: { width: 40000, height: 1000 } });
-    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_TOO_LARGE');
+    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_DIMENSION_LIMIT_EXCEEDED');
     expect(sendCommand).toHaveBeenCalledTimes(1);
     expect(detach).toHaveBeenCalledOnce();
   });
@@ -153,10 +168,25 @@ describe('non-scrolling full-page capture', () => {
     expect(sendMessage.mock.calls.some(([, command]) => command.type === 'FINISH_CAPTURE')).toBe(false);
     expect(detach).toHaveBeenCalledOnce();
   });
-  it('rejects invalid PNG dimensions', async () => {
+  it.each([
+    // Each protective limit reports which one fired and the value it saw.
+    ['a page wider than the maximum side', 40_000, 1_800, 'CAPTURE_DIMENSION_LIMIT_EXCEEDED', { maximumSide: 32_767, width: 40_000 }],
+    ['a pixel count over the maximum', 20_000, 2_000, 'CAPTURE_PIXEL_LIMIT_EXCEEDED', { maximumPixels: 32_000_000, pixels: 40_000_000 }],
+  ])('refuses %s', async (_label, width, height, code, context) => {
+    sendCommand.mockImplementation(async (_target, method) => method === 'Page.getLayoutMetrics'
+      ? { cssContentSize: { width, height } } : { data: png(width, height) });
+    const failure = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}).catch(error => error as CaptureError);
+    expect((failure as CaptureError).detail).toMatchObject({ code, stage: 'CAPTURE' });
+    expect((failure as CaptureError).detail.context).toMatchObject(context);
+    expect(captureErrorCategory((failure as CaptureError).detail.code)).toBe('CAPTURE_TOO_LARGE');
+  });
+  it('rejects invalid PNG dimensions, and reports what it expected', async () => {
     sendCommand.mockImplementation(async (_target, method) => method === 'Page.getLayoutMetrics'
       ? { cssContentSize: { width: 800, height: 1800 } } : { data: png(600) });
-    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_FAILED');
+    const failure = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}).catch(error => error as CaptureError);
+    expect((failure as CaptureError).detail).toMatchObject({ code: 'CAPTURE_SCREENSHOT_INVALID', stage: 'CAPTURE' });
+    expect((failure as CaptureError).detail.context).toMatchObject({ expectedWidth: 800, actualWidth: 600 });
+    expect(captureErrorCategory((failure as CaptureError).detail.code)).toBe('CAPTURE_FAILED');
     expect(detach).toHaveBeenCalledOnce();
   });
   it('Stop interrupts a pending screenshot immediately and discards its late result', async () => {
@@ -184,7 +214,9 @@ describe('non-scrolling full-page capture', () => {
     vi.useFakeTimers();
     sendCommand.mockReturnValue(new Promise(() => {}));
     const result = observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
-    const rejected = expect(result).rejects.toThrow('CAPTURE_FAILED');
+    // The per-command deadline is named, so a stall is distinguishable from a
+    // refused command or an invalid screenshot.
+    const rejected = expect(result).rejects.toThrow('CAPTURE_COMMAND_TIMEOUT');
     await vi.advanceTimersByTimeAsync(15_250);
     await rejected;
     expect(detach).toHaveBeenCalledOnce();
@@ -194,7 +226,7 @@ describe('non-scrolling full-page capture', () => {
       addListener.mock.calls[0][0]({ tabId: 1 }, 'canceled_by_user');
       return new Promise(() => {});
     });
-    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_FAILED');
+    await expect(observeTab(1, 1, snapshot.origin, 'obs_1', () => {})).rejects.toThrow('CAPTURE_DEBUGGER_DETACHED');
     expect(detach).not.toHaveBeenCalled();
     expect(removeListener).toHaveBeenCalledOnce();
   });
@@ -207,6 +239,6 @@ describe('capture tile planning', () => {
       expect(tile.height).toBeLessThanOrEqual(8192);
       expect(width * tile.height).toBeLessThanOrEqual(8_000_000);
     }
-    expect(() => captureTiles(800, Number.MAX_SAFE_INTEGER)).toThrow('CAPTURE_TOO_LARGE');
+    expect(() => captureTiles(800, Number.MAX_SAFE_INTEGER)).toThrow('CAPTURE_PIXEL_LIMIT_EXCEEDED');
   });
 });

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { CaptureObservationSchema, CaptureTileSchema, StepRequestSchema, VisualCategorySchema } from '../contracts';
-import type { StepRequest } from '../contracts';
+import type { ExtensionError, StepRequest } from '../contracts';
 export type { StepRequest };
 import { PerceptionResultSchema } from '../vision/contracts';
 
@@ -23,11 +23,33 @@ export const FindingSchema = z.object({ id: IdSchema, source: z.enum(['ocr', 'fa
 export type Finding = z.infer<typeof FindingSchema>;
 export const MaskSchema = z.object({ bounds: BoundsSchema, reasons: z.array(PiiKindSchema).min(1).max(19) }).strict();
 export type Mask = z.infer<typeof MaskSchema>;
-export const BlockReasonSchema = z.enum(['STALE_OBSERVATION', 'STOPPED', 'INVALID_INPUT', 'INCOMPLETE_DETECTION',
-  'INVALID_BOUNDS', 'TEXT_WITHHELD', 'LIMIT_EXCEEDED', 'MASKING_FAILED', 'IMAGE_TOO_LARGE', 'RAW_DATA_LEAK', 'INVALID_REFERENCE', 'VERIFICATION_FAILED']);
+// Why an export was refused. The gateway still fails closed on every one of
+// these; the difference is that each now names the evidence that was missing or
+// the rule that fired, instead of one word covering seven unrelated causes.
+// The two generic values are kept for third-party paths that still raise them.
+export const BlockReasonSchema = z.enum(['STALE_OBSERVATION', 'STOPPED', 'INVALID_INPUT',
+  'INCOMPLETE_DETECTION',
+  'INCOMPLETE_DETECTION_OCR', 'INCOMPLETE_DETECTION_FACE', 'INCOMPLETE_DETECTION_DOCUMENT',
+  'INCOMPLETE_DETECTION_OBSERVATION', 'INCOMPLETE_DETECTION_TILE', 'INCOMPLETE_DETECTION_BINDING',
+  'INCOMPLETE_DETECTION_STALE_EVIDENCE', 'DOCUMENT_DETECTION_FAILED',
+  'INVALID_BOUNDS',
+  'TEXT_WITHHELD',
+  'TEXT_WITHHELD_POLICY', 'TEXT_WITHHELD_INVALID_ENCODING', 'TEXT_WITHHELD_UNSAFE_CONTROL_CHARACTER',
+  'TEXT_WITHHELD_SANITIZATION_FAILED',
+  'LIMIT_EXCEEDED', 'MASKING_FAILED', 'IMAGE_TOO_LARGE', 'RAW_DATA_LEAK', 'INVALID_REFERENCE', 'VERIFICATION_FAILED']);
 export type BlockReason = z.infer<typeof BlockReasonSchema>;
+// The pipeline stage a refusal belongs to, for the panel and the run log.
+export type PrivacyStage = 'PRIVACY_GATEWAY' | 'PRIVACY_NORMALIZATION' | 'OCR' | 'FACE_DETECTION'
+  | 'DOCUMENT_DETECTION' | 'TILE_VALIDATION' | 'DOM_OBSERVATION';
 export class PrivacyError extends Error {
-  constructor(public readonly reason: BlockReason) { super(reason); }
+  constructor(public readonly reason: BlockReason, public readonly detail?: ExtensionError) { super(reason); }
+}
+// Structure only: counts, statuses, identifiers, code points and lengths. No
+// page text, OCR output, instruction or image data may enter `context`.
+export function privacyError(reason: BlockReason, stage: PrivacyStage, message: string,
+  context?: Record<string, unknown>, cause?: string): PrivacyError {
+  return new PrivacyError(reason, { code: reason, stage, message, timestamp: new Date().toISOString(),
+    ...(cause ? { cause } : {}), ...(context ? { context } : {}) });
 }
 const complete = z.enum(['complete', 'incomplete']);
 export const CoverageSchema = z.object({ instruction: complete, dom: complete, ocr: complete, faces: complete,
@@ -60,4 +82,5 @@ export const ExportDataSchema = z.object({ binding: BindingSchema, observation: 
 export type ExportData = z.infer<typeof ExportDataSchema>;
 export type ExportResult = { ok: true; request: StepRequest; decision: 'safe' | 'safe_without_image';
   summary: { text: number; faces: number; documents: number; masks: number }; withheldReasons: BlockReason[] }
-  | { ok: false; blockedReasons: BlockReason[] };
+  // `blockedDetails` carries the stage, cause and safe context for each reason.
+  | { ok: false; blockedReasons: BlockReason[]; blockedDetails?: ExtensionError[] };

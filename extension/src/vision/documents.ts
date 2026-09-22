@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { VisualCategorySchema, type LocalObservation } from '../contracts';
 import type { PerceptionResult } from './contracts';
 import { ocrDocumentCue } from '../dom/visuals';
-import { BoundsSchema, DocumentEvidenceSchema, LIMITS, PrivacyError } from '../privacy/contracts';
+import { BoundsSchema, DocumentEvidenceSchema, LIMITS, privacyError, PrivacyError } from '../privacy/contracts';
 import { domBounds, union, validateBounds } from '../privacy/geometry';
 import { reconstructOcr } from '../privacy/normalize';
 import { visualIsMasked } from '../privacy/policy';
@@ -27,7 +27,15 @@ const kind = (category: z.infer<typeof VisualCategorySchema>): DocumentEvidence[
 // a signature, barcode or scanned document. This is not trained model inference.
 export function detectLocalDocuments(observation: LocalObservation, ocr: PerceptionResult,
   textPolicy: 'all_text' | 'sensitive_only' = 'all_text'): DocumentEvidence {
-  if (observation.dom.truncated || ocr.observationId !== observation.dom.observationId || ocr.source !== 'model') throw new PrivacyError('INCOMPLETE_DETECTION');
+  if (observation.dom.truncated) throw privacyError('INCOMPLETE_DETECTION_OBSERVATION', 'DOCUMENT_DETECTION',
+    'The observation was truncated, so document evidence cannot cover the page.',
+    { observationId: observation.dom.observationId, elements: observation.dom.elements.length }, 'dom.truncated');
+  if (ocr.observationId !== observation.dom.observationId) throw privacyError('INCOMPLETE_DETECTION_BINDING', 'DOCUMENT_DETECTION',
+    'Document rules were given text evidence from a different observation.',
+    { observationId: observation.dom.observationId, evidenceObservationId: ocr.observationId }, 'observation id mismatch');
+  if (ocr.source !== 'model') throw privacyError('INCOMPLETE_DETECTION_OCR', 'DOCUMENT_DETECTION',
+    'Document rules require text evidence from the installed model.',
+    { observationId: observation.dom.observationId, source: ocr.source }, 'result source is not the model');
   const regions: DocumentEvidence['regions'] = (observation.dom.visualRegions ?? [])
     .filter(region => visualIsMasked(region.category, textPolicy)).map(region => ({
     kind: kind(region.category), category: region.category, confidence: region.confidence,
@@ -55,7 +63,12 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
 }
 
 export function mergeDocumentEvidence(base: DocumentEvidence, model: DocumentEvidence): DocumentEvidence {
-  if (base.observationId !== model.observationId || base.status !== 'complete' || model.status !== 'complete') throw new PrivacyError('INCOMPLETE_DETECTION');
+  if (base.observationId !== model.observationId) throw privacyError('INCOMPLETE_DETECTION_BINDING', 'DOCUMENT_DETECTION',
+    'Rule evidence and model evidence describe different observations.',
+    { observationId: base.observationId, evidenceObservationId: model.observationId }, 'observation id mismatch');
+  if (base.status !== 'complete' || model.status !== 'complete') throw privacyError('INCOMPLETE_DETECTION_DOCUMENT', 'DOCUMENT_DETECTION',
+    'Document evidence cannot be merged before both sources complete.',
+    { observationId: base.observationId, ruleStatus: base.status, modelStatus: model.status }, 'a source is not complete');
   const regions = [...base.regions];
   for (const region of model.regions) {
     const duplicate = regions.some(existing => existing.category === region.category &&
@@ -80,7 +93,7 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
   const regions: DocumentEvidence['regions'] = [];
   const check = () => { if (signal.aborted) throw new PrivacyError('STOPPED'); };
   const observationId = observation.dom.observationId;
-  for (const tile of observation.tiles) {
+  for (const [tileIndex, tile] of observation.tiles.entries()) {
     check();
     let image: ImageBitmap | undefined;
     const controller = new AbortController();
@@ -95,7 +108,12 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
       // error. Do not wrap it in the image helper, whose generic timeout code
       // would hide whether the ONNX worker failed or the PNG decode failed.
       const parsed = VisionDocumentResultSchema.safeParse(await adapter.inspect({ observationId, image }, controller.signal)); check();
-      if (!parsed.success || parsed.data.observationId !== observationId) throw new PrivacyError('INCOMPLETE_DETECTION');
+      if (!parsed.success) throw privacyError('DOCUMENT_DETECTION_FAILED', 'DOCUMENT_DETECTION',
+        'The document model returned a result that does not match its contract.',
+        { observationId, tileIndex, schema: 'VisionDocumentResultSchema' }, 'MODEL_RESULT_INVALID');
+      if (parsed.data.observationId !== observationId) throw privacyError('INCOMPLETE_DETECTION_BINDING', 'DOCUMENT_DETECTION',
+        'The document model answered for a different observation.',
+        { observationId, evidenceObservationId: parsed.data.observationId, tileIndex }, 'observation id mismatch');
       for (const detection of parsed.data.detections) {
         const box = validateBounds(detection.bbox, tile.width, tile.height);
         // Low confidence is not permission to expose pixels.
@@ -104,7 +122,14 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
       }
       if (regions.length > 500) throw new PrivacyError('LIMIT_EXCEEDED');
     } catch (error) {
-      check(); throw error instanceof PrivacyError ? error : new PrivacyError('INCOMPLETE_DETECTION');
+      check();
+      if (error instanceof PrivacyError) throw error;
+      // The model or the PNG decode threw. Keep what it said: "the document
+      // detector failed" and "no document evidence exists" are different facts.
+      throw privacyError('DOCUMENT_DETECTION_FAILED', 'DOCUMENT_DETECTION',
+        'The local document model could not finish this tile.',
+        { observationId, tileIndex, errorName: error instanceof Error ? error.name : typeof error,
+          errorMessage: error instanceof Error ? error.message.slice(0, 120) : undefined }, 'MODEL_EXECUTION_FAILED');
     } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); controller.abort(); image?.close(); }
     await new Promise(resolve => setTimeout(resolve, 0));
   }

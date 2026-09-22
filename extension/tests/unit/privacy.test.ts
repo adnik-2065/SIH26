@@ -34,8 +34,40 @@ describe('local PII and text policy', () => {
   it('normalizes full-width and invisible characters and withholds unsupported text/overflow', () => {
     expect(sanitizeText('ｍｉｒａ＠ｅｘａｍｐｌｅ．ｔｅｓｔ', 'instruction').sanitized).toBe('[EMAIL_1]');
     expect(sanitizeText('mi\u200bra@example.test', 'instruction').sanitized).toBe('[EMAIL_1]');
-    expect(() => sanitizeText('निजी विवरण', 'instruction')).toThrow('TEXT_WITHHELD');
     expect(() => sanitizeText('x'.repeat(LIMITS.text + 1), 'instruction')).toThrow('LIMIT_EXCEEDED');
+  });
+  // Unicode is ordinary content on this project's own pages. It is processed by
+  // the same allowlist as ASCII rather than rejected for not being ASCII, which
+  // used to block an entire payload over a rupee sign.
+  it.each([
+    // Unknown words are withheld in every script; symbols and punctuation are
+    // carried exactly as ASCII punctuation always was.
+    ['a rupee amount', 'Fee ₹499', '[DOCUMENT_1] ₹[DOCUMENT_2]'],
+    ['Devanagari', 'निजी विवरण', '[DOCUMENT_1] [DOCUMENT_2]'],
+    ['accents', 'José Álvarez', '[DOCUMENT_1] [DOCUMENT_2]'],
+    ['emoji beside allowlisted words', 'Submit ✅ now 🎉', 'Submit ✅ [DOCUMENT_1] 🎉'],
+    ['typographic punctuation', 'Don’t — really…', '[DOCUMENT_1] — [DOCUMENT_2]...'],
+  ])('carries %s through the page-text allowlist instead of refusing it', (_label, text, expected) => {
+    expect(sanitizeText(text, 'element_description').sanitized).toBe(expected);
+  });
+  it('lets the user\u2019s own instruction keep its script', () => {
+    expect(sanitizeText('प्रोफ़ाइल पेज खोलें', 'instruction').sanitized).toBe('प्रोफ़ाइल पेज खोलें');
+    expect(sanitizeText('pay ₹499 now', 'instruction').sanitized).toBe('pay ₹499 now');
+  });
+  it.each([
+    ['a control character', 'bad' + String.fromCharCode(7) + 'bell', 'TEXT_WITHHELD_UNSAFE_CONTROL_CHARACTER', 'U+0007'],
+    ['an unpaired surrogate', 'bad' + String.fromCharCode(0xD800) + 'end', 'TEXT_WITHHELD_INVALID_ENCODING', 'U+D800'],
+  ])('still withholds %s, and says which code point', (_label, text, reason, codePoint) => {
+    try {
+      sanitizeText(text, 'element_description');
+      throw new Error('expected the text to be withheld');
+    } catch (error) {
+      const failure = error as { reason?: string; detail?: { context?: Record<string, unknown> } };
+      expect(failure.reason).toBe(reason);
+      expect(failure.detail?.context).toMatchObject({ codePoint, offset: 3, textLength: text.length });
+      // The text itself never reaches the diagnostics.
+      expect(JSON.stringify(failure.detail)).not.toContain('bad');
+    }
   });
   it('allocates deterministic placeholders locally and clears the mapping', () => {
     const tokens = new Placeholders();
@@ -185,10 +217,10 @@ describe('one fail-closed payload gateway', () => {
   });
   it('blocks stale task/origin/revision/generation/tab and Stop', async () => {
     for (const changed of [{ taskId: 'other' }, { origin: 'https://other.test' }, { revision: 1 }, { generation: 2 }, { tabId: 2 }]) {
-      expect(await buildSafeStepRequest({ data: fixture(), signal: new AbortController().signal, current: () => ({ ...binding, ...changed }) })).toEqual({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
+      expect(await buildSafeStepRequest({ data: fixture(), signal: new AbortController().signal, current: () => ({ ...binding, ...changed }) })).toMatchObject({ ok: false, blockedReasons: ['STALE_OBSERVATION'] });
     }
     const controller = new AbortController(); controller.abort();
-    expect(await buildSafeStepRequest({ data: fixture(), signal: controller.signal, current: () => binding })).toEqual({ ok: false, blockedReasons: ['STOPPED'] });
+    expect(await buildSafeStepRequest({ data: fixture(), signal: controller.signal, current: () => binding })).toMatchObject({ ok: false, blockedReasons: ['STOPPED'] });
   });
   it('withholds optional failed images, blocks required images, and never substitutes original bytes', async () => {
     const data = fixture(); data.image = 'optional';

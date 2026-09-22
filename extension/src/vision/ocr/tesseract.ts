@@ -22,7 +22,7 @@ export class TesseractAdapter implements PerceptionAdapter {
     return new Promise((resolve, reject) => {
       const width = input.image.width, height = input.image.height;
       try { this.worker ??= new Worker(new URL('./tesseract.worker.ts', import.meta.url), { type: 'module' }); }
-      catch { input.image.close(); reject(new Error('OCR_FAILED')); return; }
+      catch { input.image.close(); reject(new Error('OCR_WORKER_INIT_FAILED')); return; }
       const worker = this.worker;
       const cleanup = () => {
         clearTimeout(deadline);
@@ -38,24 +38,30 @@ export class TesseractAdapter implements PerceptionAdapter {
       const deadline = setTimeout(() => fail('OCR_TIMEOUT'), this.timeoutMs);
       this.cancel = abort;
       signal.addEventListener('abort', abort, { once: true });
-      worker.onerror = () => fail('OCR_FAILED');
-      worker.onmessageerror = () => fail('OCR_FAILED');
+      worker.onerror = () => fail('OCR_EXECUTION_FAILED');
+      worker.onmessageerror = () => fail('OCR_EXECUTION_FAILED');
       worker.onmessage = ({ data }) => {
         if (data.type === 'progress' && data.observationId === input.observationId) {
           if (typeof data.status === 'string' && Number.isFinite(data.progress)) this.onProgress({ status: data.status, progress: Math.max(0, Math.min(1, data.progress)) });
         } else if (data.type === 'error' && data.observationId === input.observationId) {
-          fail(data.code === 'OCR_TOO_MUCH_TEXT' ? data.code : 'OCR_FAILED');
+          // The worker classified its own failure; keep that code rather than
+          // flattening every engine fault into one.
+          fail(typeof data.code === 'string' && data.code.startsWith('OCR_') ? data.code : 'OCR_EXECUTION_FAILED');
         } else if (data.type === 'result') {
           const result = PerceptionResultSchema.safeParse(data.result);
-          if (!result.success || result.data.observationId !== input.observationId || result.data.source !== 'model' ||
-            result.data.regions.some(({ kind, bounds: b }) => kind !== 'text' || b.x < 0 || b.y < 0 || b.x + b.width > width || b.y + b.height > height)) {
-            fail('OCR_INVALID_RESULT'); return;
+          // Three different faults used to share one code: a result that does
+          // not parse, a result for another observation, and boxes outside the
+          // image it was given.
+          if (!result.success) { fail('OCR_NORMALIZATION_FAILED'); return; }
+          if (result.data.observationId !== input.observationId || result.data.source !== 'model') { fail('OCR_INVALID_OBSERVATION'); return; }
+          if (result.data.regions.some(({ kind, bounds: b }) => kind !== 'text' || b.x < 0 || b.y < 0 || b.x + b.width > width || b.y + b.height > height)) {
+            fail('OCR_INVALID_BOUNDS'); return;
           }
           cleanup(); resolve(result.data);
         }
       };
       try { worker.postMessage({ ...input, assetRoot: chrome.runtime.getURL('ocr') }, [input.image]); }
-      catch { fail('OCR_FAILED'); }
+      catch { fail('OCR_EXECUTION_FAILED'); }
     });
   }
 }
