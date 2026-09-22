@@ -1,4 +1,6 @@
-import { ContentCommandSchema, type Rect } from '../contracts';
+import { ContentCommandSchema, type PageChangedDetail, type PageChangeReason,
+  type StabilitySnapshot } from '../contracts';
+import { emptyMutationSummary, pageChangedDetail, type StabilityState } from '../capture/stability';
 import { collect } from './observe';
 import { act } from './act';
 import { prepareImages } from './images';
@@ -9,101 +11,45 @@ if (!scope.__sih26Installed) {
   scope.__sih26Installed = true;
   const documentId = crypto.randomUUID();
   const refs = new Map<string, HTMLElement>();
-  // Where each reviewed control was when the observation was collected, in
-  // viewport pixels. Surrounding churn is judged against this.
-  const reviewedRects = new Map<HTMLElement, Rect>();
   let revision = 0;
   let observationId: string | undefined;
   const size = () => `${innerWidth}:${innerHeight}:${devicePixelRatio}:${visualViewport?.scale}:${visualViewport?.offsetLeft}:${visualViewport?.offsetTop}`;
   let lastSize = size();
   let capture: { observationId: string; originalSize: string; restoreUntil: number;
-    layoutSize?: string; scrollX?: number; scrollY?: number; renderReset?: boolean; noticeHeightPixels?: number } | undefined;
+    layoutSize?: string; scrollX?: number; scrollY?: number; renderReset?: boolean; noticeHeightPixels?: number;
+    invalidated?: PageChangeReason; before?: StabilityState } | undefined;
   let notice: { heightPixels: number; viewportHeightPixels: number; until: number } | undefined;
   let imagePreparation: AbortController | undefined;
-  const changed = () => {
+  const changed = (detail?: PageChangedDetail) => {
     revision++;
     refs.clear();
-    reviewedRects.clear();
     if (observationId) {
       const previous = observationId;
       observationId = undefined;
-      void chrome.runtime.sendMessage({ type: 'PAGE_CHANGED', observationId: previous }).catch(() => {});
+      void chrome.runtime.sendMessage({ type: 'PAGE_CHANGED', observationId: previous, ...(detail ? { detail } : {}) }).catch(() => {});
     }
   };
-  // Does this mutation touch a control the observation actually described? A
-  // reviewed control itself, or something inside it: its label, state or size
-  // may have just changed.
+  // A page is considered changed only when something happened that the captured
+  // pixels cannot survive: the document was navigated or replaced.
   //
-  // An ancestor is deliberately not counted. Appending a notification toast to
-  // <body>, or toggling a class on <html>, contains every control on the page
-  // while changing none of them, and live applications do that every few
-  // seconds. Counting containment upwards therefore retired the observation
-  // before the reasoning server could answer, so every proposed step came back
-  // PAGE_CHANGED and nothing was ever performed. An ancestor change that does
-  // move, hide or cover the target is still caught: the executor re-checks
-  // connection, visibility, disabled state, geometry and occlusion against the
-  // reviewed bounds at the instant of the action.
-  const touchesReviewed = (node: Node | null): boolean => {
-    const element = node?.nodeType === Node.ELEMENT_NODE ? node as Element : node?.parentElement ?? null;
-    if (!element) return true;
-    for (const ref of refs.values()) if (ref === element || ref.contains(element)) return true;
-    return false;
+  // There is deliberately no MutationObserver here any more. Watching the DOM
+  // made every counter tick, badge update, class toggle, React re-render and
+  // lazy image count as a changed page, which retired captures faster than the
+  // pipeline could finish one. What the capture actually depends on — the URL,
+  // the document size, the viewport, the scroll position and whether the
+  // controls still exist — is compared directly, once, in `compareCaptureStability`
+  // when the screenshots are done. Acting on a control is a separate question,
+  // and `act()` still re-checks connection, visibility, disabled state, reviewed
+  // geometry and occlusion at the instant of the action.
+  const navigated = (category: string) => {
+    const summary = emptyMutationSummary();
+    summary.total = 1; summary.significant = 1; summary.categories[category] = 1;
+    if (capture && !capture.restoreUntil) { capture.invalidated ??= 'PAGE_CHANGED_NAVIGATION'; return; }
+    changed(pageChangedDetail('PAGE_CHANGED_NAVIGATION', summary, capture?.before));
   };
-  // Layout settles by fractions of a pixel between reads; a real change to a
-  // container moves its contents by much more than this.
-  const DRIFT = 2;
-  // Did the surrounding change actually move what the user reviewed? A toast
-  // pinned to a corner does not; a container that re-orders, collapses or hides
-  // its children does, and then the reviewed screenshot no longer describes the
-  // page. Hiding a control zeroes its box, which counts as moved.
-  const movedReviewed = () => {
-    for (const [element, rect] of reviewedRects) {
-      const now = element.getBoundingClientRect();
-      if (Math.abs(now.x - rect.x) > DRIFT || Math.abs(now.y - rect.y) > DRIFT ||
-        Math.abs(now.width - rect.width) > DRIFT || Math.abs(now.height - rect.height) > DRIFT) return true;
-    }
-    return false;
-  };
-  // A reviewed control that was itself detached, re-parented or replaced, named
-  // in the record rather than merely surrounded by it.
-  const movesReviewed = (nodes: NodeList): boolean => {
-    for (const node of nodes) {
-      if (node.nodeType !== Node.ELEMENT_NODE) continue;
-      for (const ref of refs.values()) if (node === ref || (node as Element).contains(ref)) return true;
-    }
-    return false;
-  };
-  // Capture remains strict: any mutation can make its DOM snapshot and image
-  // describe different moments. Once capture has finished, however, many live
-  // applications keep changing unrelated badges, timers and notification
-  // containers while the reasoning server is working. Retiring every target
-  // for those changes makes a valid server action impossible to execute.
-  //
-  // After capture, preserve the reviewed element map unless a mutation reaches
-  // a reviewed control itself or its contents, moves one, replaces pixels that
-  // were reviewed, or shifts a reviewed control on the page. The executor still
-  // checks connection, visibility, disabled state, geometry and occlusion at
-  // the instant of the action. Navigation, input, scroll and resize continue to
-  // invalidate through their dedicated listeners below.
-  const significant = (records: MutationRecord[]) => {
-    if (capture && !capture.restoreUntil) return records.length > 0;
-    if (records.some(record => touchesReviewed(record.target) ||
-      record.type === 'childList' && (movesReviewed(record.removedNodes) || movesReviewed(record.addedNodes)) ||
-      record.type === 'attributes' && ['src', 'srcset', 'poster'].includes(record.attributeName || ''))) return true;
-    return records.length > 0 && movedReviewed();
-  };
-  const observer = new MutationObserver(records => { if (significant(records)) changed(); });
-  observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
-  for (const event of ['input', 'change', 'popstate', 'hashchange', 'pagehide']) {
-    window.addEventListener(event, changed, { capture: true, passive: true });
+  for (const event of ['popstate', 'hashchange', 'pagehide']) {
+    window.addEventListener(event, () => navigated(event), { capture: true, passive: true });
   }
-  for (const event of ['animationstart', 'transitionrun']) window.addEventListener(event, () => {
-    // Native capture can restart CSS animations while recalculating its render
-    // surface. Motion is paused by the capture stylesheet, and final DOM bounds
-    // are compared separately. Input, scroll, resizing and mutations still
-    // invalidate immediately; CSS lifecycle tracking resumes after capture.
-    if (!capture || capture.restoreUntil > 0) changed();
-  }, { capture: true, passive: true });
   const resized = () => {
     // Browser capture may emit resize with identical layout dimensions. Only
     // an actual viewport change makes the observation stale.
@@ -133,23 +79,42 @@ if (!scope.__sih26Installed) {
     if (capture && observationId === capture.observationId && next === capture.originalSize && performance.now() <= capture.restoreUntil) {
       lastSize = next; capture = undefined; notice = undefined; return;
     }
-    if (next !== lastSize) { lastSize = next; changed(); }
+    // A resize event is not proof that the screenshot is stale: Chrome's
+    // debugger notice and its full-page renderer both emit transient ones that
+    // have already returned by CHECK. The before/after viewport in
+    // `compareCaptureStability` is what decides.
+    if (next !== lastSize) lastSize = next;
   };
-  const scrolled = (event: Event) => {
-    const root = !!event && (event.target === document || event.target === window || event.target === visualViewport);
-    if (root && capture && observationId === capture.observationId && !capture.restoreUntil &&
-      (capture.renderReset || size() === capture.layoutSize && scrollX === capture.scrollX && scrollY === capture.scrollY)) return;
-    changed();
-  };
-  window.addEventListener('scroll', scrolled, { capture: true, passive: true });
+  // Scrolling — including a container scrolling itself — no longer retires the
+  // capture. Only a scroll offset that actually differs between COLLECT and
+  // CHECK does, because that is what moves recorded element bounds away from
+  // the pixels they describe.
   window.addEventListener('resize', resized, { passive: true });
   visualViewport?.addEventListener('resize', resized);
-  visualViewport?.addEventListener('scroll', scrolled);
+  const stabilitySnapshot = (snapshot: ReturnType<typeof collect>): StabilitySnapshot => {
+    const root = document.documentElement, body = document.body;
+    const widths = [root?.scrollWidth, root?.offsetWidth, root?.clientWidth, body?.scrollWidth, body?.offsetWidth, body?.clientWidth]
+      .filter((value): value is number => Number.isFinite(value));
+    const heights = [root?.scrollHeight, root?.offsetHeight, root?.clientHeight, body?.scrollHeight, body?.offsetHeight, body?.clientHeight]
+      .filter((value): value is number => Number.isFinite(value));
+    const totalElementCount = document.getElementsByTagName?.('*').length ?? document.querySelectorAll?.('*').length ?? 0;
+    return {
+      url: location.href, documentId,
+      documentWidth: Math.max(0, ...widths), documentHeight: Math.max(0, ...heights),
+      scrollWidth: Math.max(0, root?.scrollWidth || 0, body?.scrollWidth || 0),
+      scrollHeight: Math.max(0, root?.scrollHeight || 0, body?.scrollHeight || 0),
+      viewportWidth: innerWidth, viewportHeight: innerHeight, scrollX, scrollY,
+      totalElementCount, interactiveElementCount: snapshot.elements.length,
+    };
+  };
+  const snapshotResponse = (commandObservationId: string) => {
+    const snapshot = collect(commandObservationId, documentId, revision, refs);
+    return { snapshot, stability: stabilitySnapshot(snapshot), mutations: emptyMutationSummary() };
+  };
   chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
     if (sender.id !== chrome.runtime.id) return;
     const parsed = ContentCommandSchema.safeParse(raw);
     if (!parsed.success) { reply({ error: 'INVALID_MESSAGE' }); return; }
-    if (significant(observer.takeRecords())) changed();
     const command = parsed.data;
     if (command.type === 'PREPARE_CAPTURE') {
       // A quick Scan again can start before Chrome removes the previous notice.
@@ -166,7 +131,11 @@ if (!scope.__sih26Installed) {
       capture = { observationId: command.observationId, originalSize, restoreUntil: 0, noticeHeightPixels };
       imagePreparation?.abort();
       imagePreparation = new AbortController();
-      void prepareImages(imagePreparation.signal).then(() => reply({ ok: true }), () => reply({ error: 'CAPTURE_FAILED' }));
+      // Lazy images are still decoded before the screenshots, so the capture
+      // does not photograph half-loaded content. Nothing waits for the DOM to
+      // fall quiet any more.
+      void prepareImages(imagePreparation.signal).then(() => reply({ ok: true }),
+        () => reply({ error: 'CAPTURE_FAILED' }));
       return true;
     }
     if (command.type === 'FINISH_CAPTURE') {
@@ -195,17 +164,24 @@ if (!scope.__sih26Installed) {
       reply(act({ action: command.action, refs, expect: command.expect, resolved: command.resolved }));
       return;
     }
-    if (command.type === 'CHECK' && observationId !== command.observationId) { reply({ error: 'PAGE_CHANGED' }); return; }
+    if (command.type === 'CHECK' && observationId !== command.observationId) {
+      reply({ error: 'PAGE_CHANGED', detail: pageChangedDetail(capture?.invalidated ?? 'PAGE_CHANGED_NAVIGATION',
+        emptyMutationSummary(), capture?.before) }); return;
+    }
     observationId = command.observationId;
     if (command.type === 'COLLECT' && capture?.observationId === observationId) {
       capture.layoutSize = size(); capture.scrollX = scrollX; capture.scrollY = scrollY;
     }
-    const snapshot = collect(observationId, documentId, revision, refs);
-    reviewedRects.clear();
-    for (const element of snapshot.elements ?? []) {
-      const reviewed = refs.get(element.id);
-      if (reviewed) reviewedRects.set(reviewed, element.bounds);
+    const response = snapshotResponse(observationId);
+    if (command.type === 'COLLECT' && capture) capture.before = { dom: response.snapshot, stability: response.stability };
+    // The only thing that can invalidate a capture from inside the page now is
+    // navigation, which is recorded as it happens.
+    if (command.type === 'CHECK' && capture?.invalidated) {
+      const detail = pageChangedDetail(capture.invalidated, emptyMutationSummary(), capture.before,
+        { dom: response.snapshot, stability: response.stability });
+      console.warn(`[CAPTURE][${command.observationId}][PAGE_CHANGED] reason=${detail.cause}`);
+      reply({ error: 'PAGE_CHANGED', detail }); return;
     }
-    reply(snapshot);
+    reply(response);
   });
 }

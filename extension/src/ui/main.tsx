@@ -1,15 +1,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
-import { initialState, roundVerdict } from '../agent/lifecycle';
+import { CAPTURE_RETRY_BACKOFF_MS, CAPTURE_RETRY_LIMIT, initialState, nextCaptureRetry, roundVerdict } from '../agent/lifecycle';
 import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
 import { inspectCapturedPage } from '../vision/page';
+import { validateDeliveredTiles } from '../capture/tiles';
+import { AGENT_ENDPOINT, runtimePermissions, validateAgentEndpoint } from '../config';
+import { advance, beginRun, type RunStage, type RunState } from '../agent/run';
 import { inspectDocumentTiles, type DocumentEvidence } from '../vision/documents';
 import { OnnxDocumentAdapter } from '../vision/documents/onnx';
 import { PagePreview } from './preview';
 import { PrivacyReview } from '../privacy/review';
+import { TransportFailureNotice } from '../agent/steps';
+import { abortWith } from '../agent/diagnostics';
+import type { AbortSource, ExtensionError } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
+import type { ExecutionReport } from '../agent/wire';
 import './styles.css';
 
 const messages: Record<ErrorCode, string> = {
@@ -49,10 +56,24 @@ function Meter({ label, value, max, detail }: { label: string; value?: number; m
 }
 interface LogLine { at: string; kind: 'info' | 'server' | 'action' | 'error'; text: string }
 type DetailView = 'activity' | 'privacy' | 'settings';
-const ocrErrors: Record<string, string> = {
+// Every detector code the pipeline can raise, mapped to one sentence. An
+// unmapped code still shows the code itself rather than a generic sentence.
+const detectorErrors: Record<string, string> = {
   OCR_TIMEOUT: 'Reading took too long. Try again, or capture a smaller browser window.',
   OCR_TOO_MUCH_TEXT: 'This view exceeds the 500-word limit. Make the browser window smaller and observe again.',
+  OCR_WORKER_INIT_FAILED: 'The text engine could not start. Rebuild and reload the extension.',
+  OCR_EXECUTION_FAILED: 'The text engine failed while reading this capture.',
+  OCR_INVALID_OBSERVATION: 'Text results arrived for a different capture and were discarded.',
+  OCR_INVALID_BOUNDS: 'Text results fell outside the captured image and were discarded.',
+  OCR_NORMALIZATION_FAILED: 'Text results could not be converted into the local contract.',
+  OCR_BUSY: 'The text engine was still busy with the previous scan.',
+  FACE_TIMEOUT: 'Face detection took too long. Retry with a smaller browser window.',
+  FACE_BUSY: 'Face detection was still busy with the previous scan.',
+  VISION_TIMEOUT: 'Document detection took too long. Retry the scan.',
+  VISION_BUSY: 'Document detection was still busy with the previous scan.',
+  STOPPED: 'The scan was stopped before this detector finished.',
 };
+const detectorMessage = (code: string, fallback: string) => detectorErrors[code] ? `${detectorErrors[code]} (${code})` : `${fallback} (${code})`;
 
 function App() {
   const [state, setState] = useState<TaskState>(initialState);
@@ -64,12 +85,19 @@ function App() {
   const [error, setError] = useState('');
   const [autoRun, setAutoRun] = useState(false);
   const [round, setRound] = useState(1);
+    const [executionReport, setExecutionReport] = useState<ExecutionReport>();
   // The generation this round's capture was launched at, and the generation a
   // retry has already been issued for. See `roundVerdict`.
   const [roundGeneration, setRoundGeneration] = useState<number | undefined>(undefined);
   const retriedGeneration = useRef<number | undefined>(undefined);
   const retries = useRef(0);
+  const retryReasons = useRef<string[]>([]);
   const [runNotice, setRunNotice] = useState('');
+  const [runId, setRunId] = useState<string>();
+  const [runStage, setRunStage] = useState<RunStage>('IDLE');
+  const runRef = useRef<RunState | undefined>(undefined);
+  const [lastFailure, setLastFailure] = useState<ExtensionError>();
+  const runIdRef = useRef<string | undefined>(undefined);
   const [log, setLog] = useState<LogLine[]>([]);
   const [detailView, setDetailView] = useState<DetailView>();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -111,15 +139,20 @@ function App() {
   const [captureProgress, setCaptureProgress] = useState<{ index: number; count: number }>();
   const stopPending = useRef(false);
 
-  const clearDetections = () => {
-    controllerRef.current?.abort();
+  // This controller is what the agent request listens to, so every caller says
+  // why it is cancelling. Without a source an aborted request is reported as an
+  // unreachable server, which is how a task restart came to look like a network
+  // failure.
+  const clearDetections = (source: AbortSource = 'task_replaced', reason = 'the panel cleared the current detections') => {
+    if (controllerRef.current) abortWith(controllerRef.current, source, reason, { runId: runIdRef.current, scope: 'detections' });
     setFaces(undefined); setFaceBusy(false); setFaceError(''); setSelectedFace(undefined); setQuery('');
     setDocuments(undefined); setDocumentBusy(false); setDocumentError('');
     setOcr(undefined); setOcrBusy(false); setProgress(undefined); setOcrError(''); setSelected(undefined);
   };
   const applyState = (next: TaskState) => {
     if (next.generation !== stateRef.current.generation || next.observationId !== stateRef.current.observationId || next.status === 'stopped') {
-      clearDetections(); setObservation(undefined); captureTilesRef.current = []; setCaptureProgress(undefined);
+      clearDetections(next.status === 'stopped' ? 'user_cancel' : 'task_replaced',
+        next.status === 'stopped' ? 'the task was stopped' : `the worker published generation ${next.generation}${next.error ? ` after ${next.error}` : ''}`); setObservation(undefined); captureTilesRef.current = []; setCaptureProgress(undefined);
     }
     stateRef.current = next; setState(next);
     if (next.status === 'stopped') { adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setInstruction(''); }
@@ -137,25 +170,43 @@ function App() {
         setCaptureProgress({ index: event.index + 1, count: event.count });
         if (previewRef.current) captureTilesRef.current[event.index] = event.tile;
       }
+      if (event.type === 'CAPTURE_TILE') stage('CAPTURING');
       if (event.type === 'OBSERVATION') {
         const tiles = captureTilesRef.current;
         captureTilesRef.current = []; setCaptureProgress(undefined);
         if (previewRef.current && !stopPending.current) {
           const info = event.observation;
-          if (tiles.length !== info.tileCount || Array.from({ length: info.tileCount }, (_, i) => tiles[i]).some((tile, i) =>
-            !tile || tile.width !== info.imageWidth || tile.start !== (i ? tiles[i - 1]?.end : 0)) || tiles.at(-1)?.end !== info.imageHeight) {
-            setError(messages.CAPTURE_FAILED); return;
+          // Same strictness, but the refusal now names the tile and the
+          // mismatch instead of collapsing into one capture failure.
+          const validation = validateDeliveredTiles(Array.from({ length: info.tileCount }, (_, i) => tiles[i]), info);
+          if (!validation.ok) {
+            addLog('error', `${validation.error.code} at ${validation.error.stage}: ${validation.error.message}`, validation.error);
+            setLastFailure(runIdRef.current ? { ...validation.error, runId: runIdRef.current } : validation.error);
+            setError(`${validation.error.message} (${validation.error.code})`);
+            return;
           }
+          stage('DETECTING');
           setObservation({ ...info, tiles });
         }
       }
     };
+    // The endpoint, the host permission and connect-src are one configuration.
+    // Checking them when the panel opens turns "the request failed" into a
+    // sentence about the packaged extension, before any request is made.
+    const endpointProblem = validateAgentEndpoint(AGENT_ENDPOINT, runtimePermissions());
+    if (endpointProblem) {
+      setLastFailure(endpointProblem);
+      setError(`${endpointProblem.message} (${endpointProblem.code})`);
+    }
     chrome.runtime.onMessage.addListener(listener);
     void chrome.runtime.sendMessage({ type: 'STATUS' }).then(reply => {
       const parsed = TaskStateSchema.safeParse(reply?.state);
       if (parsed.success && parsed.data.generation >= stateRef.current.generation) applyState(parsed.data);
     }).catch(() => setError('Reload the extension and open the panel again.'));
-    const dispose = () => { controllerRef.current?.abort(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); };
+    const dispose = (event?: Event) => {
+      if (controllerRef.current) abortWith(controllerRef.current, event?.type === 'pagehide' ? 'pagehide' : 'panel_unmount',
+        event?.type === 'pagehide' ? 'the panel document was hidden' : 'the panel unmounted', { runId: runIdRef.current, scope: 'detections' });
+      adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); };
     window.addEventListener('pagehide', dispose);
     return () => { chrome.runtime.onMessage.removeListener(listener); window.removeEventListener('pagehide', dispose); dispose(); };
   }, []);
@@ -190,8 +241,9 @@ function App() {
       } catch (reason) {
 
         if (current()) {
-          if (kind === 'text') setOcrError(ocrErrors[reason instanceof Error ? reason.message : ''] || 'Text reading failed. Retry the scan, or rebuild and reload the extension.');
-          else setFaceError(reason instanceof Error && reason.message === 'FACE_TIMEOUT' ? 'Face detection took too long. Retry with a smaller browser window.' : 'Face detection failed. Retry the scan, or rebuild and reload the extension.');
+          const code = reason instanceof Error ? reason.message : String(reason);
+          if (kind === 'text') setOcrError(detectorMessage(code, 'Text reading failed. Retry the scan, or rebuild and reload the extension.'));
+          else setFaceError(detectorMessage(code, 'Face detection failed. Retry the scan, or rebuild and reload the extension.'));
         }
       } finally {
         if (current()) { if (kind === 'text') setOcrBusy(false); else setFaceBusy(false); }
@@ -203,28 +255,58 @@ function App() {
         const result = await inspectDocumentTiles(observation, documentAdapterRef.current!, controller.signal);
         if (current()) setDocuments(result);
       } catch (reason) {
-        if (current()) setDocumentError(reason instanceof Error && reason.message === 'VISION_TIMEOUT' ? 'Document scan took too long. Retry the scan.' : 'Document detection failed. Retry the scan or rebuild the extension.');
+        if (current()) {
+          const failure = reason as { reason?: string; detail?: { code?: string; message?: string } };
+          const code = failure?.detail?.code ?? failure?.reason ?? (reason instanceof Error ? reason.message : String(reason));
+          setDocumentError(failure?.detail?.message
+            ? `${failure.detail.message} (${code})`
+            : detectorMessage(code, 'Document detection failed. Retry the scan or rebuild the extension.'));
+        }
       } finally { if (current()) setDocumentBusy(false); }
     };
     void Promise.allSettled([inspect('text'), inspect('face'), inspectDocuments()]);
-    return () => controller.abort();
+    return () => abortWith(controller, 'task_replaced', 'a newer observation replaced this one', { runId: runIdRef.current, scope: 'detections' });
   }, [observation, retry]);
 
   // A run is a chain of ordinary rounds, each one a scan the user could have
   // asked for by hand. The cap stops a model that keeps proposing steps.
+  // The run registry is a ref, so a second submit in the same tick sees the
+  // first one. React state cannot do that: `taskRunning` is still false until
+  // the next render, which is exactly the window a double click lands in.
+  const stage = (next: RunStage) => {
+    if (!runRef.current) return;
+    runRef.current = advance(runRef.current, next, { log: entry => addLog('info', `[${entry.runId}] ${entry.message}`) });
+    setRunStage(runRef.current.stage);
+  };
   function startRun() {
     if (!instruction.trim()) { setRunNotice('Describe the task first.'); return; }
-    setRunNotice(''); setRound(1); setAutoRun(true); setLog([]);
-    setRoundGeneration(undefined); retriedGeneration.current = undefined; retries.current = 0;
-    addLog('info', `Run started: ${instruction.trim()}`);
+    const outcome = beginRun(runRef.current, { log: entry => addLog(entry.reason === 'DUPLICATE_RUN_IGNORED' ? 'error' : 'info',
+      `[${entry.runId}] ${entry.message}${entry.reason ? ` (${entry.reason}, stage ${entry.stage})` : ''}`) });
+    if (!outcome.started) {
+      setRunNotice(`A run is already in progress (${outcome.active.runId}, stage ${outcome.active.stage}).`);
+      return;
+    }
+    runRef.current = outcome.run;
+    setRunStage(outcome.run.stage);
+    setRunNotice(''); setRound(1); setExecutionReport(undefined); setAutoRun(true); setLog([]);
+    setRoundGeneration(undefined); retriedGeneration.current = undefined; retries.current = 0; retryReasons.current = [];
+    runIdRef.current = outcome.run.runId; setRunId(outcome.run.runId); setLastFailure(undefined);
+    addLog('info', `Run ${outcome.run.runId} started.`);
     void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE');
   }
-  function stopRun(notice: string) { setAutoRun(false); setRunNotice(notice); addLog('info', notice); }
+  // A halted run keeps its structured failure, so the panel can still say what
+  // failed after the observation (and the section that reported it) is gone.
+  function stopRun(notice: string, failure?: ExtensionError) {
+    stage(failure ? 'FAILED' : /stopped|cancel/i.test(notice) ? 'CANCELLED' : 'COMPLETED');
+    setAutoRun(false); setRunNotice(notice); setLastFailure(failure);
+    addLog(failure ? 'error' : 'info', failure ? `${notice} [${failure.code} at ${failure.stage}]` : notice);
+  }
 
   async function command(type: 'START' | 'OBSERVE' | 'STOP'): Promise<ErrorCode | undefined> {
     setError(''); captureTilesRef.current = []; setCaptureProgress(undefined);
-    if (type === 'STOP') { stopPending.current = true; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
-    else { stopPending.current = false; clearDetections(); setObservation(undefined); }
+    if (type !== 'STOP') stage('CAPTURING');
+    if (type === 'STOP') { stopPending.current = true; clearDetections('user_cancel', 'the user stopped the task'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
+    else { stopPending.current = false; clearDetections('task_restart', `a new ${type} scan was requested`); setObservation(undefined); }
     try {
       const response = await chrome.runtime.sendMessage(type === 'START' ? { type, instruction: instruction.trim() || 'Read visible page text' } : { type });
       const parsed = TaskStateSchema.safeParse(response?.state);
@@ -245,7 +327,6 @@ function App() {
   }
 
   const RUN_LIMIT = 8;
-  const RETRY_LIMIT = 4;
   // A run cannot continue past a failed scan: the next round would have nothing
   // trustworthy to redact or act on.
   const busy = state.status === 'observing' || ocrBusy || faceBusy || documentBusy;
@@ -286,7 +367,12 @@ function App() {
       status: state.status, error: state.error, generation: state.generation, roundGeneration });
     if (outcome.verdict === 'halt') { stopRun(outcome.notice); return; }
     // A capture that published an observation earns the round a clean slate.
-    if (outcome.verdict === 'continue') { if (state.observationId && roundGeneration !== undefined && state.generation >= roundGeneration) retries.current = 0; return; }
+    if (outcome.verdict === 'continue') {
+      if (state.observationId && roundGeneration !== undefined && state.generation >= roundGeneration) {
+        retries.current = 0; retryReasons.current = [];
+      }
+      return;
+    }
     // One retry per invalidated generation. Without the guard an unrelated
     // re-render would send a second OBSERVE, which the worker answers with BUSY
     // and which would stop the run for no reason.
@@ -296,14 +382,19 @@ function App() {
     // page; a retry is the same round starting over because the page would not
     // hold still. Letting retries spend rounds would end a run silently, having
     // done nothing, which is exactly the failure this whole path exists to fix.
-    if (retries.current >= RETRY_LIMIT) {
-      stopRun('The page kept changing while it was being scanned, so the run stopped. Let it finish loading, or scroll to the part you want acted on, then run the task again.');
+    const reason = state.errorDetail?.cause || 'PAGE_CHANGED_UNKNOWN';
+    retryReasons.current.push(reason);
+    const retry = nextCaptureRetry(retries.current);
+    if (!retry.retry) {
+      const reasons = Array.from(new Set(retryReasons.current)).join(', ');
+      stopRun(`The page kept changing while it was being scanned, so the run stopped after ${CAPTURE_RETRY_LIMIT} retries. Reasons: ${reasons}. Let it finish loading, then run the task again.`);
       return;
     }
-    retries.current++;
-    addLog('info', `${outcome.notice} (attempt ${retries.current} of ${RETRY_LIMIT})`);
-    void observeAgain();
-  }, [autoRun, ocrError, faceError, documentError, state.status, state.error, state.generation, state.observationId, roundGeneration]);
+    retries.current = retry.completedRetries;
+    addLog('info', `${outcome.notice} Reason: ${reason}. (attempt ${retries.current} of ${CAPTURE_RETRY_LIMIT})`);
+    const timer = window.setTimeout(() => void observeAgain(), CAPTURE_RETRY_BACKOFF_MS * retries.current);
+    return () => window.clearTimeout(timer);
+  }, [autoRun, ocrError, faceError, documentError, state.status, state.error, state.errorDetail, state.generation, state.observationId, roundGeneration]);
   const status = state.status === 'observing' ? 'Capturing full page…' : busy ? 'Analyzing on your device…' : ocrError || faceError || documentError ? 'Scan needs attention' : complete ? 'Scan ready to review' : state.status === 'stopped' ? 'Stopped' : state.error ? 'A fresh capture is needed' : state.observationId ? 'Observation ready' : 'Ready to capture';
   const recognizing = progress?.status === 'recognizing text';
   const filteredWords = ocr?.regions.map((region, index) => ({ region, index })).filter(({ region }) => region.text?.toLowerCase().includes(query.toLowerCase())) ?? [];
@@ -312,7 +403,7 @@ function App() {
   const openDetail = (view: DetailView) => { setDetailView(view); setMenuOpen(false); };
   const togglePreview = (checked: boolean) => {
     previewRef.current = checked; setPreview(checked);
-    if (!checked) { captureTilesRef.current = []; clearDetections(); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
+    if (!checked) { captureTilesRef.current = []; clearDetections('user_cancel', 'local analysis was switched off'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
   };
   // The dot never reports success while something needs attention: a green dot
   // over "A fresh capture is needed" is the kind of detail that makes a panel
@@ -323,7 +414,9 @@ function App() {
   const scanLabel = busy ? 'Scanning…' : state.taskId && state.status !== 'stopped' ? 'Scan again' : 'Scan current page';
   const host = state.origin ? state.origin.replace(/^https?:\/\//, '') : 'Current page';
   const drawerTitle = detailView === 'activity' ? 'Task activity' : detailView === 'privacy' ? 'Privacy details' : 'Settings';
-  const alert = error || documentError || (state.error && messages[state.error]) || '';
+  const pageChangeReason = state.error === 'PAGE_CHANGED' && state.errorDetail?.cause
+    ? ` Reason: ${state.errorDetail.cause}.` : '';
+  const alert = error || documentError || (state.error && `${messages[state.error]}${pageChangeReason}`) || '';
   return <div className="app">
     <header className="app-bar">
       <div className="identity">
@@ -371,7 +464,7 @@ function App() {
       {taskRunning && <section className="panel run-panel" aria-label="Run progress">
         <div className="run-head">
           <span className="spinner" aria-hidden="true" />
-          <div><strong>{workingLabel}</strong><small>Round {round} of {RUN_LIMIT}</small></div>
+          <div><strong>{workingLabel}</strong><small>Round {round} of {RUN_LIMIT} · {runStage.toLowerCase().replace(/_/g, ' ')}</small></div>
         </div>
         <ol className="stages">
           <li className={state.status !== 'observing' ? 'done' : 'active'}>Protected</li>
@@ -406,7 +499,8 @@ function App() {
       </section>
 
       {alert && <p role="alert" className="banner is-danger"><Glyph name="alert" />{alert}</p>}
-      {!alert && runNotice && !taskRunning && <p className="banner"><Glyph name={/stopped/i.test(runNotice) ? 'square' : 'check'} />{runNotice}</p>}
+      {!alert && runNotice && !taskRunning && !lastFailure && <p className="banner"><Glyph name={/stopped/i.test(runNotice) ? 'square' : 'check'} />{runNotice}</p>}
+      {lastFailure && !taskRunning && <section className="panel" aria-label="Run failure"><TransportFailureNotice error={lastFailure} /></section>}
 
       {observation && preview ? <>
         <section id="page-view" className="panel" aria-label="Captured view">
@@ -479,7 +573,7 @@ function App() {
 
         <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete}
           currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={ocrAdapter}
-          auto={autoRun} onHalt={stopRun} onLog={addLog} onContinue={() => {
+          auto={autoRun} runId={runId} executionReport={executionReport} onExecuted={setExecutionReport} onStage={stage} onHalt={stopRun} onLog={addLog} onContinue={() => {
             if (round >= RUN_LIMIT) { stopRun(`Stopped after ${RUN_LIMIT} rounds. Run the task again to continue.`); return; }
             setRound(round + 1);
             addLog('info', `Round ${round} done. Observing the page again.`);

@@ -1,10 +1,18 @@
-import type { ErrorCode, TaskState } from '../contracts';
+import type { ErrorCode, ExtensionError, TaskState } from '../contracts';
 
 export const initialState = (): TaskState => ({ status: 'idle', generation: 0 });
-export function invalidate(state: TaskState, status: 'stopped' | 'paused' | 'failed', error?: ErrorCode): TaskState {
-  const next = { ...state, status, error, generation: state.generation + 1 };
+export function invalidate(state: TaskState, status: 'stopped' | 'paused' | 'failed', error?: ErrorCode, errorDetail?: ExtensionError): TaskState {
+  const next = { ...state, status, error, generation: state.generation + 1, ...(errorDetail ? { errorDetail } : {}) };
   delete next.observationId;
+  if (!errorDetail) delete next.errorDetail;
   return next;
+}
+
+export const CAPTURE_RETRY_LIMIT = 4;
+export const CAPTURE_RETRY_BACKOFF_MS = 250;
+export function nextCaptureRetry(completedRetries: number, limit = CAPTURE_RETRY_LIMIT) {
+  return completedRetries >= limit ? { retry: false as const, completedRetries }
+    : { retry: true as const, completedRetries: completedRetries + 1 };
 }
 export function acceptsResult(state: TaskState, taskId: string, generation: number): boolean {
   return state.status === 'observing' && state.taskId === taskId && state.generation === generation;

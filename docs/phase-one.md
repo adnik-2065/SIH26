@@ -86,7 +86,7 @@ Existing backend, privacy, and other later-phase placeholder folders remain unto
 
 `src/contracts.ts` is the source of truth. Schemas reject unknown keys and unsupported action types. The build emits `dist/contracts/ActionResponseSchema.json` and `dist/contracts/StepRequestSchema.json` for the future Python backend; do not hand-edit generated schemas.
 
-An observation includes its ID, document ID, revision, origin, viewport/scroll/scale metadata, and relevant controls. The screenshot and DOM are collected separately. The capture process compares before/after snapshots and checks that the same tab remains active. Changes cause invalidation or a controlled capture failure rather than an automatic action.
+An observation includes its ID, document ID, revision, origin, viewport/scroll/scale metadata, and relevant controls. The screenshot and DOM are collected separately. Capture waits for a short meaningful-change quiet window, then compares a capture-only semantic snapshot before/after and checks that the same tab and route remain active. Small renderer drift and unrelated transient churn are tolerated; navigation, material layout/document-size changes, interactive structure/state changes, reviewed-target movement/removal, and major DOM replacement invalidate the capture with a structured reason.
 
 References belong to one observation and remain in the content script. Input/change/scroll/resize/navigation and DOM mutation events clear them. There is no unrestricted READ or execute-script action exposed to a planner.
 

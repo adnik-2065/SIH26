@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { acceptsResult, haltReason, invalidate, recover, roundVerdict } from '../../src/agent/lifecycle';
+import { acceptsResult, CAPTURE_RETRY_LIMIT, haltReason, invalidate, nextCaptureRetry, recover, roundVerdict } from '../../src/agent/lifecycle';
 import type { TaskState } from '../../src/contracts';
 const running: TaskState = { taskId: 'task_1', observationId: 'obs_1', tabId: 1, origin: 'https://example.test', status: 'observing', generation: 3 };
 describe('task lifecycle', () => {
@@ -65,5 +65,17 @@ describe('deciding what a run does next', () => {
     expect(outcome).toEqual({ verdict: 'halt', notice: expect.stringContaining('run stopped') });
     expect(roundVerdict({ status: 'failed', error: 'CAPTURE_FAILED', generation: 6, roundGeneration: 5 }).verdict).toBe('halt');
     expect(roundVerdict({ detectorError: 'Text reading failed.', status: 'paused', error: 'PAGE_CHANGED', generation: 6, roundGeneration: 5 }).verdict).toBe('halt');
+  });
+});
+
+describe('capture retry limit', () => {
+  it('permits only the configured number of retries', () => {
+    let completed = 0;
+    for (let attempt = 0; attempt < CAPTURE_RETRY_LIMIT; attempt++) {
+      const decision = nextCaptureRetry(completed);
+      expect(decision.retry).toBe(true);
+      completed = decision.completedRetries;
+    }
+    expect(nextCaptureRetry(completed)).toEqual({ retry: false, completedRetries: CAPTURE_RETRY_LIMIT });
   });
 });

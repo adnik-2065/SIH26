@@ -1,7 +1,7 @@
 import type { Rect } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
 import { canonical, classify } from './classify';
-import { LIMITS, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
+import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
 import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
 import { controlIsMasked } from './policy';
 import { Placeholders, sanitizeText } from './text';
@@ -22,7 +22,12 @@ export function reconstructOcr(regions: PerceptionResult['regions']) {
     }
     for (const [wordIndex, word] of line.words.sort((a, b) => a.bounds.x - b.bounds.x).entries()) {
       const value = canonical(word.text ?? '');
-      if (!value) throw new PrivacyError('INCOMPLETE_DETECTION');
+      // A word region with no readable text means the detector's output cannot
+      // be reconstructed, so its coverage of the page is unknown.
+      if (!value) throw privacyError('INCOMPLETE_DETECTION_OCR', 'PRIVACY_NORMALIZATION',
+        'A text region carried no readable word, so the page text cannot be reconstructed.',
+        { wordIndex, lineIndex, regionBounds: { width: word.bounds.width, height: word.bounds.height } },
+        'empty text region');
       if (wordIndex) text += ' ';
       const start = text.length; text += value;
       if (text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
@@ -71,7 +76,12 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
   const words = data.ocr.result!.regions;
   for (const region of words) {
     validateBounds(region.bounds, width, height);
-    if (region.kind !== 'text' || !region.text || region.confidence === undefined) throw new PrivacyError('INCOMPLETE_DETECTION');
+    if (region.kind !== 'text' || !region.text || region.confidence === undefined) {
+      throw privacyError('INCOMPLETE_DETECTION_OCR', 'PRIVACY_NORMALIZATION',
+        'A text region did not carry the fields the redaction plan needs.',
+        { kind: region.kind, hasText: !!region.text, hasConfidence: region.confidence !== undefined },
+        'incomplete text region');
+    }
     if (textPolicy === 'all_text' || region.confidence < 0.35) masks.push(paddedMask(region.bounds, 'document', width, height));
   }
   const reconstructed = reconstructOcr(words);
@@ -102,7 +112,11 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
   }
   for (const region of data.faces.result!.regions) {
     validateBounds(region.bounds, width, height);
-    if (region.kind !== 'face' || region.confidence === undefined) throw new PrivacyError('INCOMPLETE_DETECTION');
+    if (region.kind !== 'face' || region.confidence === undefined) {
+      throw privacyError('INCOMPLETE_DETECTION_FACE', 'PRIVACY_NORMALIZATION',
+        'A face region did not carry the fields the redaction plan needs.',
+        { kind: region.kind, hasConfidence: region.confidence !== undefined }, 'incomplete face region');
+    }
     append({ id: 'pending', source: 'face', kind: 'face', confidence: region.confidence, bounds: region.bounds,
       exportPolicy: 'mask', redactText: false, redactPixels: true });
   }

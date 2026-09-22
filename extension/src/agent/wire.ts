@@ -4,6 +4,12 @@ import type { StepRequest } from '../contracts';
 // derived field by field from the redacted payload: there is no path from raw
 // page text, attributes, or the original screenshot into this body.
 export interface AgentBody { ss: string | null; page_info: string; instruction: string; problem_context: string }
+export interface ExecutionReport {
+  observationId: string;
+  actionType: string;
+  target?: string;
+  status: 'executed';
+}
 
 const RULES = [
   'Address every element only by the exact id listed in the page description.',
@@ -27,12 +33,15 @@ export function describePage(request: StepRequest) {
   return `Observation ${request.observationId}. ${image}\n\nInteractive elements:\n${elements}${values}`;
 }
 
-export function toAgentBody(request: StepRequest): AgentBody {
+  export function toAgentBody(request: StepRequest, executionReport?: ExecutionReport): AgentBody {
+    const report = executionReport
+      ? `\n\nExecution report from the previous observation:\n${JSON.stringify(executionReport)}\nThe previous action was executed successfully. This request is informational only; do not execute another action.`
+      : '';
   return {
     ss: request.sanitizedImage?.base64 ?? null,
     page_info: describePage(request),
     instruction: request.sanitizedInstruction,
-    problem_context: `Reply with {"thought": "...", "output": [{"action": "click|type|select|scroll|wait|finish", "id": ..., "className": null, "xpath": null, "value": ...}]}.\n\nRules:\n${RULES}`,
+    problem_context: `Reply with {"thought": "...", "output": [{"action": "click|type|select|scroll|wait|finish", "id": ..., "className": null, "xpath": null, "value": ...}]}\n\nRules:\n${RULES}${report}`,
   };
 }
 

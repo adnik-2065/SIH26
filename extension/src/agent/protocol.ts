@@ -1,23 +1,41 @@
-import { AgentResponseSchema, ActionSchema, type Action, type StepRequest } from '../contracts';
+import { AgentResponseSchema, ActionSchema, type Action, type StepRequest, type TransportError } from '../contracts';
 import { canonical, classify, credentialKinds } from '../privacy/classify';
+import { transportError } from './diagnostics';
 
 // Why a step was refused. These are shown to the user, never sent anywhere.
 export const rejections = ['UNKNOWN_TARGET', 'SELECTOR_UNSUPPORTED', 'MISSING_VALUE', 'UNSAFE_VALUE',
   'SENSITIVE_TARGET', 'INVALID_ACTION', 'AFTER_FINISH'] as const;
 export type Rejection = typeof rejections[number];
 export interface PlannedStep { action: Action; index: number; literal: boolean }
-export type Plan = { ok: true; thought: string; steps: PlannedStep[]; rejected: Array<{ index: number; reason: Rejection }> }
-  | { ok: false; reason: 'MALFORMED_RESPONSE' | 'WRONG_REQUEST' };
+// A refusal carries both the coarse reason older callers read and the exact
+// code, stage and structural context that say what was wrong with the reply.
+export type PlanFailure = { ok: false; reason: 'MALFORMED_RESPONSE' | 'WRONG_REQUEST'; error: TransportError };
+export type PlanSuccess = { ok: true; thought: string; steps: PlannedStep[]; rejected: Array<{ index: number; reason: Rejection }> };
+export type Plan = PlanSuccess | PlanFailure;
 
 // A server may only name a control the redaction gateway actually exported,
 // and only for the observation this response answers. Everything else about
 // the page — markup, class names, structure — it never received.
-export function planActions(raw: unknown, request: StepRequest): Plan {
+export function planActions(raw: unknown, request: StepRequest, runId?: string): Plan {
   const parsed = AgentResponseSchema.safeParse(raw);
-  if (!parsed.success) return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  if (!parsed.success) {
+    // Field paths and issue codes only. The offending values are the server's
+    // prose and can echo page vocabulary, so they stay out of the diagnostics.
+    const issues = parsed.error.issues.slice(0, 8).map(issue => ({ path: issue.path.join('.') || '(root)', code: issue.code }));
+    return { ok: false, reason: 'MALFORMED_RESPONSE', error: transportError({
+      code: 'AGENT_RESPONSE_SCHEMA_INVALID', stage: 'response_validated', runId,
+      message: 'The reply did not match the agent response schema.',
+      cause: `${parsed.error.issues.length} schema issue${parsed.error.issues.length === 1 ? '' : 's'}`,
+      context: { schema: 'AgentResponseSchema', issues, replyType: raw === null ? 'null' : typeof raw },
+    }) };
+  }
   const response = parsed.data;
   for (const [key, value] of [['requestId', response.requestId], ['taskId', response.taskId], ['observationId', response.observationId]] as const)
-    if (value !== undefined && value !== request[key]) return { ok: false, reason: 'WRONG_REQUEST' };
+    if (value !== undefined && value !== request[key]) return { ok: false, reason: 'WRONG_REQUEST', error: transportError({
+      code: 'AGENT_PLAN_VALIDATION_FAILED', stage: 'plan_validated', runId,
+      message: 'The reply echoes a different request than the one in flight.',
+      cause: `${key} does not match the request`, context: { mismatchedField: key },
+    }) };
   const elements = new Map(request.elements.map(element => [element.id, element]));
   const valueRefs = new Map(request.valueRefs.map(ref => [ref.id, ref]));
   const steps: PlannedStep[] = [], rejected: Array<{ index: number; reason: Rejection }> = [];
@@ -59,7 +77,16 @@ export function planActions(raw: unknown, request: StepRequest): Plan {
     if (!text) { refuse('MISSING_VALUE'); continue; }
     steps.push({ action: step.action === 'type' ? { type: 'type', target, text } : { type: 'choose', target, optionText: text }, index, literal: true });
   }
-  for (const step of steps) if (!ActionSchema.safeParse(step.action).success) return { ok: false, reason: 'MALFORMED_RESPONSE' };
+  for (const step of steps) {
+    const action = ActionSchema.safeParse(step.action);
+    if (!action.success) return { ok: false, reason: 'MALFORMED_RESPONSE', error: transportError({
+      code: 'AGENT_PLAN_VALIDATION_FAILED', stage: 'plan_validated', runId,
+      message: 'A translated step did not satisfy the local action contract.',
+      cause: 'ActionSchema rejected a translated step',
+      context: { schema: 'ActionSchema', stepIndex: step.index, actionType: step.action.type,
+        issues: action.error.issues.slice(0, 4).map(issue => ({ path: issue.path.join('.') || '(root)', code: issue.code })) },
+    }) };
+  }
   return { ok: true, thought: canonical(response.thought).slice(0, 2000), steps, rejected };
 }
 

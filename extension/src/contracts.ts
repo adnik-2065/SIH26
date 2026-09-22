@@ -46,6 +46,56 @@ export const StepRequestSchema = z.object({ ...envelope,
 }).strict();
 export type StepRequest = z.infer<typeof StepRequestSchema>;
 
+// ---------------------------------------------------------------------------
+// Diagnostics
+//
+// A failure code on its own ("SERVER_UNREACHABLE") cannot say which stage of a
+// request failed, whether anything was received, or who cancelled it. Every
+// layer that can fail therefore reports this structured shape alongside its
+// coarse category, so one failed run is readable end to end. It carries
+// structure, never page content: sizes, counts, codes and states only.
+export const ExtensionErrorSchema = z.object({
+  code: z.string().min(1).max(80),
+  stage: z.string().min(1).max(80),
+  message: z.string().min(1).max(500),
+  // What this failure is attributed to, in one short phrase.
+  cause: z.string().max(200).optional(),
+  // The original exception, as "Name: message". Never a stack trace.
+  originalError: z.string().max(500).optional(),
+  context: z.record(z.unknown()).optional(),
+  timestamp: z.string(),
+  runId: z.string().max(80).optional(),
+}).strict();
+export type ExtensionError = z.infer<typeof ExtensionErrorSchema>;
+
+// The stages one agent request passes through. A failure names the stage it
+// reached, which is what distinguishes "never left the device" from "the model
+// answered and we could not read it".
+export const TransportStageSchema = z.enum(['request_initialized', 'payload_serialized', 'fetch_started', 'response_received',
+  'response_body_read_started', 'response_body_received', 'json_parse_started', 'json_parsed', 'reply_unwrapped',
+  'response_validated', 'plan_validated', 'transport_completed']);
+export type TransportStage = z.infer<typeof TransportStageSchema>;
+
+export const TransportErrorCodeSchema = z.enum([
+  'AGENT_ENDPOINT_REJECTED', 'AGENT_FETCH_ABORTED', 'AGENT_FETCH_TIMEOUT', 'AGENT_FETCH_NETWORK_ERROR',
+  'AGENT_REDIRECT_BLOCKED', 'AGENT_HTTP_ERROR', 'AGENT_RESPONSE_READ_FAILED', 'AGENT_RESPONSE_EMPTY',
+  'AGENT_RESPONSE_TOO_LARGE', 'AGENT_JSON_PARSE_FAILED', 'AGENT_MALFORMED_RESPONSE', 'AGENT_RESPONSE_SCHEMA_INVALID',
+  'AGENT_PLAN_VALIDATION_FAILED', 'AGENT_UNKNOWN_ERROR']);
+export type TransportErrorCode = z.infer<typeof TransportErrorCodeSchema>;
+export type TransportError = ExtensionError & { code: TransportErrorCode; stage: TransportStage };
+
+// Who cancelled a request, and why. An AbortError says only that something
+// aborted; without this the panel cannot tell a 4-second task restart from a
+// 120-second timeout, and both look like an unreachable server.
+export const AbortSourceSchema = z.enum(['timeout', 'user_cancel', 'task_restart', 'task_replaced',
+  'panel_unmount', 'pagehide', 'navigation', 'extension_shutdown', 'caller_signal', 'unknown']);
+export type AbortSource = z.infer<typeof AbortSourceSchema>;
+export const AbortReasonSchema = z.object({
+  source: AbortSourceSchema, reason: z.string().max(200), at: z.string(),
+  runId: z.string().max(80).optional(), stage: z.string().max(80).optional(),
+}).strict();
+export type AbortReason = z.infer<typeof AbortReasonSchema>;
+
 export const RectSchema = z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict();
 export const PanelCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('STATUS') }).strict(),
@@ -72,7 +122,6 @@ export const ContentCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('ACT'), observationId: id, action: ActionSchema, resolved: LiteralTextSchema.optional(),
     expect: z.object({ role: z.string().max(50), bounds: RectSchema }).strict().optional() }).strict(),
 ]);
-export const PageChangedSchema = z.object({ type: z.literal('PAGE_CHANGED'), observationId: id }).strict();
 export const VisualCategorySchema = z.enum(['aadhaar_card', 'pan_card', 'passport', 'identity_card',
   'financial_document', 'private_document', 'signature', 'qr_barcode', 'form_control', 'sensitive_image']);
 export type VisualCategory = z.infer<typeof VisualCategorySchema>;
@@ -93,6 +142,52 @@ export const DomSnapshotSchema = z.object({
 export type DomSnapshot = z.infer<typeof DomSnapshotSchema>;
 export type ObservedElement = z.infer<typeof ElementSchema>;
 export type Rect = z.infer<typeof RectSchema>;
+
+// Capture stability deliberately has its own compact snapshot. The ordinary
+// DOM observation contains labels, revision counters and visual detections
+// that can change without making the screenshot unsafe. This shape contains
+// only values used to decide whether the captured pixels still describe the
+// page, and never contains page text.
+export const StabilitySnapshotSchema = z.object({
+  url: z.string().url().max(4096), documentId: id,
+  documentWidth: z.number().nonnegative().finite(), documentHeight: z.number().nonnegative().finite(),
+  scrollWidth: z.number().nonnegative().finite(), scrollHeight: z.number().nonnegative().finite(),
+  viewportWidth: z.number().positive().finite(), viewportHeight: z.number().positive().finite(),
+  scrollX: z.number().finite(), scrollY: z.number().finite(),
+  totalElementCount: z.number().int().nonnegative(), interactiveElementCount: z.number().int().nonnegative(),
+}).strict();
+export type StabilitySnapshot = z.infer<typeof StabilitySnapshotSchema>;
+
+export const MutationSummarySchema = z.object({
+  total: z.number().int().nonnegative(), ignored: z.number().int().nonnegative(),
+  significant: z.number().int().nonnegative(), categories: z.record(z.number().int().nonnegative()),
+}).strict();
+export type MutationSummary = z.infer<typeof MutationSummarySchema>;
+
+// Only major changes retire a capture, so these are the only reasons it can
+// report. Small DOM mutations, animations, class and style changes, counters,
+// badges, re-renders and lazy updates are not page changes.
+export const PageChangeReasonSchema = z.enum([
+  'PAGE_CHANGED_NAVIGATION', 'PAGE_CHANGED_MAJOR_LAYOUT', 'PAGE_CHANGED_DOCUMENT_SIZE',
+  'PAGE_CHANGED_TARGET_REMOVED', 'PAGE_CHANGED_UNKNOWN',
+]);
+export type PageChangeReason = z.infer<typeof PageChangeReasonSchema>;
+export const PageChangedDetailSchema = ExtensionErrorSchema.extend({
+  code: z.literal('PAGE_CHANGED'), stage: z.literal('Capture Stability'), cause: PageChangeReasonSchema,
+}).strict();
+export type PageChangedDetail = z.infer<typeof PageChangedDetailSchema>;
+export const PageChangedSchema = z.object({
+  type: z.literal('PAGE_CHANGED'), observationId: id, detail: PageChangedDetailSchema.optional(),
+}).strict();
+
+export const CaptureSnapshotResponseSchema = z.object({
+  snapshot: DomSnapshotSchema, stability: StabilitySnapshotSchema, mutations: MutationSummarySchema,
+}).strict();
+export type CaptureSnapshotResponse = z.infer<typeof CaptureSnapshotResponseSchema>;
+export const CapturePageChangedResponseSchema = z.object({
+  error: z.literal('PAGE_CHANGED'), detail: PageChangedDetailSchema,
+}).strict();
+export const CaptureCheckResponseSchema = z.union([CaptureSnapshotResponseSchema, CapturePageChangedResponseSchema]);
 export const ErrorCodeSchema = z.enum(['ACCESS_REQUIRED', 'PAGE_CHANGED', 'STOPPED', 'CAPTURE_FAILED', 'CAPTURE_TOO_LARGE',
   'INVALID_MESSAGE', 'BUSY', 'RESTARTED', 'TARGET_CHANGED', 'TARGET_UNSAFE', 'ACTION_FAILED']);
 export type ErrorCode = z.infer<typeof ErrorCodeSchema>;
@@ -100,7 +195,7 @@ export const TaskStateSchema = z.object({
   status: z.enum(['idle', 'observing', 'paused', 'stopped', 'failed']),
   taskId: id.optional(), tabId: z.number().int().optional(), windowId: z.number().int().optional(),
   origin: z.string().optional(), observationId: id.optional(),
-  generation: z.number().int().nonnegative(), error: ErrorCodeSchema.optional(),
+  generation: z.number().int().nonnegative(), error: ErrorCodeSchema.optional(), errorDetail: ExtensionErrorSchema.optional(),
 }).strict();
 export type TaskState = z.infer<typeof TaskStateSchema>;
 // Screenshots travel separately so a long page never exceeds Chrome's message

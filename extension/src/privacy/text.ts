@@ -1,5 +1,5 @@
 import { canonical, classify, credentialKinds, type Span } from './classify';
-import { LIMITS, PrivacyError, type Finding, type PiiKind } from './contracts';
+import { LIMITS, privacyError, PrivacyError, type Finding, type PiiKind, type PrivacyStage } from './contracts';
 
 // One allocator per local task/session. Raw values are never used to derive IDs.
 export class Placeholders {
@@ -29,12 +29,51 @@ const safeWords = new Set(('a an the my your this that these those i me we our a
   'has have do does done below above page image images only visible all current view open close show hide settings sensitive unlabelled ' +
   'textbox combobox checkbox radio spinbutton slider listbox switch').split(' '));
 const placeholderPattern = /\[(?:PERSON|EMAIL|PHONE|ADDRESS|DATE_OF_BIRTH|AADHAAR|PAN|PASSPORT|PAYMENT_CARD|BANK_ACCOUNT|IFSC|FACE|DOCUMENT|PASSWORD|OTP|TOKEN|API_KEY)_\d+\]/g;
+// What actually makes a string unsafe to carry, as opposed to merely not being
+// ASCII. Unicode is the normal case on this project's own pages: rupee amounts,
+// typographic punctuation, accented names, Devanagari, emoji. Rejecting all of
+// it blocked whole payloads for a currency symbol, which is neither a privacy
+// control nor a correct one — the allowlist below is what withholds unknown
+// words, and it now tokenizes every script rather than Latin only.
+//
+// These, by contrast, are refused: they can hide or reorder what a reviewer
+// reads, or mean the string never survived decoding intact.
+// eslint-disable-next-line no-control-regex -- matching control characters is the point
+const unsafeControl = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u;
+const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+const nonCharacter = /[\uFDD0-\uFDEF\uFFFE\uFFFF]/u;
+// Letters, marks, digits and word-joining punctuation in any script. Anything a
+// script writes as a word is a word here, so an unknown Devanagari or accented
+// word is withheld exactly like an unknown Latin one.
+const wordPattern = /[\p{L}\p{M}\p{N}_'\u2019\u02BC-]+/gu;
+// The character that made a string unsafe, reported as a code point and offset —
+// never as the text itself.
+function unsafeCharacter(text: string, stage: PrivacyStage) {
+  for (const [pattern, reason, cause] of [
+    [loneSurrogate, 'TEXT_WITHHELD_INVALID_ENCODING', 'unpaired surrogate'],
+    [nonCharacter, 'TEXT_WITHHELD_INVALID_ENCODING', 'Unicode non-character'],
+    [unsafeControl, 'TEXT_WITHHELD_UNSAFE_CONTROL_CHARACTER', 'control character'],
+  ] as const) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    throw privacyError(reason, stage, 'The text contains a character that cannot be carried safely.', {
+      offset: match.index, codePoint: `U+${(match[0].codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}`,
+      textLength: text.length, rule: cause,
+    }, cause);
+  }
+}
 export function sanitizeText(raw: string, context: 'instruction' | 'element_description' | 'ocr',
   placeholders = new Placeholders(), ocrPolicy: 'all_text' | 'sensitive_only' = 'all_text') {
-  const normalized = canonical(raw);
-  // English OCR is the only installed language. Withhold unsupported scripts
-  // and control characters instead of pretending the rules classified them.
-  if ((context !== 'ocr' || ocrPolicy === 'all_text') && /[^\x20-\x7E\n\r\t]/.test(normalized)) throw new PrivacyError('TEXT_WITHHELD');
+  const stage: PrivacyStage = context === 'ocr' ? 'OCR' : 'PRIVACY_NORMALIZATION';
+  let normalized: string;
+  try {
+    normalized = canonical(raw);
+  } catch (error) {
+    if (error instanceof PrivacyError) throw error;
+    throw privacyError('TEXT_WITHHELD_SANITIZATION_FAILED', stage, 'The text could not be normalized.',
+      { textLength: raw.length, errorName: error instanceof Error ? error.name : typeof error }, 'canonical() threw');
+  }
+  unsafeCharacter(normalized, stage);
   const matches = classify(normalized), spans: Span[] = [];
   // The allowlist below is the answer to untrusted page content: with no NER
   // model, a word the rules do not recognise cannot be cleared, so it is
@@ -45,7 +84,7 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
   // own and never came off the page. Classified PII is still redacted from it.
   if (context !== 'instruction' && (context !== 'ocr' || ocrPolicy === 'all_text')) {
     const placeholders = [...normalized.matchAll(placeholderPattern)].map(match => ({ start: match.index!, end: match.index! + match[0].length }));
-    for (const match of normalized.matchAll(/[A-Za-z0-9_'-]+/g)) {
+    for (const match of normalized.matchAll(wordPattern)) {
       const start = match.index!, end = start + match[0].length;
       if (!safeWords.has(match[0].toLowerCase()) && !placeholders.some(span => start >= span.start && end <= span.end) &&
         !matches.some(span => start < span.end && end > span.start)) matches.push({ start, end, kind: 'document', unclassified: true });

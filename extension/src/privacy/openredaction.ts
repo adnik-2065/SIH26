@@ -1,5 +1,5 @@
 import { patterns } from '../../vendor/openredaction/patterns.js';
-import { LIMITS, PrivacyError, type PiiKind } from './contracts';
+import { LIMITS, privacyError, PrivacyError, type PiiKind } from './contracts';
 import type { Span } from './classify';
 
 // Only reviewed additions. Indian IDs, names, email, phone and Luhn remain
@@ -29,6 +29,8 @@ export function additionalTextCandidates(text: string): Span[] {
     }
     return spans;
   } catch (error) {
-    throw error instanceof PrivacyError ? error : new PrivacyError('INCOMPLETE_DETECTION');
+    throw error instanceof PrivacyError ? error : privacyError('INCOMPLETE_DETECTION_OCR', 'PRIVACY_NORMALIZATION',
+      'The additional text detector failed, so its coverage of the page is unknown.',
+      { errorName: error instanceof Error ? error.name : typeof error }, 'openredaction threw');
   }
 }
