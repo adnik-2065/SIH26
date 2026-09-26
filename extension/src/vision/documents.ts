@@ -1,11 +1,11 @@
 import { z } from 'zod';
-import { VisualCategorySchema, type LocalObservation } from '../contracts';
+import { VisualCategorySchema, type LocalObservation, type Rect } from '../contracts';
 import type { PerceptionResult } from './contracts';
 import { ocrDocumentCue } from '../dom/visuals';
 import { BoundsSchema, DocumentEvidenceSchema, LIMITS, privacyError, PrivacyError } from '../privacy/contracts';
-import { domBounds, union, validateBounds } from '../privacy/geometry';
+import { domBounds, intersection, union, validateBounds } from '../privacy/geometry';
 import { reconstructOcr } from '../privacy/normalize';
-import { visualIsMasked } from '../privacy/policy';
+import { visualIsMasked, visualRegionIsEvidence } from '../privacy/policy';
 import { bounded, pngBytes, validateTiles } from '../privacy/image';
 
 export const VisionDocumentResultSchema = z.object({ observationId: z.string(), truncated: z.literal(false),
@@ -36,27 +36,32 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
   if (ocr.source !== 'model') throw privacyError('INCOMPLETE_DETECTION_OCR', 'DOCUMENT_DETECTION',
     'Document rules require text evidence from the installed model.',
     { observationId: observation.dom.observationId, source: ocr.source }, 'result source is not the model');
+  // Keep legitimate visual candidates, but never let a page-sized container
+  // become a page-scale document mask: that is how a screenshot turned black.
   const regions: DocumentEvidence['regions'] = (observation.dom.visualRegions ?? [])
-    .filter(region => visualIsMasked(region.category, textPolicy)).map(region => ({
+    .filter(region => visualIsMasked(region.category, textPolicy) && visualRegionIsEvidence(region.bounds, observation.captureBounds))
+    .map(region => ({
     kind: kind(region.category), category: region.category, confidence: region.confidence,
     bounds: domBounds(region.bounds, observation),
   }));
-  // OCR gives cues, not a trustworthy document boundary. Strict mode answers
-  // that by masking the full captured page: it also covers a document spanning
-  // many tiles and its non-text marks. Context mode cannot afford a whole-page
-  // rectangle for one phrase, so it masks the lines the cue actually sits on;
-  // individual identifiers inside them are still caught by the text rules.
+  // OCR gives cues, not a trustworthy document boundary. One phrase is not
+  // evidence for a page-scale rectangle, so both policies mask the lines the
+  // cue actually sits on, widened across the capture: that is the largest
+  // region the text evidence can justify. Identifiers elsewhere are still
+  // caught by the text rules, and labelled or model-detected document regions
+  // still cover the rest of a real document.
   const reconstructed = reconstructOcr(ocr.regions);
   if (reconstructed.text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
   const cue = ocrDocumentCue(reconstructed.text);
   if (cue) {
-    const page = { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight };
+    const page: Rect = { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight };
     // Every word box the cue touches, widened to the lines holding them.
     const boxes = reconstructed.spans.filter(span => span.start < cue.end && span.end > cue.start).map(span => span.bounds);
-    const bounds = textPolicy === 'all_text' || !boxes.length ? page
-      : { ...boxes.reduce(union), x: 0, width: observation.imageWidth };
-    regions.push({ kind: kind(cue.category), category: cue.category, confidence: .5,
-      bounds: validateBounds(bounds, page.width, page.height) });
+    if (boxes.length) {
+      const bounds = { ...boxes.reduce(union), x: 0, width: observation.imageWidth };
+      regions.push({ kind: kind(cue.category), category: cue.category, confidence: .5,
+        bounds: validateBounds(bounds, page.width, page.height) });
+    }
   }
   return DocumentEvidenceSchema.parse({ status: 'complete', required: true, detector: 'document_rules',
     observationId: observation.dom.observationId, regions });
@@ -116,9 +121,24 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         { observationId, evidenceObservationId: parsed.data.observationId, tileIndex }, 'observation id mismatch');
       for (const detection of parsed.data.detections) {
         const box = validateBounds(detection.bbox, tile.width, tile.height);
-        // Low confidence is not permission to expose pixels.
-        regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence,
-          bounds: { ...box, y: box.y + tile.y } });
+        const pageBox = { ...box, y: box.y + tile.y };
+        // A detection covering essentially the whole capture describes the page
+        // context, not a bounded document artefact. The same page-scale
+        // evidence rule that gates DOM candidates gates model output, in image
+        // space, so a false positive over ordinary UI can never become a
+        // page-wide mask. Bounded detections still union across tile seams.
+        if (!visualRegionIsEvidence(pageBox, { width: observation.imageWidth, height: observation.imageHeight })) continue;
+        // The same document seen by neighbouring tiles arrives as one box per
+        // crop. Union same-category intersecting boxes into one region: the
+        // candidate list is deduplicated, while every crop's boxes keep their
+        // combined coverage, so a document spanning a seam is never dropped
+        // and never counted twice. Distinct same-category documents do not
+        // intersect and stay separate.
+        const existing = regions.find(region => region.category === detection.type && intersection(region.bounds, pageBox));
+        if (existing) existing.bounds = union(existing.bounds, pageBox);
+        else regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence, bounds: pageBox });
+        // eslint-disable-next-line no-console -- temporary runtime provenance diagnostic
+        console.log('[DOC-PROBE] accepted', JSON.stringify({ category: detection.type, confidence: detection.confidence, pageBox, tile: { y: tile.y, width: tile.width, height: tile.height } }));
       }
       if (regions.length > 500) throw new PrivacyError('LIMIT_EXCEEDED');
     } catch (error) {

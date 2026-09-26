@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
-import { CAPTURE_RETRY_BACKOFF_MS, CAPTURE_RETRY_LIMIT, initialState, nextCaptureRetry, roundVerdict } from '../agent/lifecycle';
+import { CAPTURE_RETRY_BACKOFF_MS, CAPTURE_RETRY_LIMIT, initialState, lifecycleStateLog, newActionHistory, newLoopTracker, nextCaptureRetry, nextRound, recordActionHistory, resetActionHistory, roundVerdict, RUN_LIMIT, type ActionHistoryEntry } from '../agent/lifecycle';
 import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
 import { inspectCapturedPage } from '../vision/page';
@@ -96,6 +96,13 @@ function App() {
   const [runId, setRunId] = useState<string>();
   const [runStage, setRunStage] = useState<RunStage>('IDLE');
   const runRef = useRef<RunState | undefined>(undefined);
+  // Action history and loop tracking live for the whole task, across the
+  // per-round remounts of the scan pipeline, and reset only when a new task
+  // starts. History is written by the executor's actual result (through
+  // `recordActionHistory`); the loop tracker counts equivalent state+action
+  // cycles across rounds.
+  const actionHistoryRef = useRef<ActionHistoryEntry[]>(newActionHistory());
+  const loopTrackerRef = useRef(newLoopTracker());
   const [lastFailure, setLastFailure] = useState<ExtensionError>();
   const runIdRef = useRef<string | undefined>(undefined);
   const [log, setLog] = useState<LogLine[]>([]);
@@ -151,6 +158,10 @@ function App() {
   };
   const applyState = (next: TaskState) => {
     if (next.generation !== stateRef.current.generation || next.observationId !== stateRef.current.observationId || next.status === 'stopped') {
+      // The exact user-visible refusal line, now timestamped with the old and
+      // new generation so a task_replaced abort can be tied to the event that
+      // published it.
+      lifecycleStateLog('panel_task_replaced', next);
       clearDetections(next.status === 'stopped' ? 'user_cancel' : 'task_replaced',
         next.status === 'stopped' ? 'the task was stopped' : `the worker published generation ${next.generation}${next.error ? ` after ${next.error}` : ''}`); setObservation(undefined); captureTilesRef.current = []; setCaptureProgress(undefined);
     }
@@ -289,6 +300,9 @@ function App() {
     runRef.current = outcome.run;
     setRunStage(outcome.run.stage);
     setRunNotice(''); setRound(1); setExecutionReport(undefined); setAutoRun(true); setLog([]);
+    // A new task starts with no actions performed and no repetition history.
+    actionHistoryRef.current = resetActionHistory();
+    loopTrackerRef.current = newLoopTracker();
     setRoundGeneration(undefined); retriedGeneration.current = undefined; retries.current = 0; retryReasons.current = [];
     runIdRef.current = outcome.run.runId; setRunId(outcome.run.runId); setLastFailure(undefined);
     addLog('info', `Run ${outcome.run.runId} started.`);
@@ -326,12 +340,40 @@ function App() {
     if (refused === 'ACCESS_REQUIRED') { setError(''); setAutoRun(true); await command('START'); }
   }
 
-  const RUN_LIMIT = 8;
-  // A run cannot continue past a failed scan: the next round would have nothing
-  // trustworthy to redact or act on.
   const busy = state.status === 'observing' || ocrBusy || faceBusy || documentBusy;
   const complete = !!ocr && !!faces && !!documents && !ocrBusy && !faceBusy && !documentBusy && !ocrError && !faceError && !documentError;
   const taskRunning = autoRun || busy;
+  // MV3 keepalive for the inference window. The agent request runs in the
+  // panel (requestStep fetches from here), so while the model thinks the
+  // worker receives zero messages and can be terminated; an ACT that follows
+  // a mid-think termination wakes a fresh worker whose recover() has already
+  // invalidated the observation — RESTARTED → task_replaced → the refusal of
+  // record (reproduced in docs/worker-restart-generation-investigation.md).
+  // While a run is active, a single chrome.runtime.sendMessage round-trip per
+  // 20 s keeps the worker continuously alive (5-min window reset per event);
+  // lifecycle-logged so the timeline shows the keepalive, and self-terminating
+  // the moment the run goes inactive. Observations still invalidate on any
+  // real navigation or STOP — this only prevents a restart the page never caused.
+  useEffect(() => {
+    if (!taskRunning) return;
+    let stopped = false;
+    const beat = async () => {
+      while (!stopped) {
+        await new Promise(resolve => setTimeout(resolve, 20_000));
+        if (stopped) return;
+        try {
+          const reply = await chrome.runtime.sendMessage({ type: 'STATUS' });
+          const parsed = TaskStateSchema.safeParse(reply?.state);
+          if (parsed.success) {
+            lifecycleStateLog('panel_keepalive_beat', parsed.data);
+            if (parsed.data.generation >= stateRef.current.generation) applyState(parsed.data);
+          }
+        } catch { /* a dead worker here is exactly what the beat prevents */ }
+      }
+    };
+    void beat();
+    return () => { stopped = true; };
+  }, [taskRunning]);
   // Escape closes whatever is on top before it reaches the run: a menu, then a
   // drawer, and only then the task itself.
   useEffect(() => {
@@ -573,9 +615,13 @@ function App() {
 
         <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete}
           currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={ocrAdapter}
-          auto={autoRun} runId={runId} executionReport={executionReport} onExecuted={setExecutionReport} onStage={stage} onHalt={stopRun} onLog={addLog} onContinue={() => {
-            if (round >= RUN_LIMIT) { stopRun(`Stopped after ${RUN_LIMIT} rounds. Run the task again to continue.`); return; }
-            setRound(round + 1);
+          auto={autoRun} runId={runId} executionReport={executionReport} onExecuted={setExecutionReport} onStage={stage} onHalt={stopRun}
+          actionHistory={actionHistoryRef.current} loopTracker={loopTrackerRef.current}
+          onActionOutcome={(entry) => { recordActionHistory(actionHistoryRef.current, entry); }}
+          onLoopDetected={(notice) => stopRun(notice)} onLog={addLog} onContinue={() => {
+            const next = nextRound(round, RUN_LIMIT);
+            if (!next.continue) { stopRun(next.notice); return; }
+            setRound(next.round);
             addLog('info', `Round ${round} done. Observing the page again.`);
             void command('OBSERVE');
           }} />

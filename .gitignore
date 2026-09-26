@@ -164,3 +164,6 @@ htmlcov/
 ngrok.yml
 ngrok.yaml
 .ngrok2/
+tests/
+evidence/
+.freebuff/

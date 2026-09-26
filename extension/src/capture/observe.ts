@@ -3,7 +3,8 @@ import { CaptureCheckResponseSchema, CaptureSnapshotResponseSchema, PageChangedD
   type CaptureObservation, type CaptureTile, type MutationSummary, type PageChangeReason } from '../contracts';
 import { captureTiles } from './tiles';
 import { compareCaptureStability, emptyMutationSummary, PageChangedError, pageChangedDetail } from './stability';
-import { captureError, CAPTURE_LIMITS } from './errors';
+import { CaptureError, captureError, CAPTURE_LIMITS } from './errors';
+import { lifecycleLog } from '../agent/lifecycle';
 
 const LayoutSchema = z.object({
   cssContentSize: z.object({ width: z.number().positive().finite(), height: z.number().positive().finite() }),
@@ -28,10 +29,20 @@ function pngSize(encoded: string) {
   return { width: header.getUint32(16), height: header.getUint32(20) };
 }
 
+// Where a capture stood when it ended. `phase` is the last fully collected
+// state: COLLECT means the DOM snapshot and at least one screenshot were taken
+// (a tile delivery was interrupted), CHECK means the screenshots were complete
+// and only the final stability comparison was interrupted. The retry policy
+// uses this to wait out an in-flight navigation instead of re-capturing blind.
+export interface CaptureEndContext { phase: 'NONE' | 'COLLECT' | 'CHECK'; steps: string[]; signalAborted: boolean }
+
 export async function observeTab(tabId: number, windowId: number, origin: string, observationId: string,
   check: () => void, signal?: AbortSignal,
-  onTile: (tile: CaptureTile, index: number, count: number) => Promise<void> = async () => {}): Promise<CaptureObservation> {
+  onTile: (tile: CaptureTile, index: number, count: number) => Promise<void> = async () => {},
+  onEnd?: (context: CaptureEndContext) => void): Promise<CaptureObservation> {
   const target = { tabId };
+  const steps: string[] = [];
+  const instrument: { phase: 'NONE' | 'COLLECT' | 'CHECK' } = { phase: 'NONE' };
   let attached = false;
   let scrollbarReserved = false;
   let motionPaused = false;
@@ -48,6 +59,7 @@ export async function observeTab(tabId: number, windowId: number, origin: string
   const detached = (source: chrome.debugger.Debuggee) => {
     if (source.tabId === tabId && attached) {
       attached = false;
+      lifecycleLog('debugger_onDetach', { tabId, elapsedMs: Math.round(performance.now() - started) });
       interrupt(captureError('CAPTURE_DEBUGGER_DETACHED', 'The debugger session ended before the capture finished.',
         { tabId, elapsedMs: Math.round(performance.now() - started) },
         'another client took the debugger, or the user dismissed the notice'));
@@ -56,6 +68,34 @@ export async function observeTab(tabId: number, windowId: number, origin: string
   const current = () => { if (failure) throw failure; if (signal?.aborted) throw new Error('STOPPED'); check(); };
   const pageChanged = (reason: PageChangeReason, mutations: MutationSummary = emptyMutationSummary()) =>
     new PageChangedError(pageChangedDetail(reason, mutations));
+  // chrome.tabs and chrome.scripting throw raw browser errors when the frame
+  // they address disappears mid-navigation ("Cannot access contents of url",
+  // "Receiving end does not exist", "No frame with given id"). Idle, an
+  // inaccessible frame means a genuinely restricted page — a real capture
+  // failure. While the tab still reports 'loading', the same error means the
+  // document was replaced under the capture: the retryable race. Evidence
+  // taken at throw time is what tells the two apart, so only an
+  // in-flight-navigation ending is re-labelled; everything else keeps its
+  // original meaning in the background's classifier.
+  const captureStep = async <T>(operation: () => Promise<T>): Promise<T> => {
+    try { return await operation(); }
+    catch (error) {
+      if (error instanceof CaptureError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      let navigationInFlight: boolean;
+      try { navigationInFlight = (await chrome.tabs.get(tabId)).status === 'loading'; }
+      catch { navigationInFlight = true; }
+      // Only the AMBIGUOUS family is re-labelled here. "Receiving end does not
+      // exist", "message port closed", "No frame with given id" and "Cannot
+      // find context" already carry an unambiguous navigation meaning in the
+      // background classifier and propagate unchanged; a restricted page that
+      // is simply not injectable keeps failing as CAPTURE_FAILED.
+      if (navigationInFlight && /Cannot access contents of url|Frame no longer exists|Frame with given id was detached|Inspected target navigated|The tab was closed/i.test(message))
+        throw captureError('CAPTURE_PAGE_CHANGED', 'The page navigated while the capture was working.',
+          { errorMessage: message.slice(0, 160), navigationInFlight }, 'document replaced during capture');
+      throw error;
+    }
+  };
   const active = async () => {
     current();
     const [tab] = await chrome.tabs.query({ active: true, windowId });
@@ -98,13 +138,17 @@ export async function observeTab(tabId: number, windowId: number, origin: string
   const capturedAt = Date.now();
   try {
     await active();
+    // From here on the tab was verified present at this URL: an ending during
+    // the steps below happened while this page was being photographed, which
+    // is the window a mid-capture navigation lands in.
+    steps.push('ACTIVE_URL');
     // Injection first preserves the existing user-granted activeTab boundary.
-    await chrome.scripting.executeScript({ target, files: ['content.js'] });
+    await captureStep(() => chrome.scripting.executeScript({ target, files: ['content.js'] }));
     current();
     // The panel can be clicked while Chrome is still animating it open. Measure
     // the pre-notice viewport only after that animation has settled; otherwise
     // the panel's inset gets mistaken for part of the debugging notice.
-    await Promise.race([chrome.scripting.executeScript({ target, func: async function waitForStableViewport() {
+    await Promise.race([captureStep(() => chrome.scripting.executeScript({ target, func: async function waitForStableViewport() {
       const started = performance.now();
       let last = `${innerWidth}:${innerHeight}:${devicePixelRatio}`, stableSince = started;
       while (performance.now() - stableSince < 150 && performance.now() - started < 1500) {
@@ -112,20 +156,23 @@ export async function observeTab(tabId: number, windowId: number, origin: string
         const next = `${innerWidth}:${innerHeight}:${devicePixelRatio}`;
         if (next !== last) { last = next; stableSince = performance.now(); }
       }
-    } }), interrupted]);
+    } })), interrupted]);
     current();
     const prepared = z.union([z.object({ ok: z.literal(true) }).strict(),
       z.object({ error: z.literal('PAGE_CHANGED'), detail: PageChangedDetailSchema }).strict()])
-      .parse(await chrome.tabs.sendMessage(tabId, { type: 'PREPARE_CAPTURE', observationId }, { frameId: 0 }));
+      .parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'PREPARE_CAPTURE', observationId }, { frameId: 0 })));
     if ('error' in prepared) throw new PageChangedError(prepared.detail);
+    steps.push('PREPARE_CAPTURE');
     current();
     await chrome.debugger.attach(target, '1.3').catch((error: unknown) => {
+      lifecycleLog('debugger_attach_failed', { tabId, errorName: error instanceof Error ? error.name : typeof error });
       throw captureError('CAPTURE_DEBUGGER_ATTACH_FAILED', 'The debugger could not attach to this tab.',
         { tabId, errorName: error instanceof Error ? error.name : typeof error,
           errorMessage: error instanceof Error ? error.message.slice(0, 160) : undefined },
         'another debugger client, a restricted page, or a revoked permission');
     });
     attached = true;
+    lifecycleLog('debugger_attached', { tabId, observationId: observationId.slice(0, 8) });
     // Allow Chrome's own debugging notice to settle before measuring the page.
     await Promise.race([new Promise(resolve => setTimeout(resolve, 250)), interrupted]);
     await active();
@@ -149,7 +196,10 @@ export async function observeTab(tabId: number, windowId: number, origin: string
     motionPaused = true;
     current();
     const domStart = performance.now();
-    const before = CaptureSnapshotResponseSchema.parse(await chrome.tabs.sendMessage(tabId, { type: 'COLLECT', observationId }, { frameId: 0 }));
+    const before = CaptureSnapshotResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'COLLECT', observationId }, { frameId: 0 })));
+    steps.push('COLLECT');
+    // The DOM snapshot exists; the tiles are still being delivered.
+    instrument.phase = 'COLLECT';
     const domMs = performance.now() - domStart;
     const layout = LayoutSchema.parse(await command('Page.getLayoutMetrics'));
     const captureBounds = { x: 0, y: 0, width: Math.ceil(layout.cssContentSize.width), height: Math.ceil(layout.cssContentSize.height) };
@@ -211,10 +261,14 @@ export async function observeTab(tabId: number, windowId: number, origin: string
       current();
     }
     await command('Emulation.clearDeviceMetricsOverride');
+    // Every tile was delivered; only the final stability comparison remains.
+    instrument.phase = 'CHECK';
     await active();
-    const checked = CaptureCheckResponseSchema.parse(await chrome.tabs.sendMessage(tabId, { type: 'CHECK', observationId }, { frameId: 0 }));
+    const checked = CaptureCheckResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'CHECK', observationId }, { frameId: 0 })));
     current();
     if ('error' in checked) throw new PageChangedError(checked.detail);
+    steps.push('CHECK');
+    instrument.phase = 'NONE';
     // One semantic comparison of the values the screenshots depend on. DOM
     // churn between COLLECT and CHECK is not consulted and is not a failure.
     const decision = compareCaptureStability({ dom: before.snapshot, stability: before.stability },
@@ -229,17 +283,19 @@ export async function observeTab(tabId: number, windowId: number, origin: string
       console.warn(`[CAPTURE][${observationId}][PAGE_CHANGED] reason=${decision.reason}`);
       throw new PageChangedError(detail);
     }
-    await chrome.tabs.sendMessage(tabId, { type: 'FINISH_CAPTURE', observationId }, { frameId: 0 });
+    await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'FINISH_CAPTURE', observationId }, { frameId: 0 }));
     current();
     return { dom: checked.snapshot, captureBounds, imageWidth, imageHeight, tileCount: tiles.length, capturedAt,
       captureMs: performance.now() - started, domMs };
   } finally {
+    onEnd?.({ phase: instrument.phase, steps: [...steps], signalAborted: signal?.aborted === true });
     clearTimeout(deadline);
     clearTimeout(totalDeadline);
     signal?.removeEventListener('abort', abort);
     chrome.debugger.onDetach.removeListener(detached);
     // Runs on success, Stop, navigation, browser cancellation and errors.
     // Detaching also drops this session's emulation if a command was interrupted.
+    lifecycleLog('debugger_detach', { tabId, attached, elapsedMs: Math.round(performance.now() - started) });
     if (attached) await chrome.debugger.detach(target).catch(() => {});
     // Remove only this capture's stylesheet; never edit the site's style
     // attributes or leave a layout override after success, Stop, or failure.

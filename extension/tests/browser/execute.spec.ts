@@ -93,15 +93,18 @@ for (const noise of ['none', 'toast-appended-to-body', 'class-toggled-on-html', 
 
 // The same leniency must not reach the control itself. Every case below changes
 // what was reviewed, so the step is refused and the page is left untouched.
-// A container change that relocates or hides the control retires the whole
-// observation as it happens (PAGE_CHANGED); an overlay leaves the geometry
-// alone, so it is the executor that refuses at the instant of the click.
+// There is deliberately no MutationObserver: unrelated churn leaves the ref
+// usable, and these per-target changes (detached, rewritten, hidden, moved)
+// are caught by the executor's availability, geometry and occlusion checks at
+// the instant of the click as TARGET_CHANGED — the reviewed page is still
+// current, the reviewed control is not. An overlay is refused by the same
+// executor, at the same instant, for the same reason.
 for (const [change, expected] of [
-  ['the reviewed control is detached', 'PAGE_CHANGED'],
-  ['its container is rewritten', 'PAGE_CHANGED'],
-  ['its own label changes', 'PAGE_CHANGED'],
-  ['an ancestor hides it', 'PAGE_CHANGED'],
-  ['an ancestor moves it', 'PAGE_CHANGED'],
+  ['the reviewed control is detached', 'TARGET_CHANGED'],
+  ['its container is rewritten', 'TARGET_CHANGED'],
+  ['its own label changes', 'TARGET_CHANGED'],
+  ['an ancestor hides it', 'TARGET_CHANGED'],
+  ['an ancestor moves it', 'TARGET_CHANGED'],
   ['an overlay covers it', 'TARGET_CHANGED'],
 ] as const) {
   test(`the step is refused when ${change}`, async () => {

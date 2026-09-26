@@ -31,13 +31,24 @@ export function controlType(el: HTMLElement) { return (el.getAttribute('type') |
 export function sensitiveControl(el: HTMLElement) {
   return /password/i.test(controlType(el)) || /one-time-code|cc-number|cc-csc/i.test(el.getAttribute('autocomplete') || '');
 }
-// Visible, on screen and interactive: the same gate the observer applies when
-// it decides a control is worth describing at all.
+// Visible and interactive: the same gate the observer applies when it decides
+// a control is worth describing at all. The capture photographs the whole
+// document, not just the viewport, so "on screen" means "inside the document".
+// getBoundingClientRect is viewport-relative, so the document-space extent is
+// reconstructed with the scroll offsets: a course row below the fold or above
+// it after a scroll is still in the screenshot's document and stays described.
+// Off-document parked nodes (above or beside the page) stay excluded, as do
+// hidden, invisible and aria-hidden controls.
 export function available(el: HTMLElement) {
   const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+  const documentHeight = document.documentElement.scrollHeight || innerHeight;
+  const documentWidth = document.documentElement.scrollWidth || innerWidth;
+  const documentTop = rect.top + scrollY, documentBottom = rect.bottom + scrollY;
+  const documentLeft = rect.left + scrollX, documentRight = rect.right + scrollX;
   return Boolean(el.isConnected) && Boolean(rect.width) && Boolean(rect.height) && style.visibility !== 'hidden' &&
     style.display !== 'none' && Number(style.opacity) !== 0 && !el.closest('[hidden],[inert],[aria-hidden="true"]') &&
-    rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+    documentBottom > 0 && documentRight > 0 &&
+    documentTop < documentHeight && documentLeft < documentWidth;
 }
 export function collect(observationId: string, documentId: string, revision: number, refs: Map<string, HTMLElement>): DomSnapshot {
   refs.clear();

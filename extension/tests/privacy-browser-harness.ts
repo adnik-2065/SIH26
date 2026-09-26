@@ -10,6 +10,7 @@ export { inspectDocumentTiles, detectLocalDocuments } from '../src/vision/docume
 export { collect } from '../src/dom/observe';
 export { act } from '../src/dom/act';
 export { planActions, executableNow } from '../src/agent/protocol';
+export { toAgentBody, describePage } from '../src/agent/wire';
 
 export function visualFixture(scale = 1, long = false) {
   const data = fixture();

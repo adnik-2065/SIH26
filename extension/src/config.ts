@@ -1,19 +1,38 @@
 import type { ExtensionError } from './contracts';
+import backendDefaults from './backend.json' with { type: 'json' };
 
-// The one place the backend address is written down.
+// The one place the backend address is written down is `src/backend.json`.
 //
-// It used to appear in three: the transport default, `host_permissions` and
-// `connect-src`. A moved tunnel updated in one of them fails closed at a
-// different layer each time — a refused fetch, a CSP violation, or a silent
-// permission error — so they are derived from here and checked against the
-// shipped manifest at build time and again when the panel opens.
+// Every consumer derives from it: the runtime transport (`AGENT_ENDPOINT`
+// below), the shipped manifest -- whose `host_permissions` and `connect-src`
+// the build GENERATES from that one value -- and the panel-open validation.
+// A moved tunnel updated in only one of them would otherwise fail closed at a
+// different layer each time: a refused fetch, a CSP violation, or a silent
+// permission error.
 //
-// `VITE_AGENT_BASE_URL` overrides the default at build time. The manifest must
-// be updated in the same commit; `npm run build` refuses otherwise.
+// `VITE_AGENT_BASE_URL` overrides the default at build time; the manifest is
+// regenerated in the same build, so they can never drift.
+// One derivation shared by the runtime (below) and the build script, which
+// regenerates the manifest from the same src/backend.json value.
+export interface BackendConfig { baseUrl: string; route: string; endpoint: string; origin: string; allowed: boolean }
+export function buildBackendConfig(rawBase: string | undefined): BackendConfig {
+  const base = ((rawBase ?? '').trim().replace(/\/+$/, '')) || backendDefaults.baseUrl;
+  const route = backendDefaults.route || '/agent';
+  return {
+    baseUrl: base,
+    route,
+    endpoint: `${base}${route}`,
+    origin: new URL(base).origin,
+    allowed: endpointAllowed(base),
+  };
+}
+
 const configured = (import.meta.env?.VITE_AGENT_BASE_URL as string | undefined)?.trim();
-export const AGENT_BASE_URL = configured || 'https://hdtv-conditions-fathers-extensions.trycloudflare.com';
-export const AGENT_ROUTE = '/agent';
-export const AGENT_ENDPOINT = `${AGENT_BASE_URL.replace(/\/+$/, '')}${AGENT_ROUTE}`;
+const backend = buildBackendConfig(configured);
+export const AGENT_BASE_URL = backend.baseUrl;
+export const AGENT_ROUTE = backend.route;
+export const AGENT_ENDPOINT = backend.endpoint;
+export const DEFAULT_AGENT_BASE_URL = backendDefaults.baseUrl;
 
 export type EndpointErrorCode = 'BACKEND_ENDPOINT_NOT_CONFIGURED' | 'BACKEND_ENDPOINT_INVALID' | 'BACKEND_ENDPOINT_NOT_ALLOWED';
 const endpointError = (code: EndpointErrorCode, message: string, context: Record<string, unknown>, cause?: string): ExtensionError =>

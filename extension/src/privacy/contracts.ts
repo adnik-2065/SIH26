@@ -15,7 +15,7 @@ export const PiiKindSchema = z.enum(['person_name', 'email', 'phone', 'address',
   'passport', 'payment_card', 'bank_account', 'ifsc', 'face', 'document', 'password', 'otp', 'token', 'api_key']);
 export type PiiKind = z.infer<typeof PiiKindSchema>;
 export const FindingSchema = z.object({ id: IdSchema, source: z.enum(['ocr', 'face', 'dom', 'document', 'instruction']),
-  detector: z.enum(['existing_text_detector', 'openredaction', 'mediapipe', 'vision_model', 'document_rules']).optional(),
+  detector: z.enum(['openredaction', 'mediapipe', 'vision_model', 'document_rules']).optional(),
   textRange: z.object({ start: z.number().int().nonnegative(), end: z.number().int().positive() }).strict().optional(),
   kind: PiiKindSchema, confidence: z.number().finite().min(0).max(1), text: z.string().max(LIMITS.text).optional(),
   bounds: BoundsSchema.optional(), elementId: IdSchema.optional(), exportPolicy: z.enum(['replace', 'mask', 'withhold', 'block']),
@@ -56,7 +56,12 @@ export const CoverageSchema = z.object({ instruction: complete, dom: complete, o
   documents: z.enum(['not_enabled', 'complete', 'incomplete']), image: z.enum(['not_requested', 'complete', 'incomplete']) }).strict();
 export const RedactionPlanSchema = z.object({ observationId: IdSchema, findings: z.array(FindingSchema).max(LIMITS.findings),
   masks: z.array(MaskSchema).max(LIMITS.masks), sanitizedInstruction: StepRequestSchema.shape.sanitizedInstruction,
-  sanitizedElements: StepRequestSchema.shape.elements, valueRefs: StepRequestSchema.shape.valueRefs,
+  // Element boxes travel through the plan into page_info. The inferred type of
+  // a strict() reference is the narrow id/role/description shape, so the schema
+  // is stated explicitly to keep the bounds field visible to TypeScript.
+  sanitizedElements: z.array(z.object({ id: IdSchema, role: z.string().max(50),
+    description: z.string().max(300), bounds: BoundsSchema.optional() }).strict()).max(200),
+  valueRefs: StepRequestSchema.shape.valueRefs,
   coverage: CoverageSchema, decision: z.enum(['safe', 'safe_without_image', 'blocked']), blockedReasons: z.array(BlockReasonSchema) }).strict();
 export type RedactionPlan = z.infer<typeof RedactionPlanSchema>;
 export const BindingSchema = z.object({ taskId: IdSchema, observationId: IdSchema, origin: z.string().url(),

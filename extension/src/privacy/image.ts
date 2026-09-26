@@ -112,6 +112,6 @@ export async function redactImage(observation: LocalObservation, masks: Mask[], 
     const base64 = btoa(binary);
     if (base64.length > LIMITS.base64) throw new PrivacyError('IMAGE_TOO_LARGE');
     if (observation.tiles.some(tile => tile.screenshot.slice(22) === base64)) throw new PrivacyError('RAW_DATA_LEAK');
-    return { mimeType: 'image/png' as const, base64 };
+    return { mimeType: 'image/png' as const, base64, width, height };
   } finally { output.width = 0; output.height = 0; }
 }

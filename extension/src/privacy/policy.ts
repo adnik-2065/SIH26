@@ -25,3 +25,15 @@ export function controlIsMasked(element: ObservedElement, policy: TextPolicy) {
 export function visualIsMasked(category: VisualCategory, policy: TextPolicy) {
   return policy === 'all_text' || (category !== 'sensitive_image' && category !== 'form_control');
 }
+
+// A DOM region covering essentially the whole capture is page layout, not
+// evidence: a body or wrapper element sized to the page must never become a
+// page-scale document mask. Legitimate documents are bounded artefacts, and
+// the model pipeline still inspects the whole page through the tiles. The
+// document detector and the mask verifier must agree on this predicate, so a
+// rejected region can never leave an export unverified.
+export function visualRegionIsEvidence(bounds: { width: number; height: number }, capture: { width: number; height: number }) {
+  if (!(capture.width > 0) || !(capture.height > 0)) return false;
+  return bounds.width * bounds.height < capture.width * capture.height * .6 &&
+    bounds.width <= capture.width * .95;
+}

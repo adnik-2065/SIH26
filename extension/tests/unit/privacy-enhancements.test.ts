@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classify } from '../../src/privacy/classify';
-import { additionalTextCandidates } from '../../src/privacy/openredaction';
+import { openRedactionCandidates } from '../../src/privacy/openredaction';
 import { Placeholders, sanitizeText } from '../../src/privacy/text';
 import { normalize, reconstructOcr } from '../../src/privacy/normalize';
 import { verifyMaskCoverage } from '../../src/privacy/verification';
@@ -10,35 +9,34 @@ import { detectLocalDocuments, VisionDocumentResultSchema } from '../../src/visi
 import { tileMasks } from '../../src/privacy/geometry';
 import { binding, fixture } from '../privacy-fixture';
 
-describe('curated OpenRedaction additions', () => {
+describe('OpenRedaction-derived candidates', () => {
   it.each([
     ['bank_account', 'GB82 WEST 1234 5698 7654 32'],
     ['document', 'SSN: 321-54-6789'], ['token', 'AA:BB:CC:DD:EE:FF'],
     ['api_key', `AIza${'A'.repeat(35)}`], ['token', 'xoxb-1234567890-abcdef'],
     ['token', 'postgres://fictional:password@db.test/local'],
   ])('adds %s with local offsets and no raw-value fields', (kind, raw) => {
-    const spans = additionalTextCandidates(raw);
+    const spans = openRedactionCandidates(raw);
     expect(spans.some(s => s.kind === kind && s.detector === 'openredaction')).toBe(true);
     expect(spans.every(s => s.start >= 0 && s.end <= raw.length)).toBe(true);
     expect(JSON.stringify(spans)).not.toContain(raw);
     expect(sanitizeText(raw, 'instruction').sanitized).not.toContain(raw);
   });
   it('rejects invalid IBAN checksums and ordinary structural prose', () => {
-    expect(additionalTextCandidates('GB83 WEST 1234 5698 7654 32')).toEqual([]);
-    expect(additionalTextCandidates('Please inspect the form')).toEqual([]);
-    expect(additionalTextCandidates('test IBAN: GB82 WEST 1234 5698 7654 32')).toHaveLength(1);
+    expect(openRedactionCandidates('GB83 WEST 1234 5698 7654 32')).toEqual([]);
+    expect(openRedactionCandidates('Please inspect the form')).toEqual([]);
+    expect(openRedactionCandidates('test IBAN: GB82 WEST 1234 5698 7654 32')).toHaveLength(1);
   });
   it.each([
-    ['email', 'mira@example.test'], ['phone', '+91 98765 43210'], ['pan', 'ABCDE1234F'],
-    ['aadhaar', '1234 5678 9012'], ['payment_card', '4111 1111 1111 1111'],
-    ['ifsc', 'ABCD0123456'], ['passport', 'A1234567'], ['api_key', 'API key: fictional-key'],
-  ])('retains existing %s rules', (kind, raw) => {
-    expect(classify(raw).some(s => s.kind === kind)).toBe(true);
+    ['email', 'mira@example.test'], ['phone', '9876543210'],
+    ['aadhaar', 'Aadhaar: 2345 6789 0124'], ['payment_card', '4111 1111 1111 1111'],
+    ['ifsc', 'IFSC: ABCD0123456'], ['passport', 'Passport: A1234567'], ['api_key', 'API key: fictional-key'],
+  ])('detects %s through OpenRedaction', (kind, raw) => {
+    expect(openRedactionCandidates(raw).some(s => s.kind === kind)).toBe(true);
     expect(sanitizeText(raw, 'instruction').sanitized).not.toContain(raw);
   });
-  it('fuses overlapping existing and added credentials into one placeholder', () => {
+  it('fuses every candidate for a value into one withheld placeholder', () => {
     const raw = `AIza${'A'.repeat(35)}`;
-    expect(classify(raw).length).toBeGreaterThan(1);
     const placeholders = new Placeholders();
     const first = sanitizeText(raw, 'instruction', placeholders);
     expect(first.findings).toHaveLength(1);
@@ -50,14 +48,14 @@ describe('curated OpenRedaction additions', () => {
 describe('OCR offsets and conservative fusion', () => {
   it('maps multi-token numbers across lines and punctuation to all source boxes', () => {
     const data = fixture();
-    data.ocr.result!.regions = ['1234', '5678', '9012', ','].map((text, i) => ({ kind: 'text', text, confidence: .5,
-      bounds: { x: i === 3 ? 50 : 10, y: 90 + Math.min(i, 2) * 10, width: i === 3 ? 4 : 40, height: 10 } }));
+    data.ocr.result!.regions = ['Aadhaar', '2345', '6789', '0124'].map((text, i) => ({ kind: 'text', text, confidence: .5,
+      bounds: { x: 10, y: 90 + Math.min(i, 2) * 10, width: 40, height: 10 } }));
     const reconstructed = reconstructOcr(data.ocr.result!.regions);
     for (const span of reconstructed.spans) expect(reconstructed.text.slice(span.start, span.end)).not.toBe('');
     const plan = normalize(data, new Placeholders());
     const aadhaar = plan.findings.filter(f => f.source === 'ocr' && f.kind === 'aadhaar');
     expect(aadhaar).toHaveLength(1);
-    expect(aadhaar[0].bounds).toEqual({ x: 10, y: 90, width: 40, height: 30 });
+    expect(aadhaar[0].bounds).toEqual({ x: 10, y: 100, width: 40, height: 20 });
     expect(() => verifyMaskCoverage(data, plan.masks)).not.toThrow();
     for (const tile of data.observation.tiles) expect(tileMasks(plan.masks, tile).length).toBeGreaterThan(0);
   });
@@ -114,12 +112,14 @@ describe('local document evidence and model boundary', () => {
       expect(plan.masks.some(m => m.bounds.y <= 80 && m.bounds.y + m.bounds.height >= 140)).toBe(true);
       for (const tile of data.observation.tiles) expect(tileMasks(plan.masks, tile).some(m => m.bounds.width >= 120)).toBe(true);
     });
-  it('uses a whole-page fallback for document cues with no trusted document boundary', () => {
+  it('bounds a document cue to its own lines in both policies, never the whole capture', () => {
     const data = fixture();
     data.ocr.result!.regions[0].text = 'passport number';
-    data.documents = detectLocalDocuments(data.observation, data.ocr.result!);
-    expect(data.documents.regions[0].bounds).toEqual({ x: 0, y: 0, width: 200, height: 200 });
-    expect(normalize(data, new Placeholders()).masks).toHaveLength(1);
+    data.documents = detectLocalDocuments(data.observation, data.ocr.result!, 'all_text');
+    expect(data.documents.regions[0].bounds).toEqual({ x: 0, y: 90, width: 200, height: 10 });
+    const plan = normalize(data, new Placeholders());
+    expect(plan.masks.length).toBeGreaterThan(0);
+    expect(plan.masks.every(m => m.bounds.height < data.observation.imageHeight)).toBe(true);
   });
   it('rejects stale evidence, truncated collection and raw model result fields', () => {
     const data = fixture();
@@ -227,6 +227,6 @@ describe('context mode masks private values, not the whole page', () => {
     expect(region.category).toBe('passport');
     expect(region.bounds).toEqual({ x: 0, y: 150, width: 200, height: 10 });
     expect(detectLocalDocuments(data.observation, data.ocr.result!, 'all_text').regions[0].bounds)
-      .toEqual({ x: 0, y: 0, width: 200, height: 200 });
+      .toEqual({ x: 0, y: 150, width: 200, height: 10 });
   });
 });

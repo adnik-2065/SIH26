@@ -1,4 +1,4 @@
-import { canonical, classify, credentialKinds, type Span } from './classify';
+import { canonical, credentialKinds, openRedactionCandidates, type Span } from './openredaction';
 import { LIMITS, privacyError, PrivacyError, type Finding, type PiiKind, type PrivacyStage } from './contracts';
 
 // One allocator per local task/session. Raw values are never used to derive IDs.
@@ -27,6 +27,9 @@ const safeWords = new Set(('a an the my your this that these those i me we our a
   'workshop web development computer vision register registration agree consent synthetic test demo portal layout change add reset toggle ' +
   'seconds second help next previous continue cancel save search find upload file confirm confirmation enabled editable not no yes is are be ' +
   'has have do does done below above page image images only visible all current view open close show hide settings sensitive unlabelled ' +
+  'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
+  'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
+  'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
   'textbox combobox checkbox radio spinbutton slider listbox switch').split(' '));
 const placeholderPattern = /\[(?:PERSON|EMAIL|PHONE|ADDRESS|DATE_OF_BIRTH|AADHAAR|PAN|PASSPORT|PAYMENT_CARD|BANK_ACCOUNT|IFSC|FACE|DOCUMENT|PASSWORD|OTP|TOKEN|API_KEY)_\d+\]/g;
 // What actually makes a string unsafe to carry, as opposed to merely not being
@@ -74,7 +77,7 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
       { textLength: raw.length, errorName: error instanceof Error ? error.name : typeof error }, 'canonical() threw');
   }
   unsafeCharacter(normalized, stage);
-  const matches = classify(normalized), spans: Span[] = [];
+  const matches = openRedactionCandidates(normalized), spans: Span[] = [];
   // The allowlist below is the answer to untrusted page content: with no NER
   // model, a word the rules do not recognise cannot be cleared, so it is
   // withheld. The instruction is different in kind. The user typed it into this
@@ -107,9 +110,15 @@ export function sanitizeText(raw: string, context: 'instruction' | 'element_desc
     const text = normalized.slice(span.start, span.end);
     sanitized += normalized.slice(cursor, span.start) + placeholders.token(span.kind, text);
     findings.push({ id: `finding_${index}`, source: context === 'element_description' ? 'dom' : context === 'ocr' ? 'ocr' : 'instruction',
-      kind: span.kind, confidence: span.confidence ?? 1, detector: span.detector ?? 'existing_text_detector',
+      kind: span.kind, confidence: span.confidence ?? 1, detector: span.detector ?? 'openredaction',
       textRange: { start: span.start, end: span.end }, text, exportPolicy: credentialKinds.has(span.kind) ? 'withhold' : 'replace',
-      redactText: true, redactPixels: context !== 'instruction', ...(span.unclassified ? { unclassified: true } : {}) });
+      redactText: true, // An unclassified span is a word the rules could not clear, never positive
+// evidence of PII. It stays withheld from the export (placeholder text,
+// redactText), but painting its region black blanked ordinary UI - course
+// titles, navigation, footer links - which is the localized over-masking
+// defect proven at runtime. Positively classified spans still redact pixels
+// in both policies.
+redactPixels: context !== 'instruction' && !span.unclassified, ...(span.unclassified ? { unclassified: true } : {}) });
     cursor = span.end;
   }
   sanitized += normalized.slice(cursor);
@@ -122,7 +131,7 @@ export function containsLeak(value: string, knownValues: readonly string[], iden
   // Remove only engine placeholder syntax before candidate classification.
   const unmarked = normalized.replace(placeholderPattern, '');
   const opaqueId = identifier && opaqueIdentifier(unmarked);
-  if (!opaqueId && classify(unmarked).length) return true;
+  if (!opaqueId && openRedactionCandidates(unmarked).length) return true;
   const compact = unmarked.toLocaleLowerCase('en').replace(/\s+/g, '');
   return knownValues.some(raw => {
     const value = canonical(raw).toLocaleLowerCase('en').replace(/\s+/g, '');

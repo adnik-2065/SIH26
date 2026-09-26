@@ -38,11 +38,22 @@ export const AgentResponseSchema = z.object({ thought: z.string().max(2000),
   protocolVersion: z.literal(1).optional(), requestId: id.optional(), taskId: id.optional(), observationId: id.optional(),
 }).strict();
 // The privacy gateway creates this exact allowlist. No server transport exists.
+// RectSchema is defined further down; the element schema below needs it, and
+// const hoisting rules mean the schema must be constructed lazily here.
 export const StepRequestSchema = z.object({ ...envelope,
   sanitizedInstruction: z.string().min(1).max(2000),
-  elements: z.array(z.object({ id, role: z.string().max(50), description: z.string().max(300) }).strict()).max(200),
+  elements: z.array(z.object({ id, role: z.string().max(50), description: z.string().max(300),
+    // The control's box in the delivered screenshot's pixels, so a visible
+    // control whose label the redaction replaced can be matched by position to
+    // this exact existing id in page_info. Coordinates only — never a label,
+    // href or attribute value.
+    bounds: z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict().optional() }).strict()).max(200),
   valueRefs: z.array(z.object({ id, purpose: z.string().max(100), target: id }).strict()).max(100),
-  sanitizedImage: z.object({ mimeType: z.literal('image/png'), base64: z.string().max(4_000_000) }).strict().optional(),
+  sanitizedImage: z.object({ mimeType: z.literal('image/png'), base64: z.string().max(4_000_000),
+    // The delivered image's own pixel size. Element boxes in page_info are
+    // expressed in this space so the model can match what it sees to exact
+    // existing ids. Dimensions only — never another copy of the image.
+    width: z.number().int().positive(), height: z.number().int().positive() }).strict().optional(),
 }).strict();
 export type StepRequest = z.infer<typeof StepRequestSchema>;
 
@@ -97,6 +108,17 @@ export const AbortReasonSchema = z.object({
 export type AbortReason = z.infer<typeof AbortReasonSchema>;
 
 export const RectSchema = z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict();
+// The geometry a reviewed observation recorded for a control, shared by the
+// panel→background and background→content ACT messages. One schema for both
+// legs: the background forwards `expect` verbatim, so the two command schemas
+// must never drift — a missing key here turns a valid click into
+// INVALID_MESSAGE before any target validation runs (the CBE311 failure).
+export const ExpectSchema = z.object({ role: z.string().max(50), bounds: RectSchema,
+  // The viewport the observation was collected under. Chrome's capture
+  // apparatus transiently shrinks the viewport; the executor uses this to
+  // tell that harmless shift from a control that genuinely moved.
+  viewport: z.object({ scrollX: z.number().finite(), scrollY: z.number().finite(),
+    height: z.number().positive().finite() }).strict().optional() }).strict().optional();
 export const PanelCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('STATUS') }).strict(),
   z.object({ type: z.literal('START'), instruction: z.string().trim().min(1).max(2000) }).strict(),
@@ -107,7 +129,7 @@ export const PanelCommandSchema = z.discriminatedUnion('type', [
   // `resolved` carries an approved vault value for a `fill`/`select`, resolved
   // by the panel at dispatch time. It crosses extension messaging only.
   z.object({ type: z.literal('ACT'), observationId: id, action: ActionSchema, resolved: LiteralTextSchema.optional(),
-    expect: z.object({ role: z.string().max(50), bounds: RectSchema }).strict().optional() }).strict(),
+    expect: ExpectSchema }).strict(),
 ]);
 export const ContentCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('PREPARE_CAPTURE'), observationId: id }).strict(),
@@ -120,7 +142,7 @@ export const ContentCommandSchema = z.discriminatedUnion('type', [
   // `resolved` carries an approved vault value for a `fill`/`select`, resolved
   // by the panel at dispatch time. It crosses extension messaging only.
   z.object({ type: z.literal('ACT'), observationId: id, action: ActionSchema, resolved: LiteralTextSchema.optional(),
-    expect: z.object({ role: z.string().max(50), bounds: RectSchema }).strict().optional() }).strict(),
+    expect: ExpectSchema }).strict(),
 ]);
 export const VisualCategorySchema = z.enum(['aadhaar_card', 'pan_card', 'passport', 'identity_card',
   'financial_document', 'private_document', 'signature', 'qr_barcode', 'form_control', 'sensitive_image']);

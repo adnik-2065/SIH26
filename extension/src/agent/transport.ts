@@ -1,6 +1,7 @@
 import { AbortReasonSchema, type StepRequest, type TransportError, type TransportErrorCode, type TransportStage } from '../contracts';
 import { planActions, type PlanSuccess } from './protocol';
 import { toAgentBody, unwrapReply, type ExecutionReport } from './wire';
+import type { ActionHistoryEntry } from './lifecycle';
 import { AGENT_ENDPOINT, endpointAllowed } from '../config';
 import { abortReasonOf, abortWith, logStage, newRunId, transportError,
   type StageEvent, type StageListener } from './diagnostics';
@@ -20,6 +21,9 @@ export interface TransportInput {
   runId?: string;
   fetchImpl?: typeof fetch;
     executionReport?: ExecutionReport;
+  // What the executor actually did in earlier rounds of this task, recorded at
+  // the executor boundary and sent with every planning request.
+  actionHistory?: ActionHistoryEntry[];
   // Every stage, in order, including the failing one. It cannot change the
   // request or the verdict.
   onEvent?: StageListener;
@@ -111,7 +115,7 @@ export async function requestStep(input: TransportInput): Promise<TransportResul
   const call = input.fetchImpl ?? fetch;
   let body: string;
   try {
-    body = JSON.stringify(toAgentBody(request, input.executionReport));
+    body = JSON.stringify(toAgentBody(request, input.executionReport, input.actionHistory));
   } catch (error) {
     return fail('AGENT_UNKNOWN_ERROR', 'The redacted payload could not be serialized.', { error, cause: 'JSON.stringify threw' });
   }

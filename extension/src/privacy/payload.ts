@@ -8,7 +8,8 @@ export function payload(binding: Binding, plan: RedactionPlan, placeholders: Pla
   return { protocolVersion: 1, requestId: `request_${crypto.randomUUID()}`, taskId: binding.taskId, observationId: binding.observationId,
     sanitizedInstruction: sanitizeText(plan.sanitizedInstruction, 'instruction', placeholders).sanitized,
     elements: plan.sanitizedElements.map(element => ({ id: element.id, role: element.role,
-      description: sanitizeText(element.description, 'element_description', placeholders).sanitized })),
+      description: sanitizeText(element.description, 'element_description', placeholders).sanitized,
+      ...(element.bounds ? { bounds: element.bounds } : {}) })),
     valueRefs: plan.valueRefs.map(ref => ({ id: ref.id, target: ref.target,
       purpose: sanitizeText(ref.purpose, 'element_description', placeholders).sanitized })), ...(image ? { sanitizedImage: image } : {}) };
 }

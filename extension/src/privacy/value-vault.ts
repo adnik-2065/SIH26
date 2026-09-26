@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ObservedElement } from '../contracts';
-import { canonical, classify, credentialKinds } from './classify';
+import { canonical, credentialKinds, openRedactionCandidates } from './openredaction';
 import { BindingSchema, IdSchema, LIMITS, PrivacyError, type Binding } from './contracts';
 
 export const LocalValueRecordSchema = z.object({ id: IdSchema, taskId: IdSchema, observationId: IdSchema, origin: z.string().url(),
@@ -45,7 +45,7 @@ export class LocalValueVault {
     if (element.id !== approval.target || element.sensitive || element.disabled || element.label.length >= 200 ||
       !['textbox', 'combobox', 'spinbutton'].includes(element.role) ||
       /password|otp|token|secret|key|recovery|verification/i.test(`${element.type} ${element.label}`) ||
-      !matchesKind || classify(approval.value).some(span => credentialKinds.has(span.kind)) || this.#records.size >= 100) throw new PrivacyError('INVALID_REFERENCE');
+      !matchesKind || openRedactionCandidates(approval.value).some(span => credentialKinds.has(span.kind)) || this.#records.size >= 100) throw new PrivacyError('INVALID_REFERENCE');
     // Only explicit profile approval enters here. Page normalization has no
     // route into this method, and never promotes detected values to references.
     const id = `value_${crypto.randomUUID()}`;

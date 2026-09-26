@@ -4,8 +4,11 @@ import { available, sensitiveControl } from './observe';
 export interface ActInput {
   action: Action;
   refs: Map<string, HTMLElement>;
-  // Geometry the reviewed observation recorded for this control.
-  expect?: { role: string; bounds: Rect };
+  // Geometry the reviewed observation recorded for this control, plus the
+  // viewport it was collected under (scroll and height). The panel already
+  // holds both in the observation snapshot; the scroll offset and the capture
+  // viewport height are what distinguish a harmless shift from a moved control.
+  expect?: { role: string; bounds: Rect; viewport?: { scrollX: number; scrollY: number; height: number } };
   // A vault reference resolved by the panel immediately before dispatch. It
   // travels only through extension messaging and is never stored here.
   resolved?: string;
@@ -26,12 +29,54 @@ function resolve(input: ActInput): HTMLElement | ErrorCode {
   if (!available(element)) return 'TARGET_CHANGED';
   if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true') return 'TARGET_CHANGED';
   const rect = element.getBoundingClientRect();
-  if (input.expect && (Math.abs(rect.x - input.expect.bounds.x) > TOLERANCE || Math.abs(rect.y - input.expect.bounds.y) > TOLERANCE ||
-    Math.abs(rect.width - input.expect.bounds.width) > TOLERANCE || Math.abs(rect.height - input.expect.bounds.height) > TOLERANCE)) return 'TARGET_CHANGED';
+  // The reviewed bounds are viewport coordinates of the observation moment.
+  // Between COLLECT and the action, two harmless things can move every control
+  // without the page the user reviewed having changed:
+  //   1. the page was scrolled — page-anchored controls shift by the scroll delta;
+  //   2. Chrome's capture apparatus (debugger notice, full-document renderer)
+  //      transiently changed the viewport height — bottom-anchored layout
+  //      (chat composers, sticky footers) shifts by the height delta.
+  // Each interpretation is a documented, page-wide transform; a control that
+  // was genuinely replaced, animated or resized matches NEITHER. Fail-closed:
+  // no match within tolerance refuses the action exactly as before.
+  const expect = input.expect;
+  if (expect) {
+    const planned = expect.viewport;
+    const pageAnchoredY = planned ? expect.bounds.y - (scrollY - planned.scrollY) : expect.bounds.y;
+    const pageAnchoredX = planned ? expect.bounds.x - (scrollX - planned.scrollX) : expect.bounds.x;
+    const heightDelta = planned ? innerHeight - planned.height : 0;
+    const viewportAnchoredY = planned ? expect.bounds.y + heightDelta : expect.bounds.y;
+    // Chrome's debugging notice changes the available height while it is up
+    // (measured 840 → 896 across a capture). Top-anchored and page-anchored
+    // layouts are covered above; a CENTERED layout — modal dialogs, google's
+    // search box — moves by HALF the height delta instead, which neither
+    // interpretation explains. The center-anchored reading is that third
+    // page-wide transform: the control kept its position relative to the
+    // viewport's vertical center. It adds no tolerance: with an unchanged
+    // viewport it reduces to the plain bounds comparison, so a genuinely
+    // moved control refuses exactly as before.
+    const centerAnchoredY = planned ? expect.bounds.y + heightDelta / 2 : expect.bounds.y;
+    const within = (actual: number, expected: number) => Math.abs(actual - expected) <= TOLERANCE;
+    const sizeSame = within(rect.width, expect.bounds.width) && within(rect.height, expect.bounds.height);
+    const pageAnchored = within(rect.x, pageAnchoredX) && within(rect.y, pageAnchoredY) && sizeSame;
+    const viewportAnchored = within(rect.x, pageAnchoredX) && within(rect.y, viewportAnchoredY) && sizeSame;
+    const centerAnchored = within(rect.x, pageAnchoredX) && within(rect.y, centerAnchoredY) && sizeSame;
+    if (!pageAnchored && !viewportAnchored && !centerAnchored) return 'TARGET_CHANGED';
+  }
   // Something drawn on top would receive the click instead. A wrapping label
   // or a child of the control itself is the same control for this purpose.
-  const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-  if (!top || (top !== element && !element.contains(top) && !top.contains(element))) return 'TARGET_CHANGED';
+  // A control outside the visual viewport cannot be hit-tested — the browser
+  // returns null for any point beyond the viewport, on the very elements the
+  // capture legitimately photographed below the fold. Rendering checks answer
+  // for them instead: a fixed-position overlay can only ever cover the
+  // viewport, never an off-screen document region.
+  const centerX = rect.left + rect.width / 2, centerY = rect.top + rect.height / 2;
+  if (centerX >= 0 && centerX <= innerWidth && centerY >= 0 && centerY <= innerHeight) {
+    const top = document.elementFromPoint(centerX, centerY);
+    if (!top || (top !== element && !element.contains(top) && !top.contains(element))) return 'TARGET_CHANGED';
+  } else {
+    if (!element.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true })) return 'TARGET_CHANGED';
+  }
   return element;
 }
 

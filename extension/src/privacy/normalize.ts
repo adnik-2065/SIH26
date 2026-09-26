@@ -1,6 +1,6 @@
 import type { Rect } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
-import { canonical, classify } from './classify';
+import { canonical, openRedactionCandidates } from './openredaction';
 import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
 import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
 import { controlIsMasked } from './policy';
@@ -71,7 +71,12 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     if (controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
     const roles = ['textbox', 'combobox', 'button', 'checkbox', 'radio', 'link', 'spinbutton', 'slider', 'listbox', 'switch'];
     return { id: element.id, role: roles.includes(element.role) ? element.role : 'control',
-      description: element.sensitive || element.label.length >= 200 || /password|otp|token|secret/i.test(element.type) ? 'Sensitive field' : result.sanitized || 'Unlabelled control' };
+      description: element.sensitive || element.label.length >= 200 || /password|otp|token|secret/i.test(element.type) ? 'Sensitive field' : result.sanitized || 'Unlabelled control',
+      // The control's position in the delivered image's pixels. page_info
+      // lists it so a visible control whose label the redaction replaced can
+      // be matched by position to this exact existing id. Coordinates only:
+      // no label, href or attribute value travels with it.
+      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } };
   });
   const words = data.ocr.result!.regions;
   for (const region of words) {
@@ -82,7 +87,12 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
         { kind: region.kind, hasText: !!region.text, hasConfidence: region.confidence !== undefined },
         'incomplete text region');
     }
-    if (textPolicy === 'all_text' || region.confidence < 0.35) masks.push(paddedMask(region.bounds, 'document', width, height));
+    // A word box without a single letter or digit carries nothing any PII rule
+    // could classify: 'â€”' and '||' over thumbnails and borders are OCR noise,
+    // and context mode keeps them visible. Strict mode still covers every
+    // word, and every real word keeps the low-confidence conservative mask.
+    const garbage = !/\p{L}|\p{N}/u.test(region.text);
+    if (textPolicy === 'all_text' || (region.confidence < 0.35 && !garbage)) masks.push(paddedMask(region.bounds, 'document', width, height));
   }
   const reconstructed = reconstructOcr(words);
   const result = sanitizeText(reconstructed.text, 'ocr', placeholders, textPolicy);
@@ -94,19 +104,34 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
   });
   // Also classify compact OCR: emails/IDs may split at arbitrary characters,
   // line wraps or capture seams. Keep an offset map back to every source box.
-  if (textPolicy === 'all_text') for (const block of reconstructed.text.matchAll(/[^\n]+(?:\n(?!\n)[^\n]+)*/g)) {
+  // Compact detection runs in both policies: whitespace-collapsed text is
+  // where split emails and identifiers rejoin, and its offset map keeps every
+  // mask on the source OCR boxes.
+  for (const block of reconstructed.text.matchAll(/[^\n]+(?:\n(?!\n)[^\n]+)*/g)) {
     const compact = block[0].replace(/\s/g, '');
     const offsets: number[] = [];
     for (let i = 0; i < block[0].length; i++) if (!/\s/.test(block[0][i])) offsets.push(block.index! + i);
     // Compact only format-based candidates. Ordinary prose becomes a long
     // opaque-looking token when spaces are removed; that is not token evidence.
-    const spans = classify(compact).filter(span => ['email', 'phone', 'pan', 'aadhaar', 'payment_card', 'ifsc', 'passport'].includes(span.kind));
+    const spans = openRedactionCandidates(compact).filter(span => ['email', 'phone', 'pan', 'aadhaar', 'payment_card', 'ifsc', 'passport', 'bank_account'].includes(span.kind));
     spans.forEach(span => {
       const start = offsets[span.start], end = offsets[span.end - 1] + 1;
+      // The same value, with its real spaces restored, was already offered to
+      // detection above. If that pass classified it, its findings carry the
+      // value's own boxes; a compact re-detection here would only widen them
+      // to the whole block, so keep the tighter evidence.
+      // The same block with its real spaces restored was already offered to
+      // detection above. If that pass found a value of this kind inside the
+      // compact candidate, the compact form is prose glued onto an already
+      // detected value, and keeping it would widen the mask from the value's
+      // own boxes to the whole block. Only genuinely split values survive.
+      const value = compact.slice(span.start, span.end);
+      if (openRedactionCandidates(block[0]).some(other => other.kind === span.kind &&
+        value.includes(block[0].slice(other.start, other.end).replace(/\s/g, '')))) return;
       const boxes = reconstructed.spans.filter(box => box.start < end && box.end > start).map(box => box.bounds);
       if (!boxes.length) throw new PrivacyError('INVALID_BOUNDS');
       append({ id: 'pending', source: 'ocr', kind: span.kind, confidence: 1, text: compact.slice(span.start, span.end),
-        textRange: { start, end }, detector: span.detector ?? 'existing_text_detector',
+        textRange: { start, end }, detector: span.detector ?? 'openredaction',
         exportPolicy: 'replace', redactText: true, redactPixels: true, bounds: boxes.reduce(union) });
     });
   }

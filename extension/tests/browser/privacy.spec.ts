@@ -130,18 +130,25 @@ test('document model boxes retain both tile overlaps and mask a multi-tile docum
     const h = window.PrivacyHarness, data = h.visualFixture(1, true);
     let calls = 0;
     data.documents = await h.inspectDocumentTiles(data.observation, { inspect: async ({ observationId, image }) => {
-      calls++;
-      const box = { x: 0, y: 0, width: image.width, height: image.height }; image.close();
+      const tileCall = ++calls;
+      // Bounded boxes from each tile that overlap across the seam at row 250:
+      // tile one saw rows 220-270, tile two rows 240-290.
+      const box = { x: 60, y: tileCall === 1 ? 220 : 115, width: 50, height: 50 }; image.close();
       return { observationId, truncated: false, detections: [{ type: 'financial_document', source: 'vision_model', confidence: .01, bbox: box }] };
     } }, new AbortController().signal);
     const plan = h.normalize(data, new h.Placeholders());
     const result = await h.buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal });
-    return { ok: result.ok, calls, tiles: data.observation.tileCount, masks: plan.masks };
+    // Coverage invariant: no mask may swallow the page. The union of the two
+    // seam boxes (60,220,50x70) must survive as one padded document mask.
+    const pageArea = data.observation.imageWidth * data.observation.imageHeight;
+    return { ok: result.ok, calls, tiles: data.observation.tileCount, masks: plan.masks, pageArea };
   });
   expect(result.ok).toBe(true);
   expect(result.calls).toBe(result.tiles);
-  expect(result.masks).toHaveLength(1);
-  expect(result.masks[0].bounds).toEqual({ x: 0, y: 0, width: 200, height: 40000 });
+  const docMask = result.masks.find(m => m.bounds.x <= 52 && m.bounds.y <= 212 &&
+    m.bounds.x + m.bounds.width >= 118 && m.bounds.y + m.bounds.height >= 298);
+  expect(docMask).toBeDefined();
+  expect(result.masks.every(m => m.bounds.width * m.bounds.height < result.pageArea * .5)).toBe(true);
 });
 
 test('document adapter rejects failure, stale output, malformed bounds and cancellation', async ({ page }) => {
@@ -285,4 +292,54 @@ test('context mode preserves safe page pixels while masking PII; strict mode mas
   expect(result.context.contextPixel).toEqual([208, 232, 255, 255]);
   expect(result.context.piiPixel).toEqual([0, 0, 0, 255]);
   expect(result.strict.contextPixel).toEqual([0, 0, 0, 255]);
+});
+
+// Issue 2 regression: a visible control whose label the redaction replaced
+// must still be locatable by position — its box travels in the delivered
+// screenshot's pixels beside an opaque id, so visual evidence can establish
+// correspondence to an EXISTING id. Coordinates alone can never mint one.
+test('a redacted-label control carries its position in the attached screenshot', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const h = window.PrivacyHarness, data = h.visualFixture(1);
+    // The label is personal data, so the export replaces it wholesale…
+    data.observation.dom.elements[0].label = 'Email mira@example.test';
+    data.observation.dom.elements.push({ id: `${data.binding.observationId}_e2`, role: 'link', type: 'a', label: 'CBE311 Database Security',
+      sensitive: false, disabled: false, bounds: { x: 10, y: 40, width: 120, height: 20 } });
+    data.instruction = 'Open the Database Security course.';
+    const exportResult = await h.buildSafeStepRequest({ data, signal: new AbortController().signal, current: () => data.binding });
+    if (!exportResult.ok) return { ok: false as const, reasons: exportResult.blockedReasons };
+    // …and the wire text carries the id, role and position, with no course name.
+    const body = h.toAgentBody(exportResult.request);
+    const courseRow = body.page_info.split('\n').find(line => line.includes('_e2')) ?? '';
+    return { ok: true as const, request: exportResult.request, page_info: body.page_info, courseRow };
+  });
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  const element = result.request.elements.find(entry => entry.id.endsWith('_e2'))!;
+  expect(element.description).not.toContain('CBE311');
+  expect(element.bounds).toEqual({ x: 10, y: 40, width: 120, height: 20 });
+  expect(result.page_info).toContain(`id=${element.id} role=link`);
+  expect(result.page_info).toContain('box=[8,38,124,24] in a 200x200 screenshot');
+  expect(result.page_info).not.toContain('CBE311');
+  // The box is exactly the element's own bounds in image pixels; ids in the
+  // text stay in the exported set.
+  for (const id of result.page_info.match(/id=\S+/g) ?? []) expect(result.request.elements.some(entry => id === `id=${entry.id}`)).toBe(true);
+});
+
+// The server is described the delivered image's dimensions so the boxes are
+// interpretable; the payload schema requires them whenever an image rides along.
+test('the redacted image travels with its pixel size', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const h = window.PrivacyHarness, data = h.visualFixture(1);
+    const exportResult = await h.buildSafeStepRequest({ data, signal: new AbortController().signal, current: () => data.binding });
+    if (!exportResult.ok) return { ok: false as const, reasons: exportResult.blockedReasons };
+    const image = exportResult.request.sanitizedImage!;
+    return { ok: true as const, image: { mimeType: image.mimeType, width: image.width, height: image.height, base64: image.base64.length } };
+  });
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(result.image.mimeType).toBe('image/png');
+  expect(result.image.width).toBeGreaterThan(0);
+  expect(result.image.height).toBeGreaterThan(0);
+  expect(result.image.base64).toBeGreaterThan(0);
 });

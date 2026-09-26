@@ -116,7 +116,7 @@ describe('sending the redacted payload', () => {
     const [url, init] = fetchImpl.mock.calls[0];
     expect(url).toBe('https://agent.example.test/step');
     const body = JSON.parse(init.body);
-    expect(Object.keys(body).sort()).toEqual(['instruction', 'page_info', 'problem_context', 'ss']);
+    expect(Object.keys(body).sort()).toEqual(['action_history', 'instruction', 'page_info', 'problem_context', 'ss']);
     expect(body.instruction).toBe(request.sanitizedInstruction);
     expect(body.ss).toBeNull();
     expect(init.credentials).toBe('omit');
@@ -162,8 +162,10 @@ describe('sending the redacted payload', () => {
 
 describe('the body sent to the reasoning server', () => {
   it('is assembled only from fields the privacy gateway already cleared', () => {
-    const body = toAgentBody({ ...request, sanitizedImage: { mimeType: 'image/png', base64: 'AAAA' } });
-    expect(Object.keys(body).sort()).toEqual(['instruction', 'page_info', 'problem_context', 'ss']);
+    const body = toAgentBody({ ...request, sanitizedImage: { mimeType: 'image/png', base64: 'AAAA', width: 480, height: 720 } });
+    expect(Object.keys(body).sort()).toEqual(['action_history', 'instruction', 'page_info', 'problem_context', 'ss']);
+    // A fresh run has performed nothing yet: the field is present but empty.
+    expect(body.action_history).toEqual([]);
     expect(body.instruction).toBe('Register for the workshop');
     expect(body.ss).toBe('AAAA');
     // Every addressable name in the description is an opaque observation id.
@@ -171,18 +173,39 @@ describe('the body sent to the reasoning server', () => {
     expect(body.page_info).toContain('value_1 fills obs_1_e1');
     expect(body.problem_context).toContain('Never invent an id');
   });
-  it('includes a safe execution report without allowing another action', () => {
+  it('includes a safe execution report and asks for the next step', () => {
     const body = toAgentBody({ ...request }, {
       observationId: 'obs_previous', actionType: 'click', target: 'obs_previous_e1', status: 'executed',
     });
     expect(body.problem_context).toContain('Execution report from the previous observation');
     expect(body.problem_context).toContain('"actionType":"click"');
     expect(body.problem_context).toContain('"target":"obs_previous_e1"');
-    expect(body.problem_context).toContain('do not execute another action');
+    // The report tells the server the action landed and the page was observed
+    // again: planning continues from the new page_info. It must not instruct
+    // the server to stop (the old halt that ended every run after one action).
+    expect(body.problem_context).toContain('Plan the next step from the current page_info');
+    expect(body.problem_context).not.toContain('do not execute another action');
     expect(body.problem_context).not.toContain('student@example.com');
   });
   it('describes an empty view without pretending controls exist', () => {
     expect(describePage({ ...request, elements: [], valueRefs: [] })).toContain('no interactive element');
+  });
+  it('places each element in the attached screenshot, without inventing anything', () => {
+    const withBoxes = { ...request, elements: request.elements.map((element, index) => ({ ...element,
+      bounds: { x: 8 + index * 10, y: 8 + index * 10, width: 100, height: 24 } })),
+      sanitizedImage: { mimeType: 'image/png' as const, base64: 'AAAA', width: 480, height: 720 } };
+    const body = toAgentBody(withBoxes);
+    // The redacted-label control is locatable by position in image pixels…
+    expect(body.page_info).toContain('id=obs_1_e1 role=textbox label="Full name" box=[6,6,104,28] in a 480x720 screenshot');
+    expect(body.page_info).toContain('A redacted screenshot of this same view is attached (480x720 px)');
+    // …and every addressable id is still one the payload exported.
+    for (const id of body.page_info.match(/id=\S+/g) ?? []) expect(withBoxes.elements.some(element => id === `id=${element.id}`)).toBe(true);
+    expect(body.page_info).not.toContain('xpath');
+  });
+  it('adds no box when no screenshot is attached', () => {
+    const body = toAgentBody({ ...request });
+    expect(body.page_info).not.toContain('box=');
+    expect(body.page_info).toContain('No screenshot is attached.');
   });
   it('accepts the wrapped reply the server sends and a flat one', () => {
     const answer = { thought: 'ok', output: [] };

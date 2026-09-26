@@ -86,3 +86,58 @@ export class PageChangedError extends Error {
 }
 
 export const emptyMutationSummary = (): MutationSummary => ({ total: 0, ignored: 0, significant: 0, categories: {} });
+
+// How a capture ending should be treated by the retry lifecycle. Deliberately
+// tiny and total: the background's catch block and the panel's run loop must
+// agree on one meaning for each ending, or a run stops while the retry policy
+// still has attempts left.
+export type CaptureEnding = 'PAGE_CHANGED' | 'CANCELLED' | 'OTHER';
+
+// Browser-state evidence taken at the moment the capture failed. It exists so
+// that AMBIGUOUS failures — messages a restricted page produces while idle and
+// a navigating page produces mid-swap — can be told apart without weakening
+// anything: with no navigation in flight they stay genuine capture failures.
+export interface CaptureEndEvidence {
+  // chrome.tabs reports the tab as still 'loading' — a navigation/document
+  // replacement was actively in progress when the capture threw.
+  navigationInFlight?: boolean;
+}
+
+// Classify how a capture ended, from the error the background worker caught.
+// Everything an ordinary page transition produces belongs to PAGE_CHANGED:
+// the explicit stability errors, the abort signal (a Stop or the invalidation
+// of an already-superseded capture — the retry policy decides), and the
+// browser's own mid-navigation rejections, which are not capture bugs:
+// "Receiving end does not exist" / "message port closed" from chrome.tabs and
+// chrome.scripting while the old document is torn down for the new page, and
+// "No frame with given id" / "Cannot find context with specified id" /
+// "Frame was detached" from CDP and scripting. Anything else — limits,
+// timeouts, a refused debugger attach — is a genuine capture failure (OTHER).
+// One group is evidence-gated: "Cannot access contents of url" and its
+// siblings name an inaccessible frame — idle that means a genuinely restricted
+// page (a real failure), but while a navigation is in flight it means the
+// document was replaced under the capture, which is the retryable race.
+export function captureEndingClass(error: unknown, evidence?: CaptureEndEvidence): CaptureEnding {
+  if (error instanceof PageChangedError) return 'PAGE_CHANGED';
+  if (error instanceof Error && error.name === 'CaptureError') {
+    const detail = (error as { detail?: { code?: string; cause?: string; context?: Record<string, unknown> } }).detail;
+    if (detail?.code === 'CAPTURE_PAGE_CHANGED' || detail?.code === 'CAPTURE_ACTIVE_TAB_CHANGED') return 'PAGE_CHANGED';
+    // A debugger command that the navigation itself rejected carries the
+    // browser's own wording in the wrapped context ("No frame with given id",
+    // "Cannot find context with specified id"). A real screenshot bug does not
+    // produce those messages.
+    const wrapped = `${detail?.cause ?? ''} ${String(detail?.context?.errorMessage ?? '')}`;
+    if (/No frame with given id|Cannot find context with specified id/i.test(wrapped)) return 'PAGE_CHANGED';
+    if (evidence?.navigationInFlight &&
+      /Cannot access contents of url|Frame no longer exists|Frame with given id was detached|Inspected target navigated|The tab was closed/i.test(wrapped))
+      return 'PAGE_CHANGED';
+  }
+  const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  if (/STOPPED$/.test(text)) return 'CANCELLED';
+  if (/Receiving end does not exist|message port closed|No frame with given id|Cannot find context with specified id|Frame was detached/i.test(text))
+    return 'PAGE_CHANGED';
+  if (evidence?.navigationInFlight &&
+    /Cannot access contents of url|Frame no longer exists|Frame with given id was detached|Inspected target navigated|The tab was closed/i.test(text))
+    return 'PAGE_CHANGED';
+  return 'OTHER';
+}

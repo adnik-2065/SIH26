@@ -1,5 +1,5 @@
 import { AgentResponseSchema, ActionSchema, type Action, type StepRequest, type TransportError } from '../contracts';
-import { canonical, classify, credentialKinds } from '../privacy/classify';
+import { canonical, credentialKinds, openRedactionCandidates } from '../privacy/openredaction';
 import { transportError } from './diagnostics';
 
 // Why a step was refused. These are shown to the user, never sent anywhere.
@@ -95,7 +95,7 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
 export function literalTextAllowed(value: string) {
   const text = canonical(value);
   if (!text || text.length > 200) return false;
-  return !classify(text).some(span => credentialKinds.has(span.kind) ||
+  return !openRedactionCandidates(text).some(span => credentialKinds.has(span.kind) ||
     ['aadhaar', 'pan', 'passport', 'payment_card', 'bank_account', 'ifsc'].includes(span.kind));
 }
 

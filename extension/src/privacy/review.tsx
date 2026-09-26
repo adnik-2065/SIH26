@@ -5,6 +5,7 @@ import { detectLocalDocuments, mergeDocumentEvidence, type DocumentEvidence } fr
 import { buildSafeStepRequest } from './gateway';
 import { LIMITS, PrivacyError, type Binding, type ExportResult } from './contracts';
 import { AgentSteps, TransportFailureNotice } from '../agent/steps';
+import type { ActionHistoryEntry, LoopTracker } from '../agent/lifecycle';
 import type { ExecutionReport } from '../agent/wire';
 
 interface Props {
@@ -15,10 +16,13 @@ interface Props {
   // A task running by itself redacts as soon as both detectors finish. The
   // work performed is identical to the button below; only the click is implied.
   auto?: boolean; runId?: string; executionReport?: ExecutionReport; onExecuted?: (report: ExecutionReport) => void;
+  onActionOutcome?: (entry: ActionHistoryEntry) => void; actionHistory?: ActionHistoryEntry[];
+  loopTracker?: LoopTracker;
+  onLoopDetected?: (notice: string) => void;
   onStage?: (stage: 'REDACTING' | 'SENDING' | 'WAITING_RESPONSE' | 'EXECUTING') => void; onContinue?: () => void; onHalt?: (notice: string, error?: ExtensionError) => void;
   onLog?: (kind: 'info' | 'server' | 'action' | 'error', text: string, detail?: unknown) => void;
 }
-export function PrivacyReview({ observation, instruction, ocr, faces, modelDocuments, complete, currentState, signal, verificationOcr, auto, runId, executionReport, onExecuted, onStage, onContinue, onHalt, onLog }: Props) {
+export function PrivacyReview({ observation, instruction, ocr, faces, modelDocuments, complete, currentState, signal, verificationOcr, auto, runId, executionReport, onExecuted, onActionOutcome, actionHistory, loopTracker, onLoopDetected, onStage, onContinue, onHalt, onLog }: Props) {
   const [result, setResult] = useState<ExportResult>();
   const [busy, setBusy] = useState(false);
   const [rescan, setRescan] = useState(false);
@@ -134,7 +138,11 @@ export function PrivacyReview({ observation, instruction, ocr, faces, modelDocum
         <details className="payload"><summary>Exact local payload</summary><pre>{JSON.stringify(result.request, null, 2)}</pre></details>
         <AgentSteps request={result.request} observationId={observation.dom.observationId} signal={signal} runId={runId} onStage={onStage}
           auto={auto} executionReport={executionReport} onExecuted={onExecuted} onContinue={onContinue} onHalt={onHalt} onLog={onLog}
-          bounds={new Map(observation.dom.elements.map(element => [element.id, { role: element.role, bounds: element.bounds }]))} />
+          onActionOutcome={onActionOutcome} actionHistory={actionHistory} loopTracker={loopTracker} onLoopDetected={onLoopDetected}
+          pageState={{ documentId: observation.dom.documentId, elements: observation.dom.elements }}
+          bounds={new Map(observation.dom.elements.map(element => [element.id, { role: element.role, bounds: element.bounds,
+            viewport: { scrollX: observation.dom.viewport.scrollX, scrollY: observation.dom.viewport.scrollY,
+              height: observation.dom.viewport.height } }]))} />
       </>)}
   </section>;
 }

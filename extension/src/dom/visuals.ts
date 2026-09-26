@@ -7,7 +7,11 @@ export function documentCategory(label: string): z.infer<typeof VisualCategorySc
   if (/\bpan\b|permanent account|income tax/i.test(label)) return 'pan_card';
   if (/passport/i.test(label)) return 'passport';
   if (/identity|identification|\bid card\b|driving licen[cs]e/i.test(label)) return 'identity_card';
-  if (/bank|financial|statement|cheque|checkbook|invoice/i.test(label)) return 'financial_document';
+  // A bare word like "financial" or "bank" matches ordinary page wording
+  // (course titles, nav links) and blanked legitimate UI at runtime. The
+  // label evidence must name a document artefact, mirroring the OCR cue
+  // rules that already refuse common-word triggers.
+  if (/financial\s+(?:document|record|statement)|bank\s+statement|\b(?:invoice|cheque|checkbook)\b/i.test(label)) return 'financial_document';
   if (/signature|signed by/i.test(label)) return 'signature';
   if (/\bqr\b|barcode|bar code/i.test(label)) return 'qr_barcode';
   if (/confidential|private document|medical record/i.test(label)) return 'private_document';

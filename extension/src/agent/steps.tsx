@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { Action, ExtensionError, Rect, StepRequest } from '../contracts';
+import type { Action, ExtensionError, ObservedElement, Rect, StepRequest } from '../contracts';
 import { executableNow, type PlannedStep } from './protocol';
+import { actionSignature, historyOutcome, LOOP_THRESHOLD, newLoopTracker, observeLoopCycle, pageSignature, type ActionHistoryEntry, type LoopTracker } from './lifecycle';
 import { DEFAULT_ENDPOINT, endpointAllowed, requestStep, type TransportResult } from './transport';
 import type { ExecutionReport } from './wire';
 import { abortReasonOf, abortWith, explain, newRunId, summarize, titleFor, type StageEvent } from './diagnostics';
@@ -9,7 +10,7 @@ interface Props {
   request: StepRequest;
   // Element geometry stays local; it is passed to the executor as the shape
   // the reviewed observation recorded, never sent to the server.
-  bounds: Map<string, { role: string; bounds: Rect }>;
+  bounds: Map<string, { role: string; bounds: Rect; viewport?: { scrollX: number; scrollY: number; height: number } }>;
   observationId: string;
   signal?: AbortSignal;
   // The id of the run this payload belongs to, minted when the user submitted
@@ -25,6 +26,20 @@ interface Props {
   onHalt?: (notice: string, error?: ExtensionError) => void;
   onLog?: (kind: 'info' | 'server' | 'action' | 'error', text: string, detail?: unknown) => void;
   onExecuted?: (report: ExecutionReport) => void;
+  // Action history for the lifetime of one task: recorded from the executor's
+  // actual result in `perform`, reset by the panel when a new task starts, and
+  // sent with every planning request. Owned by the panel so it survives the
+  // per-round remounts of the redaction pipeline.
+  onActionOutcome?: (entry: ActionHistoryEntry) => void;
+  actionHistory?: ActionHistoryEntry[];
+  loopTracker?: LoopTracker;
+  // Fired when the same equivalent state+action pattern has repeated the
+  // configured threshold without meaningful progress; the panel stops the run.
+  onLoopDetected?: (notice: string) => void;
+  // The stable page identity of the observation this payload was built from.
+  // Element ids and the observation id are minted per capture, so loop state
+  // signatures are formed from document identity and geometry only.
+  pageState?: { documentId: string; elements: ObservedElement[] };
 }
 const describe = (action: Action) =>
   action.type === 'scroll' ? `Scroll ${action.direction} ${action.pixels}px`
@@ -67,7 +82,7 @@ export function TransportFailureNotice({ error }: { error: ExtensionError }) {
   </div>;
 }
 
-export function AgentSteps({ request, bounds, observationId, signal, runId, executionReport, onStage, auto, onContinue, onHalt, onLog, onExecuted }: Props) {
+export function AgentSteps({ request, bounds, observationId, signal, runId, executionReport, onStage, auto, onContinue, onHalt, onLog, onExecuted, onActionOutcome, actionHistory, loopTracker, onLoopDetected, pageState }: Props) {
   const [endpoint, setEndpoint] = useState(DEFAULT_ENDPOINT);
   const [plan, setPlan] = useState<TransportResult>();
   const [busy, setBusy] = useState(false);
@@ -76,6 +91,12 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
   // A new payload means a new page state: nothing planned earlier may be run.
   const cycled = useRef(false);
   useEffect(() => { setPlan(undefined); setOutcome(undefined); cycled.current = false; }, [request]);
+  // Loop detection counts equivalent state+action cycles across rounds, so the
+  // tracker lives longer than one payload. The panel owns it — this component
+  // unmounts for every re-observation — and a fresh tracker arrives with each
+  // new task's history.
+  const loopTrackerRef = useRef(newLoopTracker());
+  useEffect(() => { if (loopTracker) loopTrackerRef.current = loopTracker; }, [loopTracker]);
 
   async function ask() {
     // This controller exists only to forward the panel's cancellation to one
@@ -91,7 +112,7 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
     if (signal?.aborted) forward(); else signal?.addEventListener('abort', forward, { once: true });
     // Structure only: counts and sizes, never the payload itself.
     onLog?.('info', `[${run}] Sending to ${endpoint}: ${request.elements.length} elements, ${request.valueRefs.length} stored values, image ${request.sanitizedImage ? 'attached' : 'withheld'}.`);
-    const result = await requestStep({ endpoint, request, signal: controller.signal, runId: run, executionReport: executionReport,
+    const result = await requestStep({ endpoint, request, signal: controller.signal, runId: run, executionReport: executionReport, actionHistory,
       onEvent: (event: StageEvent) => {
         if (event.error) return;
         if (event.stage === 'fetch_started') onStage?.('WAITING_RESPONSE');
@@ -116,6 +137,15 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
       expect: target ? bounds.get(target) : undefined }).catch(() => undefined);
     const ok = response?.ok === true;
     onLog?.(ok ? 'action' : 'error', `${ok ? 'Performed' : 'Refused'}: ${describe(step.action)}${ok ? '' : ` — ${String(response?.error ?? 'PAGE_CHANGED')}`}`);
+    // The real executor reply — not the plan — is what history records. Only
+    // success means the action took effect; refused/failed/cancelled entries
+    // tell the next request the page does not reflect what was planned.
+    const outcome = historyOutcome(ok, ok ? undefined : String(response?.error ?? 'PAGE_CHANGED'));
+    onActionOutcome?.({ action: step.action.type === 'done' ? 'finish' : step.action.type,
+      ...(target !== undefined ? { id: target } : {}),
+      value: 'text' in step.action ? step.action.text : 'optionText' in step.action ? step.action.optionText
+        : 'valueRef' in step.action ? step.action.valueRef : 'optionRef' in step.action ? step.action.optionRef : null,
+      result: outcome.result, ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}) });
     if (ok && step.action.type !== 'done') onExecuted?.({
       observationId,
       actionType: step.action.type,
@@ -140,16 +170,31 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
     setBusy(true); setOutcome('Asking the server…');
     const result = await ask();
     if (!result.ok) { setBusy(false); setOutcome(undefined); onHalt?.(`${titleFor(result.error.code)}: ${explain(result.error.code)}`, result.error); return; }
-    if (executionReport) {
-      setBusy(false); setOutcome(undefined);
-      onLog?.('info', 'Execution report sent to the server. The run stopped before another action.');
-      onHalt?.('The action was reported as executed. The run stopped safely.');
-      return;
-    }
+    // An execution report rides along with this request: the previous action
+    // succeeded and the page has been observed again. That is the normal
+    // navigation lifecycle, not a stopping point, so planning continues here.
     const { runnable } = executableNow(result.steps);
     if (!runnable.length) { setBusy(false); setOutcome(undefined); onHalt?.('The reply contained no step this page can perform.'); return; }
     for (const step of runnable) {
       setOutcome(`Performing: ${describe(step.action)}`);
+      // Loop detection weighs the observable state of the page this payload
+      // describes plus the effective action. Both signatures avoid the
+      // per-capture element ids; any meaningful state change or different
+      // action resets the count. A `done` step ends the run normally, so it is
+      // never counted as a cycle.
+      if (pageState && step.action.type !== 'done') {
+        const target = 'target' in step.action ? step.action.target : undefined;
+        const cycle = observeLoopCycle(loopTrackerRef.current, {
+          state: pageSignature(pageState),
+          action: actionSignature(step.action, target ? bounds.get(target) : undefined),
+        });
+        if (cycle.loop) {
+          onLog?.('error', `The same state and action have repeated ${cycle.repeats} times without progress (LOOP_DETECTED).`);
+          setBusy(false); setOutcome(undefined);
+          onLoopDetected?.(`The task kept repeating the same step on an unchanged page, so it was stopped after ${cycle.repeats} equivalent cycles (LOOP_DETECTED).`);
+          return;
+      }
+      }
       const performed = await perform(step);
       // PAGE_CHANGED is not a failure. It means the page moved on while the
       // server was thinking, so the reviewed observation no longer describes
@@ -160,7 +205,16 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
         onLog?.('info', 'The page changed while the server was thinking, so it is being scanned again.');
         onContinue?.(); return;
       }
-      if (!performed.ok) { setBusy(false); setOutcome(undefined); onHalt?.(`A step was refused: ${performed.error}.`); return; }
+      if (!performed.ok) {
+        setBusy(false); setOutcome(undefined);
+        // The refusal is already in the action history; the next planning
+        // request carries it so the model can reassess from the fresh page
+        // instead of the run ending on a step the browser declined. The round
+        // limit and loop detection bound the repetition — an identical retry
+        // eight times on an unchanged page stops the run as LOOP_DETECTED.
+        onLog?.('info', `The step was not performed (${performed.error}); observing again so the next request reflects that.`);
+        onContinue?.(); return;
+      }
       if (step.action.type === 'done') { setBusy(false); setOutcome(undefined); onHalt?.('The server reported the task is finished.'); return; }
     }
     setBusy(false); setOutcome(undefined);

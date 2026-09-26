@@ -16,23 +16,38 @@ await build({ configFile: false, build: {
   outDir: 'dist', emptyOutDir: false,
   lib: { entry: 'src/dom/content.ts', formats: ['iife'], name: 'SIH26Observer', fileName: () => 'content.js' },
 } });
-// One configuration source, checked against what is actually packaged. A moved
-// tunnel updated in `src/config.ts` alone would otherwise ship an extension
-// whose fetch is refused by host_permissions or by connect-src.
+// Single source of truth for the backend endpoint: `src/backend.json`.
+// The shipped manifest is GENERATED from that one value here, so
+// `host_permissions` and `connect-src` can never drift from the runtime
+// transport in `src/config.ts` (which reads the same file). Changing the
+// backend URL is a one-file edit plus a rebuild.
 {
-  const base = (process.env.VITE_AGENT_BASE_URL || 'https://hdtv-conditions-fathers-extensions.trycloudflare.com').replace(/\/+$/, '');
+  const backendDefaults = JSON.parse(await readFile('src/backend.json', 'utf8'));
+  const base = (process.env.VITE_AGENT_BASE_URL || backendDefaults.baseUrl).replace(/\/+$/, '');
+  const route = backendDefaults.route || '/agent';
+  const backendEndpoint = `${base}${route}`;
   const origin = new URL(base).origin;
-  const manifest = JSON.parse(await readFile('manifest.json', 'utf8'));
-  const hosts = manifest.host_permissions ?? [];
-  const csp = manifest.content_security_policy?.extension_pages ?? '';
-  const problems = [];
-  if (!hosts.some(pattern => pattern === origin || pattern.startsWith(`${origin}/`))) problems.push(`host_permissions is missing ${origin}`);
-  if (!csp.includes(origin)) problems.push(`connect-src is missing ${origin}`);
-  if (problems.length) {
-    console.error(`\nBACKEND_ENDPOINT_NOT_ALLOWED: manifest.json does not permit the configured agent endpoint.\n  ${problems.join('\n  ')}\n` +
-      `  Update manifest.json (or VITE_AGENT_BASE_URL) so both match src/config.ts.\n`);
+  const allowed = new URL(base).protocol === 'https:' ||
+    (new URL(base).protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(base).hostname));
+  if (!allowed) {
+    console.error(`\nBACKEND_ENDPOINT_INVALID: ${base} is not an https URL (or http on localhost).\n`);
     process.exit(1);
   }
+  const manifest = JSON.parse(await readFile('manifest.json', 'utf8'));
+  // Host permissions are regenerated as exactly the one backend origin;
+  // extra origins belong in src/backend.json-driven code, not hand-edits.
+  manifest.host_permissions = [`${origin}/*`];
+  // connect-src is regenerated as exactly `self` + the one backend origin;
+  // any stale origin from a previous endpoint is dropped automatically.
+  const cspParts = (manifest.content_security_policy?.extension_pages ?? '')
+    .split(';').map((part) => part.trim()).filter(Boolean);
+  const connectIdx = cspParts.findIndex((part) => part.startsWith('connect-src'));
+  const connectSrc = `connect-src 'self' ${origin}`;
+  if (connectIdx < 0) cspParts.push(connectSrc);
+  else cspParts[connectIdx] = connectSrc;
+  manifest.content_security_policy = { ...manifest.content_security_policy, extension_pages: cspParts.join('; ') };
+  await writeFile('manifest.json', JSON.stringify(manifest, null, 2) + '\n');
+  console.log(`manifest.json generated for agent endpoint: ${backendEndpoint}`);
 }
 await cp('manifest.json', 'dist/manifest.json');
 await mkdir('dist/licenses', { recursive: true });

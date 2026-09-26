@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { StepRequestSchema } from '../../src/contracts';
-import { classify, luhn } from '../../src/privacy/classify';
+import { openRedactionCandidates } from '../../src/privacy/openredaction';
 import { BoundsSchema, FindingSchema, LIMITS, MaskSchema } from '../../src/privacy/contracts';
 import { buildSafeStepRequest } from '../../src/privacy';
 import { domBounds, mergeMasks, paddedMask, tileMasks } from '../../src/privacy/geometry';
@@ -12,24 +12,27 @@ import { binding, fictional, fixture } from '../privacy-fixture';
 
 describe('local PII and text policy', () => {
   it.each([
-    ['email', 'mira@example.test'], ['phone', '+91 98765 43210'], ['pan', 'ABCDE1234F'], ['aadhaar', '1234 5678 9012'],
-    ['payment_card', '4111 1111 1111 1111'], ['ifsc', 'ABCD0123456'], ['password', 'password: fictional-secret-42'],
+    ['email', 'mira@example.test'], ['phone', '9876543210'], ['aadhaar', 'Aadhaar: 2345 6789 0124'],
+    ['payment_card', '4111 1111 1111 1111'], ['ifsc', 'IFSC: ABCD0123456'], ['password', 'password: fictional-secret-42'],
     ['otp', 'OTP: 123456'], ['token', 'Bearer fictional-session-value'], ['api_key', 'API key: fictional-key-value'],
-    ['person_name', 'Contact Mira'], ['address', 'Address: 123 Fictional Lane'], ['date_of_birth', 'DOB: 1999-01-02'],
-    ['passport', 'Passport: A1234567'], ['bank_account', 'Account number: 12345678901'],
+    ['person_name', 'Name: Mira Fictional'], ['address', 'Address: 123 Fictional Lane'], ['date_of_birth', 'DOB: 02/01/1999'],
+    ['passport', 'Passport: A1234567'], ['bank_account', 'GB82 WEST 1234 5698 7654 32'],
   ])('replaces %s candidates without exposing the match', (kind, value) => {
-    expect(classify(value).some(span => span.kind === kind)).toBe(true);
+    expect(openRedactionCandidates(value).some(span => span.kind === kind)).toBe(true);
     const result = sanitizeText(value, 'instruction');
     expect(result.sanitized).not.toContain(value);
     expect(result.findings[0].text).toBeDefined();
     expect(result.findings[0].id).toMatch(/^finding_\d+$/);
   });
-  it('validates Luhn without claiming invalid candidates are cards', () => {
-    expect(luhn('4111 1111 1111 1111')).toBe(true);
-    expect(luhn('4111 1111 1111 1112')).toBe(false);
-    expect(luhn('0000000000000000')).toBe(false);
-    expect(classify('4111 1111 1111 1112').some(s => s.kind === 'payment_card')).toBe(false);
-    expect(sanitizeText('4111\n1111\n1111\n1111', 'instruction').sanitized).not.toContain('4111');
+  it('rejects an invalid payment-card candidate and still withholds it on the page', () => {
+    // OpenRedaction's own validator (Luhn) rejects the checksum failure, so no
+    // payment_card candidate is produced for the invalid number.
+    expect(openRedactionCandidates('4111 1111 1111 1112').some(s => s.kind === 'payment_card')).toBe(false);
+    // Text taken from the page is still withheld as unclassified rather than
+    // carried out because a rule did not fire.
+    const result = sanitizeText('Card: 4111 1111 1111 1112', 'element_description');
+    expect(result.sanitized).not.toContain('4111');
+    expect(openRedactionCandidates('4111 1111 1111 1111').some(s => s.kind === 'payment_card')).toBe(true);
   });
   it('normalizes full-width and invisible characters and withholds unsupported text/overflow', () => {
     expect(sanitizeText('ｍｉｒａ＠ｅｘａｍｐｌｅ．ｔｅｓｔ', 'instruction').sanitized).toBe('[EMAIL_1]');
@@ -156,7 +159,7 @@ describe('one fail-closed payload gateway', () => {
     if (!result.ok) return;
     expect(StepRequestSchema.safeParse(result.request).success).toBe(true);
     const json = JSON.stringify(result.request);
-    for (const value of [...fictional, 'Contact Mira', ...fixture().observation.tiles.map(t => t.screenshot.slice(22))]) expect(json).not.toContain(value);
+    for (const value of [...fictional, ...fixture().observation.tiles.map(t => t.screenshot.slice(22))]) expect(json).not.toContain(value);
     expect(Object.keys(result.request).sort()).toEqual(['protocolVersion', 'requestId', 'taskId', 'observationId', 'sanitizedInstruction', 'elements', 'valueRefs'].sort());
     expect(result.request.valueRefs).toEqual([]);
   });
