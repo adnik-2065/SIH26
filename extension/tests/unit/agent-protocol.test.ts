@@ -71,6 +71,25 @@ describe('translating a server response into actions', () => {
       { type: 'wait', milliseconds: 500 }, { type: 'scroll', direction: 'down', pixels: 900 },
       { type: 'scroll', direction: 'up', pixels: 600 }, { type: 'wait', milliseconds: 5000 }]);
   });
+  it('accepts a back step with no id as the wrong-destination recovery', () => {
+    const plan = planActions(reply([
+      { action: 'back', id: null, className: null, xpath: null, value: null },
+      { action: 'back' },
+      { action: 'back', id: 'obs_1_e9' },
+    ]), request);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) return;
+    // Back never addresses a control: an id is neither required nor resolved.
+    expect(plan.steps.map(step => step.action)).toEqual([{ type: 'back' }, { type: 'back' }, { type: 'back' }]);
+    expect(plan.rejected).toEqual([]);
+  });
+  it('runs a back step immediately and defers the steps planned after it', () => {
+    const plan = planActions(reply([{ action: 'back' }, { action: 'click', id: 'obs_1_e4' }, { action: 'finish' }]), request);
+    if (!plan.ok) throw new Error('expected a plan');
+    const { runnable, deferred } = executableNow(plan.steps);
+    expect(runnable.map(step => step.action.type)).toEqual(['back']);
+    expect(deferred.map(step => step.action.type)).toEqual(['click', 'done']);
+  });
   it('ignores anything the model appends after it said it had finished', () => {
     const plan = planActions(reply([{ action: 'finish' }, { action: 'click', id: 'obs_1_e4' }]), request);
     expect(plan.ok && plan.steps.map(step => step.action)).toEqual([{ type: 'done' }]);

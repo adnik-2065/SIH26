@@ -44,6 +44,8 @@ interface Props {
 const describe = (action: Action) =>
   action.type === 'scroll' ? `Scroll ${action.direction} ${action.pixels}px`
   : action.type === 'wait' ? `Wait ${action.milliseconds}ms`
+  : action.type === 'key' ? `Press ${action.key}`
+  : action.type === 'back' ? 'Go back one page'
   : action.type === 'done' ? 'Finish the task'
   : action.type === 'type' ? `Type “${action.text}” into ${action.target}`
   : action.type === 'choose' ? `Choose “${action.optionText}” in ${action.target}`
@@ -133,6 +135,20 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
   async function perform(step: PlannedStep) {
     onStage?.('EXECUTING');
     const target = 'target' in step.action ? step.action.target : undefined;
+    // [ACT DEBUG] Diagnostic evidence only: what this observation's Page Info
+    // said the requested id represented, plus the id's nearest alternative
+    // targets for comparison. Read-only; the dispatched action is unchanged.
+    if (step.action.type === 'click' && target) {
+      const row = request.elements.find(element => element.id === target);
+      console.log(`[ACT DEBUG] PAGE INFO ENTRY\nid=${target}\nrole=${row?.role ?? 'NOT FOUND'}\ndescription=${row?.description ?? 'NOT FOUND'}\nbounds=${row?.bounds ? JSON.stringify({ x: Math.round(row.bounds.x), y: Math.round(row.bounds.y), width: Math.round(row.bounds.width), height: Math.round(row.bounds.height) }) : 'NOT FOUND'}\nobservation_id=${observationId}`);
+      const aiMode = request.elements.find(element => /\bai mode\b/i.test(element.description));
+      const wiki = request.elements.find(element => /\bwikipedia\b/i.test(element.description));
+      if (aiMode || wiki) {
+        const describe = (element: { id: string; role: string; description: string; bounds?: { x: number; y: number; width: number; height: number } }) =>
+          `id=${element.id}\nrole=${element.role}\ndescription=${element.description}\nbounds=${element.bounds ? JSON.stringify({ x: Math.round(element.bounds.x), y: Math.round(element.bounds.y), width: Math.round(element.bounds.width), height: Math.round(element.bounds.height) }) : 'none'}`;
+        console.log(`[ACT DEBUG] TARGET COMPARISON\nWIKIPEDIA:\n${wiki ? describe(wiki) : 'not present in this Page Info'}\n\nAI_MODE:\n${aiMode ? describe(aiMode) : 'not present in this Page Info'}\n\nREQUESTED:\n${row ? describe(row) : `id=${target} not present in this Page Info`}`);
+      }
+    }
     const response = await chrome.runtime.sendMessage({ type: 'ACT', observationId, action: step.action,
       expect: target ? bounds.get(target) : undefined }).catch(() => undefined);
     const ok = response?.ok === true;
@@ -144,7 +160,8 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
     onActionOutcome?.({ action: step.action.type === 'done' ? 'finish' : step.action.type,
       ...(target !== undefined ? { id: target } : {}),
       value: 'text' in step.action ? step.action.text : 'optionText' in step.action ? step.action.optionText
-        : 'valueRef' in step.action ? step.action.valueRef : 'optionRef' in step.action ? step.action.optionRef : null,
+        : 'valueRef' in step.action ? step.action.valueRef : 'optionRef' in step.action ? step.action.optionRef
+        : 'key' in step.action ? step.action.key : null,
       result: outcome.result, ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}) });
     if (ok && step.action.type !== 'done') onExecuted?.({
       observationId,

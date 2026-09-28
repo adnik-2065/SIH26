@@ -5,7 +5,9 @@ const target = { target: id };
 // `fill`/`select` carry an opaque reference the extension minted, so the value
 // stays local. `type`/`choose` carry literal server text, which is a weaker
 // form: the executor refuses sensitive destinations and the text is classified
-// before it is ever keyed into the page.
+// before it is ever keyed into the page. `key` carries no text at all — it
+// dispatches one Enter to the focused control, the path a real user takes when
+// an autocomplete offers no clickable suggestion.
 export const LiteralTextSchema = z.string().min(1).max(200);
 export const ActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), ...target }).strict(),
@@ -15,6 +17,15 @@ export const ActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('choose'), ...target, optionText: LiteralTextSchema }).strict(),
   z.object({ type: z.literal('scroll'), direction: z.enum(['up', 'down']), pixels: z.number().int().min(1).max(2000) }).strict(),
   z.object({ type: z.literal('wait'), milliseconds: z.number().int().min(1).max(5000) }).strict(),
+  // One Enter to the reviewed, focused element. Deliberately not an open key
+  // vocabulary: only the key the autocomplete flow needs is accepted, so a
+  // malformed value cannot reach the page as arbitrary synthetic input.
+  z.object({ type: z.literal('key'), key: z.literal('Enter') }).strict(),
+  // One browser history step back. Element-free like `key`: the reasoning
+  // server decides the current page is a wrong destination and returns `back`
+  // with no id; the executor performs what the user's own Back button would,
+  // and the existing navigation pipeline supplies the fresh observation.
+  z.object({ type: z.literal('back') }).strict(),
   z.object({ type: z.literal('done') }).strict(),
 ]);
 export type Action = z.infer<typeof ActionSchema>;
@@ -25,7 +36,7 @@ export const ActionResponseSchema = z.object({ ...envelope, action: ActionSchema
 // `className`/`xpath` are tolerated on the wire and ignored, because a selector
 // invented from a redacted screenshot would reach controls no reviewer saw.
 export const AgentStepSchema = z.object({
-  action: z.enum(['click', 'type', 'select', 'scroll', 'wait', 'finish']),
+  action: z.enum(['click', 'type', 'select', 'scroll', 'wait', 'finish', 'key', 'keypress', 'back']),
   id: z.string().max(100).nullable().optional(),
   className: z.string().max(300).nullable().optional(),
   xpath: z.string().max(1000).nullable().optional(),
@@ -47,7 +58,10 @@ export const StepRequestSchema = z.object({ ...envelope,
     // control whose label the redaction replaced can be matched by position to
     // this exact existing id in page_info. Coordinates only — never a label,
     // href or attribute value.
-    bounds: z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict().optional() }).strict()).max(200),
+    bounds: z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict().optional(),
+    // Credential-state only: whether a credential field (password, login
+    // identifier) currently holds user input. A boolean, never the value.
+    filled: z.boolean().optional() }).strict()).max(200),
   valueRefs: z.array(z.object({ id, purpose: z.string().max(100), target: id }).strict()).max(100),
   sanitizedImage: z.object({ mimeType: z.literal('image/png'), base64: z.string().max(4_000_000),
     // The delivered image's own pixel size. Element boxes in page_info are
@@ -154,6 +168,9 @@ export const ElementSchema = z.object({
   disabled: z.boolean(), sensitive: z.boolean(), bounds: RectSchema,
   // Whether the control currently holds user input. Never the value itself.
   filled: z.boolean().optional(),
+  // A credential field (password, one-time code, login identifier): the agent
+  // must never type into it, and only its filled state may reach the server.
+  credential: z.boolean().optional(),
 }).strict();
 export const DomSnapshotSchema = z.object({
   observationId: id, documentId: id, revision: z.number().int().nonnegative(), origin: z.string().url(),

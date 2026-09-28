@@ -1,5 +1,5 @@
 import type { Action, ErrorCode, Rect } from '../contracts';
-import { available, sensitiveControl } from './observe';
+import { available, credentialControl, sensitiveControl } from './observe';
 
 export interface ActInput {
   action: Action;
@@ -12,6 +12,11 @@ export interface ActInput {
   // A vault reference resolved by the panel immediately before dispatch. It
   // travels only through extension messaging and is never stored here.
   resolved?: string;
+  // [ACT DEBUG] Diagnostic context only: the observation the ACT command names
+  // and the content script's live observation id at execution time. Never used
+  // for resolution — logging evidence for id-stability questions.
+  observationId?: string;
+  currentObservationId?: string;
 }
 export type ActResult = { ok: true } | { error: ErrorCode };
 // Layout settles by fractions of a pixel between capture and execution.
@@ -104,21 +109,101 @@ function pressPointer(element: HTMLElement) {
   element.click();
 }
 
+// [ACT DEBUG] Live DOM facts of the element the executor is about to touch —
+// read from the element itself, never from Page Info. Read-only.
+function elementFacts(element: HTMLElement) {
+  const rect = element.getBoundingClientRect();
+  const anchor = element.matches('a') && element.getAttribute('href') !== null ? element as HTMLAnchorElement
+    : element.closest('a[href]') as HTMLAnchorElement | null;
+  return `tag=${element.tagName}\ntext=${(element.textContent ?? '').trim().slice(0, 120) || '(empty)'}\nhref=${anchor?.href ?? 'none'}\nrole=${element.getAttribute('role') ?? 'none'}\naria-label=${element.getAttribute('aria-label') ?? 'none'}\nbounds=${JSON.stringify({ x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) })}`;
+}
+
 export function act(input: ActInput): ActResult {
   const { action } = input;
   if (action.type === 'done') return { ok: true };
+  // The key action does not address an element: it dispatches Enter to whatever
+  // the reviewed flow left focused, exactly as a person pressing the key would.
+  if (action.type === 'key') {
+    // Duck-typed rather than instanceof: the unit environment has no HTMLElement.
+    const active = document.activeElement;
+    const focused = active && typeof (active as HTMLElement).dispatchEvent === 'function' ? active as HTMLElement : document.body;
+    try {
+      // Chrome seeds keyCode/charCode/which only for real input, so a bare
+      // constructed event arrives as keyCode 0 — invisible to the many site
+      // scripts that read e.keyCode. Filling them makes the synthetic key
+      // legible to page scripts; it does not make it trusted, so the default
+      // action below is still ours to perform.
+      const init: KeyboardEventInit = { key: action.key, code: action.key === 'Enter' ? 'Enter' : '',
+        keyCode: action.key === 'Enter' ? 13 : 0, charCode: 0, bubbles: true, cancelable: true };
+      const keydown = new KeyboardEvent('keydown', init);
+      focused.dispatchEvent(keydown);
+      // A page that handles Enter itself (preventDefault) keeps ownership:
+      // deliver the rest of the sequence but never double-submit.
+      if (!keydown.defaultPrevented) {
+        focused.dispatchEvent(new KeyboardEvent('keypress', init));
+        // Enter's default action on a form control is the HTML implicit
+        // submission, and an untrusted keydown fires none. requestSubmit is
+        // exactly that default — validation, submit event, navigation — not a
+        // synthesized click and not a selector guess.
+        // Tag-name check rather than `instanceof HTMLFormElement`, which the
+        // unit environment (bare node) does not even define.
+        const form = (focused.tagName === 'FORM' ? focused : focused.closest?.('form')) as HTMLFormElement | null;
+        if (action.key === 'Enter' && form) form.requestSubmit();
+      }
+      focused.dispatchEvent(new KeyboardEvent('keyup', init));
+    } catch { return { error: 'ACTION_FAILED' }; }
+    return { ok: true };
+  }
+  // Back is the server's wrong-destination recovery: exactly one browser
+  // history step, never a synthesized click, an id lookup or an arbitrary URL.
+  // The navigation it causes flows through the existing PAGE_CHANGED pipeline,
+  // which retires this observation and produces the fresh one.
+  if (action.type === 'back') {
+    try {
+      // With no earlier entry there is nothing to go back to; fail safely
+      // instead of pretending the recovery happened.
+      if (history.length <= 1) {
+        console.log(`[ACT DEBUG] BACK NAVIGATION\nrequested=true\nexecuted=false\nhistoryLength=${history.length}`);
+        return { error: 'ACTION_FAILED' };
+      }
+      console.log(`[ACT DEBUG] BACK NAVIGATION\nrequested=true\nexecuted=true\nhistoryLength=${history.length}`);
+      history.back();
+      return { ok: true };
+    } catch { return { error: 'ACTION_FAILED' }; }
+  }
   if (action.type === 'scroll') {
     scrollBy({ top: action.direction === 'down' ? action.pixels : -action.pixels, behavior: 'instant' });
     return { ok: true };
   }
   const element = resolve(input);
-  if (typeof element === 'string') return { error: element };
-  // Literal server text must never reach a password or one-time-code box, no
-  // matter how the planner labelled it.
+  // [ACT DEBUG] A click whose id no longer resolves is exactly the stale-id
+  // case this investigation must distinguish, so the refusal is logged too.
+  if (typeof element === 'string') {
+    if (action.type === 'click') {
+      const target = action.target;
+      console.log(`[ACT DEBUG] ID STABILITY\nrequested_id=${target}\nexists_in_current_refs=${input.refs.has(target)}\nobservation_id=${input.observationId ?? 'unavailable'}\ncurrent_observation_id=${input.currentObservationId ?? 'unavailable'}`);
+      console.log(`[ACT DEBUG] RESOLUTION\nrequested_id=${target}\nresolved=false\nerror=${element}\nobservation_id=${input.observationId ?? 'unavailable'}`);
+    }
+    return { error: element };
+  }
+  // Literal server text must never reach a password, one-time-code or login
+  // identifier field, no matter how the planner labelled it: the server never
+  // learns credential values, so any text it sends for a credential field is
+  // by definition not the user's credential. The deterministic refusal lives
+  // in the executor, not in a prompt. Vault-backed fill stays allowed — the
+  // user approved that value locally and it never crossed the wire.
   const literal = action.type === 'type' || action.type === 'choose';
-  if (literal && sensitiveControl(element)) return { error: 'TARGET_UNSAFE' };
+  if (literal && (sensitiveControl(element) || credentialControl(element))) return { error: 'TARGET_UNSAFE' };
   try {
-    if (action.type === 'click') { pressPointer(element); return { ok: true }; }
+    if (action.type === 'click') {
+      // [ACT DEBUG] The executor's own resolution evidence, immediately before
+      // dispatch: the exact element pressPointer is about to click.
+      const target = action.target;
+      console.log(`[ACT DEBUG] ID STABILITY\nrequested_id=${target}\nexists_in_current_refs=${input.refs.has(target)}\nobservation_id=${input.observationId ?? 'unavailable'}\ncurrent_observation_id=${input.currentObservationId ?? 'unavailable'}`);
+      console.log(`[ACT DEBUG] RESOLUTION\nrequested_id=${target}\nresolved=true\n${elementFacts(element)}\nobservation_id=${input.observationId ?? 'unavailable'}`);
+      pressPointer(element);
+      return { ok: true };
+    }
     if (action.type === 'type' || action.type === 'fill') {
       const text = action.type === 'type' ? action.text : input.resolved;
       if (text === undefined) return { error: 'INVALID_MESSAGE' };

@@ -17,6 +17,7 @@ const RULES = [
   'Never invent an id, class name, or xpath. Steps carrying className or xpath are discarded.',
   'To enter a stored value, put its value_* reference in "value". To enter ordinary public text, put the literal text in "value".',
   'Never put a password, one-time code, card number, or any personal identifier in "value".',
+  'A credential field with filled=false is waiting for the user to type into it themselves. Wait (or finish the step) and observe again; never ask the user for the value.',
   'Only the first page-touching step is performed; the page is then observed again. Prefer short sequences.',
 ].map((rule, index) => `${index + 1}. ${rule}`).join('\n');
 
@@ -40,6 +41,7 @@ export function describeBox(box: Rect, width: number, height: number) {
 export function describePage(request: StepRequest) {
   const elements = request.elements.length
     ? request.elements.map(element => `- id=${element.id} role=${element.role} label="${element.description}"${
+      element.filled !== undefined ? ` filled=${element.filled}` : ''}${
       request.sanitizedImage && element.bounds ? ` ${describeBox(element.bounds, request.sanitizedImage.width, request.sanitizedImage.height)}` : ''}`).join('\n')
     : '- (no interactive element was visible in this view)';
   const values = request.valueRefs.length

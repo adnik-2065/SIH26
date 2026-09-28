@@ -28,7 +28,7 @@ const messages: Record<ErrorCode, string> = {
   INVALID_MESSAGE: 'A component returned an invalid message.', BUSY: 'An observation is already running.',
   RESTARTED: 'The background worker restarted. Observe again to capture a fresh view.',
   TARGET_CHANGED: 'That control moved or is no longer reachable. Observe again before acting.',
-  TARGET_UNSAFE: 'The step targeted a password or one-time-code field. It was not performed.',
+  TARGET_UNSAFE: 'The step targeted a password, one-time-code or login-credential field. It was not performed.',
   ACTION_FAILED: 'The step could not be completed on this page.',
 };
 // One 16px icon set, drawn inline: the panel loads no remote font or sprite.
@@ -145,6 +145,35 @@ function App() {
   const captureTilesRef = useRef<CaptureTile[]>([]);
   const [captureProgress, setCaptureProgress] = useState<{ index: number; count: number }>();
   const stopPending = useRef(false);
+  // Set only while a run is parked waiting for the user to grant activeTab
+  // access to the tab's current origin (a START/OBSERVE answered
+  // ACCESS_REQUIRED). The user is the only grant actor — the toolbar icon — so
+  // this is cleared by lifecycle events (a successful command, Stop, a new
+  // task, a terminal run), never by a timer.
+  const accessWaitRef = useRef(false);
+  // Serializes one recovery START at a time, so a burst of user events cannot
+  // start two recoveries for the same access wait.
+  const recoveringAccessRef = useRef(false);
+  // While a run is in an access wait, the next real user gesture — a window
+  // focus or visibility change, a pointer or key on the panel, exactly what
+  // follows the toolbar-icon grant — retries the recovery START once. Strictly
+  // guarded: the listeners exist only while a run is active (autoRun), and
+  // recoverAccess acts only while accessWaitRef is set, which itself is set
+  // only by an ACCESS_REQUIRED refusal — never during a healthy run.
+  useEffect(() => {
+    if (!autoRun) return;
+    const attempt = () => { void recoverAccess(); };
+    window.addEventListener('visibilitychange', attempt);
+    window.addEventListener('focus', attempt);
+    window.addEventListener('pointerdown', attempt);
+    window.addEventListener('keydown', attempt);
+    return () => {
+      window.removeEventListener('visibilitychange', attempt);
+      window.removeEventListener('focus', attempt);
+      window.removeEventListener('pointerdown', attempt);
+      window.removeEventListener('keydown', attempt);
+    };
+  }, [autoRun]);
 
   // This controller is what the agent request listens to, so every caller says
   // why it is cancelling. Without a source an aborted request is reported as an
@@ -299,6 +328,8 @@ function App() {
     }
     runRef.current = outcome.run;
     setRunStage(outcome.run.stage);
+    // A new task never inherits a pending access wait or an in-flight recovery.
+    accessWaitRef.current = false; recoveringAccessRef.current = false;
     setRunNotice(''); setRound(1); setExecutionReport(undefined); setAutoRun(true); setLog([]);
     // A new task starts with no actions performed and no repetition history.
     actionHistoryRef.current = resetActionHistory();
@@ -311,6 +342,10 @@ function App() {
   // A halted run keeps its structured failure, so the panel can still say what
   // failed after the observation (and the section that reported it) is gone.
   function stopRun(notice: string, failure?: ExtensionError) {
+    // Any terminal run — manual Stop, a halted verdict, a completed task —
+    // ends an access wait and any in-flight recovery with it.
+    accessWaitRef.current = false;
+    recoveringAccessRef.current = false;
     stage(failure ? 'FAILED' : /stopped|cancel/i.test(notice) ? 'CANCELLED' : 'COMPLETED');
     setAutoRun(false); setRunNotice(notice); setLastFailure(failure);
     addLog(failure ? 'error' : 'info', failure ? `${notice} [${failure.code} at ${failure.stage}]` : notice);
@@ -328,16 +363,62 @@ function App() {
       // an error as this round's own. It is recorded even when the panel keeps
       // a newer state, because the round still began here.
       if (parsed.success) { if (parsed.data.generation >= stateRef.current.generation) applyState(parsed.data); if (response?.ok && type !== 'STOP') setRoundGeneration(parsed.data.generation); }
-      if (!response?.ok) { setError(messages[response?.error as ErrorCode] || 'The operation could not be completed.'); setAutoRun(false); return (response?.error as ErrorCode) ?? 'INVALID_MESSAGE'; }
-    } catch { setError('The extension disconnected. Reload it and reopen the panel.'); setAutoRun(false); return 'RESTARTED'; }
+      if (response?.ok) accessWaitRef.current = false;
+      if (!response?.ok) {
+        const code = (response?.error as ErrorCode) ?? 'INVALID_MESSAGE';
+        // ACCESS_REQUIRED is not a terminal command failure: the user has not
+        // granted activeTab access to this tab/origin yet, and only the user
+        // can, with the toolbar icon. Keep the run alive and wait for that
+        // grant; every other error ends the run exactly as before.
+        if (code === 'ACCESS_REQUIRED') {
+          setError(messages.ACCESS_REQUIRED);
+          if (!accessWaitRef.current) {
+            accessWaitRef.current = true;
+            addLog('info', '[ACCESS WAIT] Access required for the current tab; waiting for the user to grant access.');
+          }
+          return code;
+        }
+        accessWaitRef.current = false;
+        setError(messages[code] || 'The operation could not be completed.');
+        setAutoRun(false);
+        return code;
+      }
+    } catch { accessWaitRef.current = false; setError('The extension disconnected. Reload it and reopen the panel.'); setAutoRun(false); return 'RESTARTED'; }
     return undefined;
+  }
+  // One recovery attempt for an access wait: a fresh START against the
+  // now-authorized current tab, which is exactly what a granted activeTab
+  // makes possible. Called only from real user events (see the listener by
+  // the access-wait refs), never on a timer, and deduplicated so duplicate
+  // events cannot start two recoveries. A refusal that is not
+  // ACCESS_REQUIRED falls through to command()'s normal failure handling —
+  // no recovery loop.
+  async function recoverAccess() {
+    if (!accessWaitRef.current || recoveringAccessRef.current) return;
+    recoveringAccessRef.current = true;
+    try {
+      addLog('info', '[ACCESS RECOVERY] User access detected; starting fresh observation.');
+      // The refused OBSERVE already consumed this generation's retry marker;
+      // recovery is a new round on a fresh generation, so release it.
+      retriedGeneration.current = undefined;
+      const refused = await command('START');
+      if (refused === 'ACCESS_REQUIRED') return; // not granted yet — keep waiting
+      if (refused === 'BUSY') { addLog('info', '[ACCESS RECOVERY] START recovery already in progress; skipping duplicate.'); return; }
+      if (refused !== undefined) return; // a real failure: command() reported it
+      accessWaitRef.current = false;
+      addLog('info', '[ACCESS RECOVERY] START recovery succeeded.');
+    } finally { recoveringAccessRef.current = false; }
   }
   // Scan the page again inside a run that is already going. A move that crossed
   // an origin is refused by OBSERVE — the paused task still describes the site
   // the user left — so the honest recovery there is a fresh task, not a dead run.
   async function observeAgain() {
     const refused = await command(state.taskId && state.status !== 'stopped' ? 'OBSERVE' : 'START');
-    if (refused === 'ACCESS_REQUIRED') { setError(''); setAutoRun(true); await command('START'); }
+    if (refused !== 'ACCESS_REQUIRED') return;
+    // The worker cannot read — let alone capture — a tab the user has not
+    // granted activeTab access to, and only the user can, with the toolbar
+    // icon. command() has parked the run in an explicit access wait; the
+    // access-wait listener resumes it with a fresh START after the grant.
   }
 
   const busy = state.status === 'observing' || ocrBusy || faceBusy || documentBusy;
@@ -407,6 +488,10 @@ function App() {
     // for the reason spelled out in `roundVerdict`.
     const outcome = roundVerdict({ detectorError: ocrError || faceError || documentError,
       status: state.status, error: state.error, generation: state.generation, roundGeneration });
+    // Parked for the user's activeTab grant on the new origin: a paused state
+    // here is the access wait, not a halt. Stop, failure, and every
+    // non-waiting state keep their normal verdicts below.
+    if (accessWaitRef.current && state.status === 'paused') return;
     if (outcome.verdict === 'halt') { stopRun(outcome.notice); return; }
     // A capture that published an observation earns the round a clean slate.
     if (outcome.verdict === 'continue') {

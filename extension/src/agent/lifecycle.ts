@@ -121,7 +121,7 @@ export function actionSignature(action: Action, control?: { role: string; bounds
   const value = action.type === 'type' ? action.text : action.type === 'choose' ? action.optionText
     : action.type === 'fill' ? action.valueRef : action.type === 'select' ? action.optionRef
     : action.type === 'scroll' ? `${action.direction}:${action.pixels}` : action.type === 'wait' ? String(action.milliseconds)
-    : null;
+    : action.type === 'key' ? action.key : null;
   const target = control ? `${control.role}@${Math.round(control.bounds.x)},${Math.round(control.bounds.y)},${Math.round(control.bounds.width)},${Math.round(control.bounds.height)}` : '';
   return [action.type, target, value ?? ''].join('|');
 }

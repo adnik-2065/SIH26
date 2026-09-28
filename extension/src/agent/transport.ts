@@ -40,7 +40,7 @@ export interface TransportFailure { ok: false; reason: TransportReason; error: T
 export type TransportResult = PlanSuccess | TransportFailure;
 // A hosted model answers in roughly 15 s for a small page; the ceiling leaves
 // room for a long one without letting a stalled tunnel hold the panel forever.
-export const LIMITS = Object.freeze({ responseBytes: 200_000, timeoutMs: 120_000, bodyPreview: 200 });
+export const LIMITS = Object.freeze({ responseBytes: 200_000, timeoutMs: 240_000, bodyPreview: 200 });
 
 export { endpointAllowed } from '../config';
 

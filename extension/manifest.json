@@ -30,9 +30,9 @@
     "default_path": "panel.html"
   },
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://newark-kinase-considering-rural.trycloudflare.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://agile-buccaneer-persuader.ngrok-free.dev; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
   },
   "host_permissions": [
-    "https://newark-kinase-considering-rural.trycloudflare.com/*"
+    "https://agile-buccaneer-persuader.ngrok-free.dev/*"
   ]
 }

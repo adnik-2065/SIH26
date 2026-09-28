@@ -44,6 +44,12 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
     const refuse = (reason: Rejection) => { rejected.push({ index, reason }); };
     if (finished) { refuse('AFTER_FINISH'); continue; }
     const value = step.value ?? '';
+    // [ACT DEBUG] Diagnostic evidence only: what the server proposed for a
+    // click, exactly as received, before any validation. The step is never
+    // altered by this log.
+    if (step.action === 'click') {
+      console.log(`[ACT DEBUG] MODEL ACTION\naction=${step.action}\nrequested_id=${step.id ?? 'null'}\nclassName=${step.className ?? 'null'}\nxpath=${step.xpath ?? 'null'}\nvalue=${value || 'null'}`);
+    }
     // Addressing. An id we minted resolves; a class or xpath cannot, because
     // we never disclosed either and cannot check what it would select.
     const element = step.id ? elements.get(step.id) : undefined;
@@ -62,6 +68,21 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
       steps.push({ action: { type: 'scroll', direction, pixels }, index, literal: false }); continue;
     }
     if (step.action === 'click') { steps.push({ action: { type: 'click', target }, index, literal: false }); continue; }
+    // `key`/`keypress` with value "Enter" (the backend's spelling) becomes the
+    // one key action the executor implements. A keypress never addresses an
+    // element id — it lands on whatever the reviewed flow left focused.
+    if (step.action === 'key' || step.action === 'keypress') {
+      if (/^enter$/i.test(value)) { steps.push({ action: { type: 'key', key: 'Enter' }, index, literal: false }); continue; }
+      refuse('MISSING_VALUE'); continue;
+    }
+    // Back is the server's own wrong-destination recovery: it arrives with no
+    // id and addresses no control, so it is never resolved through Page Info.
+    // The backend owns the decision that the page is wrong; this only forwards
+    // the one-step history action to the executor.
+    if (step.action === 'back') {
+      console.log(`[ACT DEBUG] MODEL ACTION\naction=${step.action}\nrequested_id=${step.id ?? 'null'}`);
+      steps.push({ action: { type: 'back' }, index, literal: false }); continue;
+    }
     if (!value) { refuse('MISSING_VALUE'); continue; }
     // An approved private value travels as the reference the vault minted; the
     // server never holds it. Anything else is literal text it composed itself.

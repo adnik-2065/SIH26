@@ -30,7 +30,7 @@ const safeWords = new Set(('a an the my your this that these those i me we our a
   'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
   'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
   'course courses curriculum grade grades preference preferences message messages dashboard announcement announcements inbox assignment assignments attendance ' +
-  'textbox combobox checkbox radio spinbutton slider listbox switch').split(' '));
+  'textbox combobox checkbox radio spinbutton slider listbox switch option').split(' '));
 const placeholderPattern = /\[(?:PERSON|EMAIL|PHONE|ADDRESS|DATE_OF_BIRTH|AADHAAR|PAN|PASSPORT|PAYMENT_CARD|BANK_ACCOUNT|IFSC|FACE|DOCUMENT|PASSWORD|OTP|TOKEN|API_KEY)_\d+\]/g;
 // What actually makes a string unsafe to carry, as opposed to merely not being
 // ASCII. Unicode is the normal case on this project's own pages: rupee amounts,

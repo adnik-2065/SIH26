@@ -60,7 +60,10 @@ export const RedactionPlanSchema = z.object({ observationId: IdSchema, findings:
   // a strict() reference is the narrow id/role/description shape, so the schema
   // is stated explicitly to keep the bounds field visible to TypeScript.
   sanitizedElements: z.array(z.object({ id: IdSchema, role: z.string().max(50),
-    description: z.string().max(300), bounds: BoundsSchema.optional() }).strict()).max(200),
+    description: z.string().max(300), bounds: BoundsSchema.optional(),
+    // Credential-state only: whether a credential field (password, login
+    // identifier) currently holds user input. A boolean, never the value.
+    filled: z.boolean().optional() }).strict()).max(200),
   valueRefs: StepRequestSchema.shape.valueRefs,
   coverage: CoverageSchema, decision: z.enum(['safe', 'safe_without_image', 'blocked']), blockedReasons: z.array(BlockReasonSchema) }).strict();
 export type RedactionPlan = z.infer<typeof RedactionPlanSchema>;

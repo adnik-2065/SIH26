@@ -69,9 +69,17 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     // Context mode also trims the document padding: 8px around each of a stack
     // of form rows bridges the gaps and re-creates the single black slab.
     if (controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
-    const roles = ['textbox', 'combobox', 'button', 'checkbox', 'radio', 'link', 'spinbutton', 'slider', 'listbox', 'switch'];
+    // 'option' is the autocomplete suggestion row exposed by the observer;
+    // collapsing it into 'control' would hide the suggestion semantics the
+    // server needs to click the visible option instead of guessing.
+    const roles = ['textbox', 'combobox', 'button', 'checkbox', 'radio', 'link', 'spinbutton', 'slider', 'listbox', 'switch', 'option'];
     return { id: element.id, role: roles.includes(element.role) ? element.role : 'control',
       description: element.sensitive || element.label.length >= 200 || /password|otp|token|secret/i.test(element.type) ? 'Sensitive field' : result.sanitized || 'Unlabelled control',
+      // Credential fields (password, one-time code, login identifier) carry
+      // their filled state to the server as a boolean — the one bit login
+      // readiness needs. The value itself exists nowhere in this pipeline.
+      // An element without the bit (or without a known state) exposes nothing.
+      ...(element.credential || /password|otp|token|secret/i.test(element.type) ? { filled: element.filled === true } : {}),
       // The control's position in the delivered image's pixels. page_info
       // lists it so a visible control whose label the redaction replaced can
       // be matched by position to this exact existing id. Coordinates only:

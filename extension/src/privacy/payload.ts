@@ -9,6 +9,9 @@ export function payload(binding: Binding, plan: RedactionPlan, placeholders: Pla
     sanitizedInstruction: sanitizeText(plan.sanitizedInstruction, 'instruction', placeholders).sanitized,
     elements: plan.sanitizedElements.map(element => ({ id: element.id, role: element.role,
       description: sanitizeText(element.description, 'element_description', placeholders).sanitized,
+      // The credential-state boolean only, never a value. Non-credential
+      // elements carry no filled field at all.
+      ...(element.filled !== undefined ? { filled: element.filled } : {}),
       ...(element.bounds ? { bounds: element.bounds } : {}) })),
     valueRefs: plan.valueRefs.map(ref => ({ id: ref.id, target: ref.target,
       purpose: sanitizeText(ref.purpose, 'element_description', placeholders).sanitized })), ...(image ? { sanitizedImage: image } : {}) };

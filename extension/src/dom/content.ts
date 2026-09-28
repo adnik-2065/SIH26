@@ -161,7 +161,10 @@ if (!scope.__sih26Installed) {
       // takeRecords above already cleared the map for any pending mutation, so
       // an action can only run against the exact page state that was reviewed.
       if (observationId !== command.observationId) { reply({ error: 'PAGE_CHANGED' }); return; }
-      reply(act({ action: command.action, refs, expect: command.expect, resolved: command.resolved }));
+      // [ACT DEBUG] The command's observation id and the content script's live
+      // one ride along for diagnostic logging only; resolution is unchanged.
+      reply(act({ action: command.action, refs, expect: command.expect, resolved: command.resolved,
+        observationId: command.observationId, currentObservationId: observationId }));
       return;
     }
     if (command.type === 'CHECK' && observationId !== command.observationId) {
