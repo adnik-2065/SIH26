@@ -3,7 +3,29 @@ import type { Detection } from '@mediapipe/tasks-vision';
 import { normalizeFaces } from '../../src/vision/face/normalize';
 import { MediaPipeAdapter } from '../../src/vision/face/mediapipe';
 
-const detection = (originX = 10): Detection => ({ boundingBox: { originX, originY: 20, width: 60, height: 80, angle: 0 }, categories: [{ score: .9, index: 0, categoryName: '', displayName: '' }], keypoints: [] });
+// Keypoints are fractions of the input image (MediaPipe's contract). The
+// default fixture box (10,20,60x80) in an 800x600 image with anatomically
+// ordered landmarks: two separated eyes above the nose, the nose above the
+// mouth, all near the box.
+const boxKeypoints = [
+  { x: 30 / 800, y: 40 / 600 }, { x: 50 / 800, y: 38 / 600 },
+  { x: 40 / 800, y: 55 / 600 }, { x: 40 / 800, y: 70 / 600 },
+  { x: 12 / 800, y: 55 / 600 }, { x: 68 / 800, y: 55 / 600 },
+];
+// The geometry measured on a real detected face in a 1280x720 capture
+// (tests/browser/mask-trace.spec.ts RAW-FACE): box (376,67,520x520), eyes at
+// (467,240)/(654,202), nose (520,349), mouth (564,455), ear tragions flanking.
+const realKeypoints = [
+  { x: 467 / 1280, y: 240 / 720 }, { x: 654 / 1280, y: 202 / 720 },
+  { x: 520 / 1280, y: 349 / 720 }, { x: 564 / 1280, y: 455 / 720 },
+  { x: 459 / 1280, y: 290 / 720 }, { x: 871 / 1280, y: 223 / 720 },
+];
+const realBox: Detection = {
+  boundingBox: { originX: 376, originY: 67, width: 520, height: 520, angle: 0 },
+  categories: [{ score: .67, index: 0, categoryName: '', displayName: '' }], keypoints: realKeypoints };
+const detection = (originX = 10, keypoints = boxKeypoints): Detection =>
+  ({ boundingBox: { originX, originY: 20, width: 60, height: 80, angle: 0 },
+    categories: [{ score: .9, index: 0, categoryName: '', displayName: '' }], keypoints });
 const result = () => normalizeFaces([detection()], 'obs_1', 800, 600, 12);
 
 describe('face normalization', () => {
@@ -17,6 +39,22 @@ describe('face normalization', () => {
     expect(() => normalizeFaces([detection(900)], 'obs_1', 800, 600, 0)).toThrow();
     expect(() => normalizeFaces([{ ...detection(), categories: [] }], 'obs_1', 800, 600, 0)).toThrow();
     expect(() => normalizeFaces(Array.from({ length: 501 }, () => detection()), 'obs_1', 800, 600, 0)).toThrow();
+  });
+  // Model-native false-positive rejection: a box without two distinct eyes
+  // above the mouth is texture or UI, however high its score.
+  it('keeps a real face and rejects keypoint-less or implausible boxes', () => {
+    // The measured real detection is kept with its exact box.
+    expect(normalizeFaces([realBox], 'obs_1', 1280, 720, 0).regions)
+      .toEqual([{ kind: 'face', confidence: .67, bounds: { x: 376, y: 67, width: 520, height: 520 } }]);
+    // The texture false-positive shape: every landmark clustered at one spot
+    // (no facial geometry), exactly the half-page "Face 1" over login UI.
+    const clustered = boxKeypoints.map(() => ({ x: .5, y: .5 }));
+    expect(normalizeFaces([detection(300, clustered)], 'obs_1', 800, 600, 0).regions).toEqual([]);
+    expect(normalizeFaces([detection(300, [])], 'obs_1', 800, 600, 0).regions).toEqual([]);
+    // A detection with the mouth above the eyes is not a face.
+    const inverted = [...boxKeypoints];
+    inverted[3] = { x: inverted[3].x, y: 30 / 600 };
+    expect(normalizeFaces([detection(300, inverted)], 'obs_1', 800, 600, 0).regions).toEqual([]);
   });
 });
 class FakeWorker {

@@ -3,7 +3,7 @@ import type { PerceptionResult } from '../vision/contracts';
 import { canonical, openRedactionCandidates } from './openredaction';
 import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
 import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
-import { controlIsMasked } from './policy';
+import { controlIsMasked, documentRegionIsEvidence } from './policy';
 import { Placeholders, sanitizeText } from './text';
 
 export function reconstructOcr(regions: PerceptionResult['regions']) {
@@ -153,10 +153,19 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     append({ id: 'pending', source: 'face', kind: 'face', confidence: region.confidence, bounds: region.bounds,
       exportPolicy: 'mask', redactText: false, redactPixels: true });
   }
-  for (const region of data.documents.regions) append({ id: 'pending', source: 'document', kind: region.kind,
-    detector: data.documents.detector,
-    confidence: region.confidence, bounds: validateBounds(region.bounds, width, height),
-    exportPolicy: 'mask', redactText: false, redactPixels: true });
+  for (const region of data.documents.regions) {
+    // Vision-model regions are accepted only when the shared acceptance gate
+    // passes; rule-derived regions carry page evidence by construction. The
+    // verifier applies the same gate, so a gated region can never leave an
+    // export unverified (and never becomes one of the giant slabs measured in
+    // tests/browser/mask-trace.spec.ts).
+    if (region.source === 'model' && !documentRegionIsEvidence(region.bounds, { width, height },
+      observation.dom.viewport.devicePixelRatio, words)) continue;
+    append({ id: 'pending', source: 'document', kind: region.kind,
+      detector: data.documents.detector,
+      confidence: region.confidence, bounds: validateBounds(region.bounds, width, height),
+      exportPolicy: 'mask', redactText: false, redactPixels: true });
+  }
   // In context mode, keep overlapping masks as separate padded rectangles.
   // A bounding-box merge can fill large unmasked gaps between a face, nearby
   // text and a form control, obscuring most of a page. Strict mode keeps the

@@ -11,7 +11,7 @@ self.onmessage = async ({ data: input }: MessageEvent<PerceptionInput & { assetR
   try {
     engine ??= FilesetResolver.forVisionTasks(`${input.assetRoot}/wasm`).then(files => FaceDetector.createFromOptions(files, {
       baseOptions: { modelAssetPath: `${input.assetRoot}/blaze_face_short_range.tflite`, delegate: 'CPU' },
-      runningMode: 'IMAGE', minDetectionConfidence: 0.5, minSuppressionThreshold: 0.3,
+      runningMode: 'IMAGE', minDetectionConfidence: 0.75, minSuppressionThreshold: 0.3,
     }));
     const detector = await engine;
     const result = normalizeFaces(detector.detect(input.image).detections, input.observationId, width, height, 0);

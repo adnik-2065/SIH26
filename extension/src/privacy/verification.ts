@@ -4,11 +4,17 @@ import { openRedactionCandidates } from './openredaction';
 import { PrivacyError, type ExportData, type Finding, type Mask, type StepRequest } from './contracts';
 import { domBounds } from './geometry';
 import { reconstructOcr } from './normalize';
-import { controlIsMasked, visualIsMasked, visualRegionIsEvidence } from './policy';
+import { controlIsMasked, documentRegionIsEvidence, visualIsMasked, visualRegionIsEvidence } from './policy';
 
 export function verifyMaskCoverage(data: ExportData, masks: Mask[], findings: Finding[] = []) {
   const ocrBoxes = data.ocrTextPolicy === 'sensitive_only' ? [] : data.ocr.result!.regions;
-  const expected = [...ocrBoxes, ...data.faces.result!.regions, ...data.documents.regions].map(r => r.bounds);
+  // The same acceptance gate normalize applies: a vision-model document
+  // region that failed corroboration is not expected to be masked anywhere,
+  // so it can never fail an export here either.
+  const acceptedDocuments = data.documents.regions.filter(region => region.source !== 'model' ||
+    documentRegionIsEvidence(region.bounds, { width: data.observation.imageWidth, height: data.observation.imageHeight },
+      data.observation.dom.viewport.devicePixelRatio, data.ocr.result!.regions));
+  const expected = [...ocrBoxes, ...data.faces.result!.regions, ...acceptedDocuments].map(r => r.bounds);
   expected.push(...findings.filter(finding => finding.redactPixels && finding.bounds).map(finding => finding.bounds!));
   const policy = data.ocrTextPolicy ?? 'all_text';
   expected.push(...data.observation.dom.elements.filter(e => controlIsMasked(e, policy))

@@ -5,12 +5,25 @@ export { normalize } from '../src/privacy/normalize';
 export { redactImage } from '../src/privacy/image';
 export { Placeholders } from '../src/privacy/text';
 export { LIMITS } from '../src/privacy/contracts';
+export { mergeMasks, domBounds } from '../src/privacy/geometry';
+export { documentRegionIsEvidence } from '../src/privacy/policy';
 export { fixture } from './privacy-fixture';
 export { inspectDocumentTiles, detectLocalDocuments } from '../src/vision/documents';
 export { collect } from '../src/dom/observe';
 export { act } from '../src/dom/act';
 export { planActions, executableNow } from '../src/agent/protocol';
 export { toAgentBody, describePage } from '../src/agent/wire';
+// Real-detector diagnostic exports: the production adapters, the
+// section-cropping inspection chain, and the raw decoding primitives, for
+// tracing raw model output through to final masks (tests/browser/mask-trace.spec.ts).
+export { MediaPipeAdapter } from '../src/vision/face/mediapipe';
+export { OnnxDocumentAdapter } from '../src/vision/documents/onnx';
+export { TesseractAdapter } from '../src/vision/ocr/tesseract';
+export { inspectCapturedPage, pageSections } from '../src/vision/page';
+export { faceTiles, mergeFaces } from '../src/vision/face/tiles';
+export { normalizeFaces } from '../src/vision/face/normalize';
+export { decodeOnnxOutput, ONNX_INPUT_SIZE, ONNX_MODEL_CLASSES } from '../src/vision/onnx-utils';
+export { FilesetResolver, FaceDetector } from '@mediapipe/tasks-vision';
 
 export function visualFixture(scale = 1, long = false) {
   const data = fixture();
@@ -25,9 +38,9 @@ export function visualFixture(scale = 1, long = false) {
   const seam = bands[0].end;
   data.ocr.result!.regions = [
     { kind: 'text', text: 'mira', confidence: .99, bounds: { x: 10 * scale, y: seam - 10 * scale, width: 30 * scale, height: 10 * scale } },
-    { kind: 'text', text: '@', confidence: .99, bounds: { x: 45 * scale, y: seam - 10 * scale, width: 10 * scale, height: 10 * scale } },
+    { kind: 'text', text: '@', confidence: 1, bounds: { x: 45 * scale, y: seam - 10 * scale, width: 10 * scale, height: 10 * scale } },
     { kind: 'text', text: 'example.test', confidence: .99, bounds: { x: 10 * scale, y: seam + 2 * scale, width: 80 * scale, height: 10 * scale } },
-    { kind: 'text', text: 'ABCDE1234F', confidence: .99, bounds: { x: 10 * scale, y: height - 20 * scale, width: 80 * scale, height: 10 * scale } },
+    { kind: 'text', text: 'ABCDE1234F', confidence: .99, bounds: { width: 80 * scale, height: 10 * scale, x: 10 * scale, y: height - 20 * scale } },
   ];
   data.faces.result!.regions[0].bounds = { x: 70 * scale, y: seam - 10 * scale, width: 25 * scale, height: 25 * scale };
   data.documents.status = 'complete';

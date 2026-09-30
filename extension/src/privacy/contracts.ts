@@ -81,6 +81,11 @@ export const DocumentEvidenceSchema = z.object({ status: z.enum(['not_enabled', 
   detector: z.enum(['document_rules', 'vision_model']).optional(),
   observationId: IdSchema, regions: z.array(z.object({ kind: z.enum(['document', 'aadhaar', 'pan', 'passport', 'payment_card']),
     category: VisualCategorySchema.optional(),
+    // Which detector produced the region: DOM/OCR rules carry page evidence
+    // by construction; vision_model output is accepted only when the shared
+    // documentRegionIsEvidence gate passes (planner and verifier both apply
+    // it, so a gated region can never leave an export unverified).
+    source: z.enum(['rules', 'model']).optional(),
     bounds: BoundsSchema, confidence: z.number().finite().min(0).max(1) }).strict()).max(500) }).strict();
 export const LocalObservationSchema = CaptureObservationSchema.extend({ tiles: z.array(CaptureTileSchema).max(LIMITS.tiles) });
 export const ExportDataSchema = z.object({ binding: BindingSchema, observation: LocalObservationSchema,

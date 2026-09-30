@@ -42,7 +42,7 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
     .filter(region => visualIsMasked(region.category, textPolicy) && visualRegionIsEvidence(region.bounds, observation.captureBounds))
     .map(region => ({
     kind: kind(region.category), category: region.category, confidence: region.confidence,
-    bounds: domBounds(region.bounds, observation),
+    source: 'rules', bounds: domBounds(region.bounds, observation),
   }));
   // OCR gives cues, not a trustworthy document boundary. One phrase is not
   // evidence for a page-scale rectangle, so both policies mask the lines the
@@ -60,7 +60,7 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
     if (boxes.length) {
       const bounds = { ...boxes.reduce(union), x: 0, width: observation.imageWidth };
       regions.push({ kind: kind(cue.category), category: cue.category, confidence: .5,
-        bounds: validateBounds(bounds, page.width, page.height) });
+        source: 'rules', bounds: validateBounds(bounds, page.width, page.height) });
     }
   }
   return DocumentEvidenceSchema.parse({ status: 'complete', required: true, detector: 'document_rules',
@@ -74,11 +74,15 @@ export function mergeDocumentEvidence(base: DocumentEvidence, model: DocumentEvi
   if (base.status !== 'complete' || model.status !== 'complete') throw privacyError('INCOMPLETE_DETECTION_DOCUMENT', 'DOCUMENT_DETECTION',
     'Document evidence cannot be merged before both sources complete.',
     { observationId: base.observationId, ruleStatus: base.status, modelStatus: model.status }, 'a source is not complete');
+  // Vision-model regions are tagged `source: 'model'` here and are accepted
+  // only where the shared documentRegionIsEvidence gate can see the capture's
+  // OCR (normalize and verifyMaskCoverage), so a low-confidence page-scale
+  // false positive is recorded as provenance but never becomes a mask.
   const regions = [...base.regions];
   for (const region of model.regions) {
     const duplicate = regions.some(existing => existing.category === region.category &&
       overlap(existing.bounds, region.bounds) >= .6);
-    if (!duplicate) regions.push(region);
+    if (!duplicate) regions.push({ ...region, source: 'model' });
   }
   return DocumentEvidenceSchema.parse({ ...base, detector: 'vision_model', regions });
 }
@@ -136,7 +140,8 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         // intersect and stay separate.
         const existing = regions.find(region => region.category === detection.type && intersection(region.bounds, pageBox));
         if (existing) existing.bounds = union(existing.bounds, pageBox);
-        else regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence, bounds: pageBox });
+        else regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence,
+          source: 'model', bounds: pageBox });
         // eslint-disable-next-line no-console -- temporary runtime provenance diagnostic
         console.log('[DOC-PROBE] accepted', JSON.stringify({ category: detection.type, confidence: detection.confidence, pageBox, tile: { y: tile.y, width: tile.width, height: tile.height } }));
       }

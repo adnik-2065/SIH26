@@ -11,7 +11,7 @@ export const onnxCategory = (name: OnnxClass): VisualCategory => ({
 export interface Candidate { category: VisualCategory; confidence: number; bounds: Rect }
 
 export function decodeOnnxOutput(data: Float32Array, count: number, imageWidth: number, imageHeight: number,
-  scale: number, padX: number, padY: number, threshold = .25): Candidate[] {
+  scale: number, padX: number, padY: number, threshold = .8): Candidate[] {
   const candidates: Candidate[] = [];
   for (let i = 0; i < count; i++) {
     let best = 0, confidence = 0;
