@@ -58,7 +58,7 @@ for (const { zoom, dpr, long } of [{ zoom: 1, dpr: 1, long: false }, { zoom: 1.2
         return result;
       }) as typeof chrome.debugger.sendCommand;
     });
-    await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'START', instruction: 'Inspect faculty' }));
+    await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'START', instruction: 'Inspect faculty', scope: 'page' }));
     await expect.poll(async () => (await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'STATUS' }))).state.status, { timeout: 60_000 }).not.toBe('observing');
     const state = (await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'STATUS' }))).state;
     const events = await portal.evaluate(() => (window as unknown as { captureEvents: unknown[] }).captureEvents);
@@ -109,5 +109,109 @@ for (const { zoom, dpr, long } of [{ zoom: 1, dpr: 1, long: false }, { zoom: 1.2
     // Playwright is still attached; check that the extension's own session ended.
     expect(await worker.evaluate(async tabId => chrome.debugger.sendCommand({ tabId }, 'Page.getLayoutMetrics').then(() => true, () => false), state.tabId)).toBe(false);
     console.log('Full-page capture metrics:', await panel.locator('.metrics').innerText());
+  } finally { await context.close(); }
+});
+
+for (const { zoom, dpr } of [{ zoom: 1, dpr: 1 }, { zoom: 1.25, dpr: 1 }, { zoom: 1, dpr: 2 }]) test(`viewport capture photographs one screen at the scroll position and aligns detections at zoom ${zoom}, DPR ${dpr}`, async () => {
+  const context = await chromium.launchPersistentContext(await mkdtemp(join(tmpdir(), 'sih26-viewport-')), {
+    channel: 'chromium', headless: true, viewport: null,
+    args: [`--disable-extensions-except=${resolve('dist')}`, `--load-extension=${resolve('dist')}`, '--enable-unsafe-extension-debugging', '--window-size=1280,1000', `--force-device-scale-factor=${dpr}`],
+  });
+  try {
+    const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
+    const extensionId = new URL(worker.url()).host;
+    const panel = await context.newPage();
+    await panel.goto(`chrome-extension://${extensionId}/panel.html`);
+    const portal = await context.newPage();
+    await portal.goto('http://127.0.0.1:4173/');
+    await portal.evaluate(() => {
+      const tail = document.createElement('section');
+      tail.style.cssText = 'padding-top:3000px;padding-bottom:3000px;background:white;color:black';
+      tail.innerHTML = '<p style="font:32px Arial">MidPageMarker</p><img id="portrait" src="/assets/synthetic-face.png" width="220" height="220">';
+      document.body.append(tail);
+    });
+    await portal.locator('#portrait').evaluate(image => (image as HTMLImageElement).decode());
+    const browserSession = await context.browser()!.newBrowserCDPSession();
+    const { targetInfos } = await browserSession.send('Target.getTargets', { filter: [{ type: 'tab', exclude: false }, { exclude: true }] });
+    const target = targetInfos.find(item => item.url === portal.url())!;
+    await browserSession.send('Extensions.triggerAction', { id: extensionId, targetId: target.targetId });
+    await worker.evaluate(async zoom => {
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      await chrome.tabs.setZoom(tab.id!, zoom);
+    }, zoom);
+    await portal.waitForTimeout(600);
+    await portal.locator('#portrait').evaluate(image => image.scrollIntoView({ block: 'center' }));
+    await portal.waitForTimeout(300);
+    await worker.evaluate(() => {
+      const shots: unknown[] = [];
+      (globalThis as unknown as { shots: unknown[] }).shots = shots;
+      const send = chrome.debugger.sendCommand.bind(chrome.debugger);
+      chrome.debugger.sendCommand = (async (target: chrome.debugger.Debuggee, method: string, params?: object) => {
+        if (method === 'Page.captureScreenshot') shots.push(params);
+        return send(target, method, params);
+      }) as typeof chrome.debugger.sendCommand;
+    });
+    await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'START', instruction: 'Inspect faculty' }));
+    await expect(panel.locator('.status')).toHaveText('Scan ready to review', { timeout: 90_000 });
+    const state = (await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'STATUS' }))).state;
+    expect(state.error).toBeUndefined();
+    const shots = await worker.evaluate(() => (globalThis as unknown as { shots: unknown[] }).shots);
+    expect(shots).toHaveLength(1);
+    await expect(panel.locator('.ocr-results')).toContainText('MidPageMarker');
+    const portrait = await portal.locator('#portrait').evaluate(image => {
+      const box = image.getBoundingClientRect();
+      return { x: box.x, y: box.y, width: box.width, height: box.height, dpr: devicePixelRatio, innerHeight };
+    });
+    // Image pixels start at the top of the screen, not of the document.
+    const boxes = (await panel.locator('.face-results .coordinates').allTextContents()).map(value => value.match(/\d+/g)!.map(Number));
+    expect(boxes.length).toBeGreaterThan(0);
+    const [x, y, width, height] = boxes.find(([, top]) => top >= portrait.y * portrait.dpr - 2 && top <= (portrait.y + portrait.height) * portrait.dpr)!;
+    expect(x).toBeGreaterThanOrEqual(portrait.x * portrait.dpr - 2);
+    expect(x + width).toBeLessThanOrEqual((portrait.x + portrait.width) * portrait.dpr + 2);
+    expect(y + height).toBeLessThanOrEqual((portrait.y + portrait.height) * portrait.dpr + 2);
+    for (const [, top, , tall] of boxes) expect(top + tall).toBeLessThanOrEqual(Math.ceil(portrait.innerHeight * portrait.dpr) + 2);
+  } finally { await context.close(); }
+});
+
+test('a viewport capture of a page with more controls than the limit describes every control on screen without truncating', async () => {
+  const context = await chromium.launchPersistentContext(await mkdtemp(join(tmpdir(), 'sih26-controls-')), {
+    channel: 'chromium', headless: true, viewport: null,
+    args: [`--disable-extensions-except=${resolve('dist')}`, `--load-extension=${resolve('dist')}`, '--enable-unsafe-extension-debugging', '--window-size=1280,1000', '--force-device-scale-factor=1'],
+  });
+  try {
+    const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
+    const extensionId = new URL(worker.url()).host;
+    const panel = await context.newPage();
+    await panel.goto(`chrome-extension://${extensionId}/panel.html`);
+    const portal = await context.newPage();
+    await portal.goto('http://127.0.0.1:4173/');
+    await portal.evaluate(() => {
+      const list = document.createElement('section');
+      list.style.cssText = 'padding-top:4000px';
+      list.innerHTML = Array.from({ length: 600 }, (_, i) => `<a href="#far${i}" style="display:block">FarLink${i}</a>`).join('');
+      document.body.append(list);
+      window.scrollTo(0, 0);
+    });
+    const onScreen = await portal.evaluate(() => [...document.querySelectorAll('input,textarea,select,button,a[href]')]
+      .filter(el => { const r = el.getBoundingClientRect(); return r.width && r.height && r.bottom > 0 && r.top < innerHeight; }).length);
+    expect(onScreen).toBeGreaterThan(0);
+    const browserSession = await context.browser()!.newBrowserCDPSession();
+    const { targetInfos } = await browserSession.send('Target.getTargets', { filter: [{ type: 'tab', exclude: false }, { exclude: true }] });
+    await browserSession.send('Extensions.triggerAction', { id: extensionId, targetId: targetInfos.find(item => item.url === portal.url())!.targetId });
+    const scan = async (scope: 'viewport' | 'page') => {
+      await portal.bringToFront();
+      await panel.evaluate(scope => chrome.runtime.sendMessage({ type: 'START', instruction: 'Inspect faculty', scope }), scope);
+      await expect(panel.locator('.status')).toHaveText('Scan ready to review', { timeout: 90_000 });
+      return panel.locator('.technical .foot-note').last().textContent();
+    };
+    expect(await scan('viewport')).not.toContain('Control limit reached');
+    const labels = await panel.locator('.elements li strong').allTextContents();
+    expect(labels.length).toBeLessThanOrEqual(200);
+    // Every control on the photographed screen is described; the nearest far links fill the rest.
+    expect(labels.filter(label => !/^FarLink/.test(label)).length).toBeGreaterThanOrEqual(onScreen);
+    expect(labels).toContain('FarLink0');
+    expect(labels).not.toContain('FarLink599');
+    // The whole document is still refused when it does not fit.
+    expect(await scan('page')).toContain('Control limit reached');
   } finally { await context.close(); }
 });

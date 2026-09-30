@@ -200,6 +200,24 @@ describe('one fail-closed payload gateway', () => {
       expect((await run(data)).ok).toBe(false);
     }
   });
+  it('lists a control below a viewport capture without an image box, and still redacts its label', async () => {
+    const data = fixture();
+    data.observation.dom.elements.push(
+      { id: `${binding.observationId}_e2`, role: 'textbox', type: 'text', label: 'Phone 9876543210', sensitive: false, disabled: false, bounds: { x: 10, y: 400, width: 100, height: 20 } },
+      { id: `${binding.observationId}_e3`, role: 'textbox', type: 'password', label: 'Password', sensitive: true, disabled: false, bounds: { x: 10, y: 450, width: 100, height: 20 } });
+    const result = await run(data); if (!result.ok) throw new Error(result.blockedReasons.join(','));
+    const [visible, below, password] = result.request.elements;
+    expect(visible.bounds).toBeDefined();
+    expect(below).not.toHaveProperty('bounds');
+    expect(below.description).not.toContain('9876543210');
+    expect(password).toMatchObject({ description: 'Sensitive field' });
+    expect(password).not.toHaveProperty('bounds');
+  });
+  it('still refuses malformed control bounds wherever the control is', async () => {
+    const data = fixture();
+    data.observation.dom.elements[0].bounds = { x: 10, y: 400, width: -5, height: 20 };
+    expect((await run(data)).ok).toBe(false);
+  });
   it('blocks malformed bounds, missing tiles, unknown sources, missing required documents and truncation', async () => {
     const mutations = [
       (d: ReturnType<typeof fixture>) => { d.faces.result!.regions[0].bounds.width = 999; },

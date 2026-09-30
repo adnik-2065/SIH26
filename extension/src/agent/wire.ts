@@ -18,7 +18,9 @@ const RULES = [
   'To enter a stored value, put its value_* reference in "value". To enter ordinary public text, put the literal text in "value".',
   'Never put a password, one-time code, card number, or any personal identifier in "value".',
   'A credential field with filled=false is waiting for the user to type into it themselves. Wait (or finish the step) and observe again; never ask the user for the value.',
-  'Only the first page-touching step is performed; the page is then observed again. Prefer short sequences.',
+  'Steps that type into or select in fields all run against this observation, followed by at most one click, key press, scroll or navigate; the page is then observed again. Put the step that submits or moves the page last.',
+  'The screenshot shows only the visible part of the page. Elements listed without a box are further up or down the page: they can still be clicked by id, or scroll to see them.',
+  'To open a known address directly, use "navigate" with the full http(s) URL in "value" instead of clicking through several pages.',
 ].map((rule, index) => `${index + 1}. ${rule}`).join('\n');
 
 // Where a control sits in the attached screenshot, in the image's own pixels.
@@ -42,7 +44,7 @@ export function describePage(request: StepRequest) {
   const elements = request.elements.length
     ? request.elements.map(element => `- id=${element.id} role=${element.role} label="${element.description}"${
       element.filled !== undefined ? ` filled=${element.filled}` : ''}${
-      request.sanitizedImage && element.bounds ? ` ${describeBox(element.bounds, request.sanitizedImage.width, request.sanitizedImage.height)}` : ''}`).join('\n')
+      !request.sanitizedImage ? '' : element.bounds ? ` ${describeBox(element.bounds, request.sanitizedImage.width, request.sanitizedImage.height)}` : ' (outside the screenshot)'}`).join('\n')
     : '- (no interactive element was visible in this view)';
   const values = request.valueRefs.length
     ? `\n\nApproved stored values. Use the reference itself as "value"; the text is held on the device and is never shown here:\n${
@@ -69,7 +71,7 @@ export function describePage(request: StepRequest) {
     ss: request.sanitizedImage?.base64 ?? null,
     page_info: describePage(request),
     instruction: request.sanitizedInstruction,
-    problem_context: `Reply with {"thought": "...", "output": [{"action": "click|type|select|scroll|wait|finish", "id": ..., "className": null, "xpath": null, "value": ...}]}\n\nRules:\n${RULES}${report}${history}`,
+    problem_context: `Reply with {"thought": "...", "output": [{"action": "click|type|select|scroll|navigate|wait|finish", "id": ..., "className": null, "xpath": null, "value": ...}]}\n\nRules:\n${RULES}${report}${history}`,
     action_history: actionHistory,
   };
 }

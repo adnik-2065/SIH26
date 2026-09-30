@@ -27,6 +27,23 @@ describe('OpenRedaction-derived candidates', () => {
     expect(openRedactionCandidates('Please inspect the form')).toEqual([]);
     expect(openRedactionCandidates('test IBAN: GB82 WEST 1234 5698 7654 32')).toHaveLength(1);
   });
+  it('applies the engine\'s false-positive rules that judge the value itself', () => {
+    expect(openRedactionCandidates('Card: 0000 0000 0000 0000')).toEqual([]);
+    expect(openRedactionCandidates('Card: 4111 1111 1111 1111').map(s => s.kind)).toEqual(['payment_card']);
+  });
+  // The engine's other rules fire on a word anywhere in the \u00b150 character
+  // window: 'bar@' as test data, 'https://' as a code comment, 'on' as a date.
+  it.each(['Contact akbar@gmail.com', 'Visit https://lms.iitd.ac.in or mail asha.rao@gmail.com',
+    'Call me on +44 20 7946 0958'])('keeps "%s", which a window-word rule would discard', raw => {
+    expect(openRedactionCandidates(raw)).toHaveLength(1);
+  });
+  it('drops a match whose context score falls below the engine threshold', () => {
+    // 0.8, less 0.15 for code-like text, 0.15 for example wording and 0.05 for
+    // a technical word among the five before it, is 0.45; the same email in
+    // plain text scores 0.65.
+    expect(openRedactionCandidates('function const let var class import export return if else for while function const: mira@example.test')).toEqual([]);
+    expect(openRedactionCandidates('Contact mira@example.test')).toMatchObject([{ kind: 'email', confidence: .65 }]);
+  });
   it.each([
     ['email', 'mira@example.test'], ['phone', '9876543210'],
     ['aadhaar', 'Aadhaar: 2345 6789 0124'], ['payment_card', '4111 1111 1111 1111'],
@@ -112,6 +129,24 @@ describe('local document evidence and model boundary', () => {
       expect(plan.masks.some(m => m.bounds.y <= 80 && m.bounds.y + m.bounds.height >= 140)).toBe(true);
       for (const tile of data.observation.tiles) expect(tileMasks(plan.masks, tile).some(m => m.bounds.width >= 120)).toBe(true);
     });
+  it('judges a viewport capture\'s visual regions against the whole page and drops those off screen', () => {
+    const data = fixture();
+    data.observation.dom.viewport = { ...data.observation.dom.viewport, height: 200, scrollY: 1000 };
+    data.observation.captureBounds = { x: 0, y: 1000, width: 200, height: 200 };
+    data.observation.pageSize = { width: 200, height: 2000 };
+    data.observation.scope = 'viewport';
+    data.observation.dom.visualRegions = [
+      // Most of the screen, but a small part of the page: still a document.
+      { category: 'passport', confidence: .9, bounds: { x: 10, y: 20, width: 180, height: 160 } },
+      { category: 'signature', confidence: .9, bounds: { x: 20, y: 500, width: 60, height: 20 } },
+    ];
+    data.documents = detectLocalDocuments(data.observation, data.ocr.result!);
+    expect(data.documents.regions.map(r => r.category)).toEqual(['passport']);
+    expect(data.documents.regions[0].bounds).toEqual({ x: 10, y: 20, width: 180, height: 160 });
+    const plan = normalize(data, new Placeholders());
+    expect(plan.masks.some(m => m.bounds.y <= 20 && m.bounds.y + m.bounds.height >= 180 && m.bounds.width >= 180)).toBe(true);
+    expect(() => verifyMaskCoverage(data, plan.masks, plan.findings)).not.toThrow();
+  });
   it('bounds a document cue to its own lines in both policies, never the whole capture', () => {
     const data = fixture();
     data.ocr.result!.regions[0].text = 'passport number';
@@ -205,14 +240,15 @@ describe('context mode masks private values, not the whole page', () => {
     const plan = normalize(data, new Placeholders());
     expect(covers(plan.masks, data.observation.dom.elements[1].bounds)).toBe(true);
   });
-  // Words OCR read with low confidence on google.com: a microphone icon, Indic
-  // language links under the English model, and a stylised link.
-  it('masks a low-confidence OCR word only when it could be an identifier fragment', () => {
+  // Words OCR read with low confidence on google.com (a microphone icon, Indic
+  // language links under the English model, a stylised link) and on
+  // wikipedia.org (article counts). Only what OpenRedaction classifies is masked.
+  it('masks a low-confidence OCR word only when OpenRedaction classifies it', () => {
     const data = form();
-    const words = ['4', 'Ld', 'eet', 'pexwoge', 'Setings', 'birthday!', '98765', 'mira@exa', 'I234'];
+    const words = ['4', 'Ld', 'eet', 'pexwoge', 'Setings', 'birthday!', '2781', '000+', '8/88', 'mira@example.test'];
     data.ocr.result!.regions = words.map((text, i) => ({ kind: 'text', text, confidence: .2, bounds: { x: 120, y: 10 + i * 15, width: 60, height: 10 } }));
     const plan = normalize(data, new Placeholders());
-    expect(words.filter((_, i) => covers(plan.masks, data.ocr.result!.regions[i].bounds))).toEqual(['98765', 'mira@exa', 'I234']);
+    expect(words.filter((_, i) => covers(plan.masks, data.ocr.result!.regions[i].bounds))).toEqual(['mira@example.test']);
     expect(() => verifyMaskCoverage(data, plan.masks, plan.findings)).not.toThrow();
     data.ocrTextPolicy = 'all_text';
     const strict = normalize(data, new Placeholders());

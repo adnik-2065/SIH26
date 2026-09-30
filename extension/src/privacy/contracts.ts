@@ -92,6 +92,8 @@ export const ExportDataSchema = z.object({ binding: BindingSchema, observation: 
 export type ExportData = z.infer<typeof ExportDataSchema>;
 export type ExportResult = { ok: true; request: StepRequest; decision: 'safe' | 'safe_without_image';
   // `rewritten` counts text fields the final check repaired instead of refusing.
-  summary: { text: number; faces: number; documents: number; masks: number; rewritten: number }; withheldReasons: BlockReason[] }
+  summary: { text: number; faces: number; documents: number; masks: number; rewritten: number }; withheldReasons: BlockReason[];
+  // Wall time of each gateway stage in milliseconds, for the run log. Numbers only.
+  stages?: { pii: number; masking: number; verification: number; payload: number } }
   // `blockedDetails` carries the stage, cause and safe context for each reason.
   | { ok: false; blockedReasons: BlockReason[]; blockedDetails?: ExtensionError[] };

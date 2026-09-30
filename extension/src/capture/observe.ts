@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { CaptureCheckResponseSchema, CaptureSnapshotResponseSchema, PageChangedDetailSchema,
-  type CaptureObservation, type CaptureTile, type MutationSummary, type PageChangeReason } from '../contracts';
+  type CaptureObservation, type CaptureScope, type CaptureTile, type MutationSummary, type PageChangeReason } from '../contracts';
 import { captureTiles } from './tiles';
 import { compareCaptureStability, emptyMutationSummary, PageChangedError, pageChangedDetail } from './stability';
 import { CaptureError, captureError, CAPTURE_LIMITS } from './errors';
@@ -39,7 +39,7 @@ export interface CaptureEndContext { phase: 'NONE' | 'COLLECT' | 'CHECK'; steps:
 export async function observeTab(tabId: number, windowId: number, origin: string, observationId: string,
   check: () => void, signal?: AbortSignal,
   onTile: (tile: CaptureTile, index: number, count: number) => Promise<void> = async () => {},
-  onEnd?: (context: CaptureEndContext) => void): Promise<CaptureObservation> {
+  onEnd?: (context: CaptureEndContext) => void, scope: CaptureScope = 'viewport'): Promise<CaptureObservation> {
   const target = { tabId };
   const steps: string[] = [];
   const instrument: { phase: 'NONE' | 'COLLECT' | 'CHECK' } = { phase: 'NONE' };
@@ -148,19 +148,25 @@ export async function observeTab(tabId: number, windowId: number, origin: string
     // The panel can be clicked while Chrome is still animating it open. Measure
     // the pre-notice viewport only after that animation has settled; otherwise
     // the panel's inset gets mistaken for part of the debugging notice.
+    // A viewport exactly as the previous capture of this document settled it
+    // has already stopped animating, and later rounds skip the wait. The size
+    // is kept in the extension's isolated world, which the page cannot reach.
     await Promise.race([captureStep(() => chrome.scripting.executeScript({ target, func: async function waitForStableViewport() {
       const started = performance.now();
+      const settled = globalThis as { sih26SettledViewport?: string };
       let last = `${innerWidth}:${innerHeight}:${devicePixelRatio}`, stableSince = started;
-      while (performance.now() - stableSince < 150 && performance.now() - started < 1500) {
+      const known = last === settled.sih26SettledViewport;
+      while (!known && performance.now() - stableSince < 150 && performance.now() - started < 1500) {
         await new Promise(resolve => setTimeout(resolve, 50));
         const next = `${innerWidth}:${innerHeight}:${devicePixelRatio}`;
         if (next !== last) { last = next; stableSince = performance.now(); }
       }
+      settled.sih26SettledViewport = last;
     } })), interrupted]);
     current();
     const prepared = z.union([z.object({ ok: z.literal(true) }).strict(),
       z.object({ error: z.literal('PAGE_CHANGED'), detail: PageChangedDetailSchema }).strict()])
-      .parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'PREPARE_CAPTURE', observationId }, { frameId: 0 })));
+      .parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'PREPARE_CAPTURE', observationId, scope }, { frameId: 0 })));
     if ('error' in prepared) throw new PageChangedError(prepared.detail);
     steps.push('PREPARE_CAPTURE');
     current();
@@ -196,13 +202,22 @@ export async function observeTab(tabId: number, windowId: number, origin: string
     motionPaused = true;
     current();
     const domStart = performance.now();
-    const before = CaptureSnapshotResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'COLLECT', observationId }, { frameId: 0 })));
+    const before = CaptureSnapshotResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'COLLECT', observationId, scope }, { frameId: 0 })));
     steps.push('COLLECT');
     // The DOM snapshot exists; the tiles are still being delivered.
     instrument.phase = 'COLLECT';
     const domMs = performance.now() - domStart;
     const layout = LayoutSchema.parse(await command('Page.getLayoutMetrics'));
-    const captureBounds = { x: 0, y: 0, width: Math.ceil(layout.cssContentSize.width), height: Math.ceil(layout.cssContentSize.height) };
+    const pageSize = { width: Math.ceil(layout.cssContentSize.width), height: Math.ceil(layout.cssContentSize.height) };
+    // A viewport capture photographs the screen at the reviewed scroll
+    // position: one image instead of a tiled document, so every detector reads
+    // a fraction of the pixels. It takes the same native full-surface path as
+    // a page tile, clipped at the scroll offset; DOM geometry maps into it
+    // through the same captureBounds offset.
+    const { scrollY, height: viewportHeight } = before.snapshot.viewport;
+    const top = Math.min(Math.max(0, Math.round(scrollY)), pageSize.height - 1);
+    const captureBounds = scope === 'page' ? { x: 0, y: 0, ...pageSize }
+      : { x: 0, y: top, width: pageSize.width, height: Math.max(1, Math.min(Math.ceil(viewportHeight), pageSize.height - top)) };
     const dpr = before.snapshot.viewport.devicePixelRatio;
     let imageWidth = Math.round(captureBounds.width * dpr);
     const imageHeight = Math.round(captureBounds.height * dpr);
@@ -221,7 +236,7 @@ export async function observeTab(tabId: number, windowId: number, origin: string
       const { data } = ScreenshotSchema.parse(await command('Page.captureScreenshot', {
         format: 'png', fromSurface: true, captureBeyondViewport: true,
         // Convert image pixels to CDP's device-independent clip coordinates.
-        clip: { x: 0, y: tile.y * zoom / dpr, width: Math.ceil(captureBounds.width * zoom),
+        clip: { x: 0, y: (captureBounds.y + tile.y / dpr) * zoom, width: Math.ceil(captureBounds.width * zoom),
           height: tile.height * zoom / dpr, scale: 1 },
       }));
       const size = pngSize(data);
@@ -264,7 +279,7 @@ export async function observeTab(tabId: number, windowId: number, origin: string
     // Every tile was delivered; only the final stability comparison remains.
     instrument.phase = 'CHECK';
     await active();
-    const checked = CaptureCheckResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'CHECK', observationId }, { frameId: 0 })));
+    const checked = CaptureCheckResponseSchema.parse(await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'CHECK', observationId, scope }, { frameId: 0 })));
     current();
     if ('error' in checked) throw new PageChangedError(checked.detail);
     steps.push('CHECK');
@@ -285,7 +300,7 @@ export async function observeTab(tabId: number, windowId: number, origin: string
     }
     await captureStep(() => chrome.tabs.sendMessage(tabId, { type: 'FINISH_CAPTURE', observationId }, { frameId: 0 }));
     current();
-    return { dom: checked.snapshot, captureBounds, imageWidth, imageHeight, tileCount: tiles.length, capturedAt,
+    return { dom: checked.snapshot, captureBounds, pageSize, scope, imageWidth, imageHeight, tileCount: tiles.length, capturedAt,
       captureMs: performance.now() - started, domMs };
   } finally {
     onEnd?.({ phase: instrument.phase, steps: [...steps], signalAborted: signal?.aborted === true });

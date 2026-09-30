@@ -30,6 +30,8 @@ beforeEach(async () => {
   vi.stubGlobal('__reviewedControl', element());
   vi.stubGlobal('window', { addEventListener: (event: string, callback: () => void) => {
     handlers.set(event, [...(handlers.get(event) ?? []), callback]);
+  }, removeEventListener: (event: string, callback: () => void) => {
+    handlers.set(event, (handlers.get(event) ?? []).filter(handler => handler !== callback));
   } });
   vi.stubGlobal('document', { documentElement: {}, body: {}, querySelectorAll: () => [], getElementsByTagName: () => [] });
   vi.stubGlobal('Node', { ELEMENT_NODE: 1 });

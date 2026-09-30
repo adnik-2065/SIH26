@@ -1,15 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
+import { PanelEventSchema, TaskStateSchema, type CaptureScope, type CaptureTile, type ErrorCode, type LocalObservation, type TaskState } from '../contracts';
 import { CAPTURE_RETRY_BACKOFF_MS, CAPTURE_RETRY_LIMIT, initialState, lifecycleStateLog, newActionHistory, newLoopTracker, nextCaptureRetry, nextRound, recordActionHistory, resetActionHistory, roundVerdict, RUN_LIMIT, type ActionHistoryEntry } from '../agent/lifecycle';
-import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
+import { ocrLanes, TesseractPool, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
 import { inspectSmallFaces } from '../vision/face/small';
 import { inspectCapturedPage } from '../vision/page';
 import { validateDeliveredTiles } from '../capture/tiles';
 import { AGENT_ENDPOINT, runtimePermissions, validateAgentEndpoint } from '../config';
 import { advance, beginRun, type RunStage, type RunState } from '../agent/run';
-import { inspectDocumentTiles, type DocumentEvidence } from '../vision/documents';
+import { inspectDocumentTiles, type Detections, type DocumentEvidence } from '../vision/documents';
+import { ResultCache } from '../vision/reuse';
+import { formatRoundRuntime, formatRoundTimings, formatRoundWork, markDetector, markStage, newDetectorRuntime, newRoundClock, resetRuntime } from '../metrics/timings';
 import { OnnxDocumentAdapter } from '../vision/documents/onnx';
 import { PagePreview } from './preview';
 import { PrivacyReview } from '../privacy/review';
@@ -93,6 +95,30 @@ function App() {
   const retriedGeneration = useRef<number | undefined>(undefined);
   const retries = useRef(0);
   const retryReasons = useRef<string[]>([]);
+  // Detector results for pixels already inspected, one cache per detector. They
+  // hold page text, so they live only as long as the run and its adapters.
+  const reuseRef = useRef({ text: new ResultCache<PerceptionResult>(), faces: new ResultCache<PerceptionResult>(),
+    smallFaces: new ResultCache<PerceptionResult['regions']>(), documents: new ResultCache<Detections>() });
+  const clearReuse = () => Object.values(reuseRef.current).forEach(cache => cache.clear());
+  // Stage times for the round in progress, reported once in the run log.
+  const roundClockRef = useRef(newRoundClock());
+  const logRoundTimings = (finished: number) => {
+    const clock = roundClockRef.current;
+    if (clock.marks.CAPTURING !== undefined) {
+      addLog('info', formatRoundTimings(finished, clock, performance.now()));
+      const work = (cache: { hits: number; misses: number; skips: number }) => ({ runs: cache.misses, reused: cache.hits, skipped: cache.skips });
+      const { text, faces, smallFaces, documents } = reuseRef.current;
+      addLog('info', formatRoundWork(finished, clock, { ocr: work(text), faces: work(faces), smallFaces: work(smallFaces), documents: work(documents) }));
+      addLog('info', formatRoundRuntime(finished, {
+        ocr: { workers: adapterRef.current?.lanes ?? 1, runtime: adapterRef.current?.runtime ?? newDetectorRuntime() },
+        faces: { workers: 1, runtime: faceAdapterRef.current?.runtime ?? newDetectorRuntime() },
+        documents: { workers: 1, runtime: documentAdapterRef.current?.runtime ?? newDetectorRuntime() } }));
+    }
+    Object.values(reuseRef.current).forEach(cache => cache.resetCounts());
+    adapterRef.current?.resetRuntime();
+    [faceAdapterRef.current?.runtime, documentAdapterRef.current?.runtime].forEach(runtime => runtime && resetRuntime(runtime));
+    roundClockRef.current = newRoundClock();
+  };
   const [runNotice, setRunNotice] = useState('');
   const [runId, setRunId] = useState<string>();
   const [runStage, setRunStage] = useState<RunStage>('IDLE');
@@ -133,13 +159,13 @@ function App() {
   const [ocrError, setOcrError] = useState('');
   const [progress, setProgress] = useState<OcrProgress>();
   const [selected, setSelected] = useState<number>();
-  const [ocrAdapter, setOcrAdapter] = useState<TesseractAdapter>();
+  const [ocrAdapter, setOcrAdapter] = useState<TesseractPool>();
   const [showText, setShowText] = useState(true);
   const [showControls, setShowControls] = useState(false);
   const [fullSize, setFullSize] = useState(false);
   const [retry, setRetry] = useState(0);
   const controllerRef = useRef<AbortController | null>(null);
-  const adapterRef = useRef<TesseractAdapter | null>(null);
+  const adapterRef = useRef<TesseractPool | null>(null);
   const ocrSectionRef = useRef({ index: 0, count: 1 });
   const faceAdapterRef = useRef<MediaPipeAdapter | null>(null);
   const documentAdapterRef = useRef<OnnxDocumentAdapter | null>(null);
@@ -196,7 +222,7 @@ function App() {
         next.status === 'stopped' ? 'the task was stopped' : `the worker published generation ${next.generation}${next.error ? ` after ${next.error}` : ''}`); setObservation(undefined); captureTilesRef.current = []; setCaptureProgress(undefined);
     }
     stateRef.current = next; setState(next);
-    if (next.status === 'stopped') { adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setInstruction(''); }
+    if (next.status === 'stopped') { adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); clearReuse(); setInstruction(''); }
   };
 
   useEffect(() => {
@@ -227,6 +253,7 @@ function App() {
             return;
           }
           stage('DETECTING');
+          roundClockRef.current.capture = { scope: info.scope ?? 'page', screenshots: info.tileCount, domMs: info.domMs, captureMs: info.captureMs };
           setObservation({ ...info, tiles });
         }
       }
@@ -247,10 +274,29 @@ function App() {
     const dispose = (event?: Event) => {
       if (controllerRef.current) abortWith(controllerRef.current, event?.type === 'pagehide' ? 'pagehide' : 'panel_unmount',
         event?.type === 'pagehide' ? 'the panel document was hidden' : 'the panel unmounted', { runId: runIdRef.current, scope: 'detections' });
-      adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); };
+      adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); clearReuse(); };
     window.addEventListener('pagehide', dispose);
     return () => { chrome.runtime.onMessage.removeListener(listener); window.removeEventListener('pagehide', dispose); dispose(); };
   }, []);
+
+  // The text engines are created on first use and kept across rounds.
+  function textAdapter() {
+    if (!adapterRef.current) {
+      adapterRef.current = new TesseractPool(ocrLanes(), p => {
+        const { index, count } = ocrSectionRef.current;
+        setProgress(p.status === 'recognizing text' ? { ...p, progress: (index + p.progress) / count } : p);
+      });
+      setOcrAdapter(adapterRef.current);
+    }
+    return adapterRef.current;
+  }
+
+  // Load the models while the task is typed and the page captured, not after.
+  function warmModels() {
+    textAdapter().warm();
+    (faceAdapterRef.current ??= new MediaPipeAdapter()).warm();
+    (documentAdapterRef.current ??= new OnnxDocumentAdapter()).warm();
+  }
 
   useEffect(() => {
     if (!observation) return;
@@ -261,13 +307,7 @@ function App() {
     setOcrBusy(true); setOcr(undefined); setOcrError(''); setProgress(undefined); setSelected(undefined);
     setFaceBusy(true); setFaces(undefined); setFaceError(''); setSelectedFace(undefined); setQuery('');
     ocrSectionRef.current = { index: 0, count: 1 };
-    if (!adapterRef.current) {
-      adapterRef.current = new TesseractAdapter(p => {
-        const { index, count } = ocrSectionRef.current;
-        setProgress(p.status === 'recognizing text' ? { ...p, progress: (index + p.progress) / count } : p);
-      });
-      setOcrAdapter(adapterRef.current);
-    }
+    textAdapter();
     faceAdapterRef.current ??= new MediaPipeAdapter();
     documentAdapterRef.current ??= new OnnxDocumentAdapter();
     // Decode only the current capture tile in each pipeline.
@@ -277,13 +317,16 @@ function App() {
         const adapter = kind === 'text' ? adapterRef.current! : faceAdapterRef.current!;
         const update = (result: PerceptionResult) => { if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); } };
         const page = await inspectCapturedPage(observation, adapter, controller.signal, update,
-          (index, count) => { if (kind === 'text') ocrSectionRef.current = { index, count }; });
+          (index, count) => { if (kind === 'text') ocrSectionRef.current = { index, count }; }, kind === 'text' ? reuseRef.current.text : reuseRef.current.faces);
         // Small pictures get a second, enlarged look for faces. It only adds
         // regions: if it fails, the page pass result stands on its own.
         const result = kind === 'face' && current()
-          ? await inspectSmallFaces(observation, adapter, controller.signal, page).catch(reason => { if (controller.signal.aborted) throw reason; return page; })
+          ? await inspectSmallFaces(observation, adapter, controller.signal, page, reuseRef.current.smallFaces).catch(reason => { if (controller.signal.aborted) throw reason; return page; })
           : page;
-        if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); }
+        if (current()) {
+          markDetector(roundClockRef.current, kind === 'text' ? 'ocr' : 'faces', performance.now());
+          if (kind === 'text') setOcr(result); else setFaces(result);
+        }
       } catch (reason) {
 
         if (current()) {
@@ -298,8 +341,8 @@ function App() {
     setDocumentBusy(true); setDocuments(undefined); setDocumentError('');
     const inspectDocuments = async () => {
       try {
-        const result = await inspectDocumentTiles(observation, documentAdapterRef.current!, controller.signal);
-        if (current()) setDocuments(result);
+        const result = await inspectDocumentTiles(observation, documentAdapterRef.current!, controller.signal, reuseRef.current.documents);
+        if (current()) { markDetector(roundClockRef.current, 'documents', performance.now()); setDocuments(result); }
       } catch (reason) {
         if (current()) {
           const failure = reason as { reason?: string; detail?: { code?: string; message?: string } };
@@ -322,6 +365,7 @@ function App() {
   const stage = (next: RunStage) => {
     if (!runRef.current) return;
     runRef.current = advance(runRef.current, next, { log: entry => addLog('info', `[${entry.runId}] ${entry.message}`) });
+    markStage(roundClockRef.current, next, performance.now());
     setRunStage(runRef.current.stage);
   };
   function startRun() {
@@ -341,6 +385,7 @@ function App() {
     actionHistoryRef.current = resetActionHistory();
     loopTrackerRef.current = newLoopTracker();
     setRoundGeneration(undefined); retriedGeneration.current = undefined; retries.current = 0; retryReasons.current = [];
+    clearReuse(); roundClockRef.current = newRoundClock();
     runIdRef.current = outcome.run.runId; setRunId(outcome.run.runId); setLastFailure(undefined);
     addLog('info', `Run ${outcome.run.runId} started.`);
     void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE');
@@ -352,18 +397,25 @@ function App() {
     // ends an access wait and any in-flight recovery with it.
     accessWaitRef.current = false;
     recoveringAccessRef.current = false;
+    if (runRef.current) logRoundTimings(round);
     stage(failure ? 'FAILED' : /stopped|cancel/i.test(notice) ? 'CANCELLED' : 'COMPLETED');
     setAutoRun(false); setRunNotice(notice); setLastFailure(failure);
     addLog(failure ? 'error' : 'info', failure ? `${notice} [${failure.code} at ${failure.stage}]` : notice);
   }
 
-  async function command(type: 'START' | 'OBSERVE' | 'STOP'): Promise<ErrorCode | undefined> {
+  // Agent rounds photograph the visible screen; a scan the user asks for from
+  // the panel reads the whole page for review.
+  async function command(type: 'START' | 'OBSERVE' | 'STOP', scope: CaptureScope = 'viewport'): Promise<ErrorCode | undefined> {
     setError(''); captureTilesRef.current = []; setCaptureProgress(undefined);
     if (type !== 'STOP') stage('CAPTURING');
-    if (type === 'STOP') { stopPending.current = true; clearDetections('user_cancel', 'the user stopped the task'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
-    else { stopPending.current = false; clearDetections('task_restart', `a new ${type} scan was requested`); setObservation(undefined); }
+    if (type === 'STOP') { stopPending.current = true; clearDetections('user_cancel', 'the user stopped the task'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); clearReuse(); setObservation(undefined); }
+    else {
+      stopPending.current = false; clearDetections('task_restart', `a new ${type} scan was requested`); setObservation(undefined);
+      warmModels();
+    }
     try {
-      const response = await chrome.runtime.sendMessage(type === 'START' ? { type, instruction: instruction.trim() || 'Read visible page text' } : { type });
+      const response = await chrome.runtime.sendMessage(type === 'START' ? { type, instruction: instruction.trim() || 'Read visible page text', scope }
+        : type === 'OBSERVE' ? { type, scope } : { type });
       const parsed = TaskStateSchema.safeParse(response?.state);
       // The generation the worker accepted this command at is what later marks
       // an error as this round's own. It is recorded even when the panel keeps
@@ -536,7 +588,7 @@ function App() {
   const openDetail = (view: DetailView) => { setDetailView(view); setMenuOpen(false); };
   const togglePreview = (checked: boolean) => {
     previewRef.current = checked; setPreview(checked);
-    if (!checked) { captureTilesRef.current = []; clearDetections('user_cancel', 'local analysis was switched off'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); setObservation(undefined); }
+    if (!checked) { captureTilesRef.current = []; clearDetections('user_cancel', 'local analysis was switched off'); adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); clearReuse(); setObservation(undefined); }
   };
   // The dot never reports success while something needs attention: a green dot
   // over "A fresh capture is needed" is the kind of detail that makes a panel
@@ -577,7 +629,7 @@ function App() {
         <form className={`composer${taskRunning ? ' is-running' : ''}`} onSubmit={event => { event.preventDefault(); if (!taskRunning) startRun(); }}>
           <label className="sr-only" htmlFor="instruction">What should be done on this page?</label>
           <textarea id="instruction" maxLength={2000} value={instruction} disabled={taskRunning} rows={3}
-            onChange={event => setInstruction(event.target.value)}
+            onChange={event => setInstruction(event.target.value)} onFocus={warmModels}
             onKeyDown={event => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); if (!taskRunning) startRun(); } }}
             placeholder="Ask SIH26 to do something on this page…" />
           <div className="composer-bar">
@@ -611,7 +663,7 @@ function App() {
         <div className="status" role="status" aria-live="polite"><span className={`dot ${dot}`} />{status}</div>
         <div className="scan-actions">
           <button type="button" className="btn primary scan-action" disabled={busy}
-            onClick={() => void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE')}><Glyph name="scan" />{scanLabel}</button>
+            onClick={() => void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE', 'page')}><Glyph name="scan" />{scanLabel}</button>
           <button type="button" className="btn stop" title="Stop and clear this run"
             onClick={() => { stopRun('Stopped.'); void command('STOP'); }}><Glyph name="square" /><span className="stop-label">Stop</span></button>
         </div>
@@ -713,6 +765,7 @@ function App() {
             const next = nextRound(round, RUN_LIMIT);
             if (!next.continue) { stopRun(next.notice); return; }
             setRound(next.round);
+            logRoundTimings(round);
             addLog('info', `Round ${round} done. Observing the page again.`);
             void command('OBSERVE');
           }} />
@@ -783,7 +836,7 @@ function App() {
               <input type="checkbox" checked={preview} onChange={event => togglePreview(event.target.checked)} />
               <span><strong>Local page analysis</strong><small>Read text, locate faces and detect documents on this device.</small></span>
             </label>
-            <button type="button" className="btn" disabled={busy} onClick={() => { setDetailView(undefined); void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE'); }}>{scanLabel}</button>
+            <button type="button" className="btn" disabled={busy} onClick={() => { setDetailView(undefined); void command(!state.taskId || state.status === 'stopped' ? 'START' : 'OBSERVE', 'page'); }}>{scanLabel}</button>
             <dl className="meta-list">
               <div><dt>Connected page</dt><dd>{state.origin || 'None'}</dd></div>
               <div><dt>Task state</dt><dd>{state.status}</dd></div>

@@ -1,9 +1,14 @@
+import type { CaptureScope } from '../contracts';
+import { onScreen } from './observe';
 // Native lazy images can be decoded without scrolling. Restore their loading
 // attributes afterwards; site-specific infinite-scroll/data-src loaders are not
-// executed by the extension.
-export async function prepareImages(signal: AbortSignal, markExtensionMutation: (image: HTMLImageElement) => void = () => {}): Promise<void> {
+// executed by the extension. A viewport capture photographs one screen, so
+// only the images on it are loaded.
+export async function prepareImages(signal: AbortSignal, markExtensionMutation: (image: HTMLImageElement) => void = () => {},
+  scope: CaptureScope = 'page'): Promise<void> {
   const images = Array.from(document.querySelectorAll<HTMLImageElement>('img[loading]'))
     .filter(image => image.loading === 'lazy' && !image.complete && !!(image.currentSrc || image.getAttribute('src')))
+    .filter(image => scope === 'page' || onScreen(image.getBoundingClientRect()))
     .map(image => ({ image, loading: image.getAttribute('loading')! }));
   if (!images.length) return;
   let rejectWait!: (error: Error) => void;

@@ -1,4 +1,4 @@
-import type { DomSnapshot, ObservedElement } from '../contracts';
+import type { CaptureScope, DomSnapshot, ObservedElement } from '../contracts';
 import { collectVisualRegions } from './visuals';
 
 // Rich-text editors (comment boxes, chat composers, mail bodies) are
@@ -112,10 +112,19 @@ export function available(el: HTMLElement) {
     documentBottom > 0 && documentRight > 0 &&
     documentTop < documentHeight && documentLeft < documentWidth;
 }
-export function collect(observationId: string, documentId: string, revision: number, refs: Map<string, HTMLElement>): DomSnapshot {
+// A viewport capture photographs one screen, so only the controls in that band
+// need a place in the budget to keep redaction complete. Those are always
+// described, or the observation is marked truncated; the rest of the budget
+// goes to the nearest controls above and below, which can still be scrolled to
+// or clicked by id. A full-page capture keeps the document-order rule.
+export const onScreen = (rect: DOMRect) => rect.bottom > -2 && rect.top < innerHeight + 2;
+const screenDistance = (rect: DOMRect) => rect.bottom <= 0 ? -rect.bottom : Math.max(0, rect.top - innerHeight);
+const CONTROL_LIMIT = 200;
+const linkLike = 'a[href],button,[role="button"],[role="option"],[role="listbox"] > *';
+export function collect(observationId: string, documentId: string, revision: number, refs: Map<string, HTMLElement>,
+  scope: CaptureScope = 'page'): DomSnapshot {
   refs.clear();
   let hiddenCount = 0;
-  const elements: ObservedElement[] = [];
   // Elements already examined by the base pass — described or counted hidden —
   // so suggestion candidates never duplicate a base candidate and a listbox
   // never yields an option and its wrapper. Insertion order keeps the
@@ -123,11 +132,52 @@ export function collect(observationId: string, documentId: string, revision: num
   const elsMap = new Set<HTMLElement>();
   let truncated = false;
   const all = Array.from(document.querySelectorAll<HTMLElement>(candidates));
-  for (const el of all.slice(0, 2000)) {
+  const scanLimit = scope === 'viewport' ? 20_000 : 2000;
+  const base: Array<{ el: HTMLElement; rect: DOMRect }> = [];
+  for (const el of all.slice(0, scanLimit)) {
     elsMap.add(el);
-    const r = el.getBoundingClientRect();
     if (!available(el)) { hiddenCount++; continue; }
-    if (elements.length >= 200) { truncated = true; continue; }
+    base.push({ el, rect: el.getBoundingClientRect() });
+  }
+  // Suggestion candidates join the same observation: one scan, one shared
+  // 200-element budget, one id sequence. Nothing already exposed by the base
+  // pass is dropped, hidden or renumbered — the ids below begin where the
+  // base ids end, so every existing candidate keeps its exact id.
+  const suggested: Array<{ el: HTMLElement; rect: DOMRect }> = [];
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>(suggestionSelector))) {
+    if (elsMap.has(el)) continue; // already examined by the base pass
+    if (!available(el)) { hiddenCount++; continue; }
+    elsMap.add(el);
+    suggested.push({ el, rect: el.getBoundingClientRect() });
+  }
+  let chosen: Set<HTMLElement>;
+  let omittedOnScreen = 0;
+  if (scope === 'viewport') {
+    let visible = [...base, ...suggested].filter(item => onScreen(item.rect));
+    const rest = [...base, ...suggested].filter(item => !onScreen(item.rect))
+      .sort((a, b) => screenDistance(a.rect) - screenDistance(b.rect));
+    if (visible.length > CONTROL_LIMIT) {
+      // A screen dense with links (an encyclopedia article) can hold more than
+      // the budget. Every control that can hold a user value is kept; if those
+      // alone overflow, the observation is truncated as before.
+      const holdsValue = visible.filter(item => !item.el.matches(linkLike));
+      if (holdsValue.length > CONTROL_LIMIT) truncated = true;
+      visible = [...holdsValue, ...visible.filter(item => item.el.matches(linkLike))];
+      omittedOnScreen = visible.length - CONTROL_LIMIT;
+    }
+    chosen = new Set([...visible, ...rest].slice(0, CONTROL_LIMIT).map(item => item.el));
+    // Controls off the photographed screen that did not fit are omitted, as
+    // hidden ones are; there is nothing of them in the image to redact.
+    hiddenCount += base.length + suggested.length - chosen.size;
+    truncated ||= all.length > scanLimit;
+  } else {
+    const ordered = [...base, ...suggested];
+    chosen = new Set(ordered.slice(0, CONTROL_LIMIT).map(item => item.el));
+    truncated = ordered.length > CONTROL_LIMIT || all.length > scanLimit;
+  }
+  const elements: ObservedElement[] = [];
+  for (const { el, rect: r } of base) {
+    if (!chosen.has(el)) continue;
     const type = controlType(el);
     const sensitive = sensitiveControl(el);
     const id = `${observationId}_e${elements.length + 1}`;
@@ -139,17 +189,8 @@ export function collect(observationId: string, documentId: string, revision: num
       bounds: { x: r.x, y: r.y, width: r.width, height: r.height },
     });
   }
-  // Suggestion candidates join the same observation: one scan, one shared
-  // 200-element budget, one id sequence. Nothing already exposed by the base
-  // pass is dropped, hidden or renumbered — the ids below begin where the
-  // base ids end, so every existing candidate keeps its exact id.
-  const suggestions = document.querySelectorAll<HTMLElement>(suggestionSelector);
-  for (const el of Array.from(suggestions)) {
-    if (elements.length >= 200) { truncated = true; break; }
-    if (elsMap.has(el)) continue; // already examined by the base pass
-    if (!available(el)) { hiddenCount++; continue; }
-    elsMap.add(el);
-    const r = el.getBoundingClientRect();
+  for (const { el, rect: r } of suggested) {
+    if (!chosen.has(el)) continue;
     const id = `${observationId}_e${elements.length + 1}`;
     refs.set(id, el);
     elements.push({ id, type: 'option', sensitive: false, filled: false, credential: false,
@@ -162,9 +203,10 @@ export function collect(observationId: string, documentId: string, revision: num
       bounds: { x: r.x, y: r.y, width: r.width, height: r.height },
     });
   }
-  const visuals = collectVisualRegions();
+  const visuals = collectVisualRegions(scope);
   return { observationId, documentId, revision, origin: location.origin, elements, hiddenCount,
-    visualRegions: visuals.regions, truncated: truncated || visuals.truncated || all.length > 2000,
+    visualRegions: visuals.regions, truncated: truncated || visuals.truncated,
+    ...(omittedOnScreen ? { omittedOnScreen } : {}),
     viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY, devicePixelRatio,
       visualScale: visualViewport?.scale || 1, offsetX: visualViewport?.offsetLeft || 0, offsetY: visualViewport?.offsetTop || 0 },
   };

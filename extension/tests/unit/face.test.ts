@@ -90,4 +90,18 @@ describe('MediaPipe worker lifecycle', () => {
     expect(frame.image.close).toHaveBeenCalledOnce();
     expect(FakeWorker.instances[0].terminate).toHaveBeenCalledOnce();
   });
+  it('warms the detector ahead of a scan and records only well-formed runtime reports', async () => {
+    const adapter = new MediaPipeAdapter();
+    input(); adapter.warm();
+    expect(FakeWorker.instances[0].postMessage).toHaveBeenCalledWith({ type: 'warm', assetRoot: 'chrome-extension://test/vision' });
+    const first = adapter.inspect(input(), new AbortController().signal);
+    expect(FakeWorker.instances).toHaveLength(1);
+    FakeWorker.instances[0].reply({ type: 'result', result: result(), runtime: { backend: 'wasm', loadMs: 350, waitMs: 0, inferenceMs: 480 } });
+    await first;
+    const second = adapter.inspect(input(), new AbortController().signal);
+    FakeWorker.instances[0].reply({ type: 'result', result: result(), runtime: { backend: 'wasm', loadMs: 'slow' } });
+    await expect(second).resolves.toEqual(result());
+    expect(adapter.runtime).toMatchObject({ loadMs: 350, waitMs: 0, inferenceMs: 480, runs: 1 });
+    adapter.dispose();
+  });
 });

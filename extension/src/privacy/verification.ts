@@ -1,8 +1,8 @@
-import type { LocalObservation } from '../contracts';
+import type { LocalObservation, Rect } from '../contracts';
 import { PerceptionResultSchema, type PerceptionAdapter } from '../vision/contracts';
 import { openRedactionCandidates } from './openredaction';
 import { PrivacyError, type ExportData, type Finding, type Mask, type StepRequest } from './contracts';
-import { domBounds } from './geometry';
+import { pageFrame, visibleDomBounds } from './geometry';
 import { compactKinds, reconstructOcr, textChunks } from './normalize';
 import { controlIsMasked, visualIsMasked, visualRegionIsEvidence } from './policy';
 
@@ -11,11 +11,12 @@ export function verifyMaskCoverage(data: ExportData, masks: Mask[], findings: Fi
   const expected = [...ocrBoxes, ...data.faces.result!.regions, ...data.documents.regions].map(r => r.bounds);
   expected.push(...findings.filter(finding => finding.redactPixels && finding.bounds).map(finding => finding.bounds!));
   const policy = data.ocrTextPolicy ?? 'all_text';
-  expected.push(...data.observation.dom.elements.filter(e => controlIsMasked(e, policy))
-    .map(e => domBounds(e.bounds, data.observation)));
+  // Only what the image shows can be expected under a mask.
+  const visible = (bounds: Rect) => visibleDomBounds(bounds, data.observation) ?? [];
+  expected.push(...data.observation.dom.elements.filter(e => controlIsMasked(e, policy)).flatMap(e => visible(e.bounds)));
   expected.push(...(data.observation.dom.visualRegions ?? [])
-    .filter(r => visualIsMasked(r.category, policy) && visualRegionIsEvidence(r.bounds, data.observation.captureBounds))
-    .map(r => domBounds(r.bounds, data.observation)));
+    .filter(r => visualIsMasked(r.category, policy) && visualRegionIsEvidence(r.bounds, pageFrame(data.observation)))
+    .flatMap(r => visible(r.bounds)));
   for (const box of expected) if (!masks.some(({ bounds: b }) => b.x <= box.x && b.y <= box.y &&
     b.x + b.width >= box.x + box.width && b.y + b.height >= box.y + box.height)) throw new PrivacyError('VERIFICATION_FAILED');
 }

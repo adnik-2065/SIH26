@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { normalizeNavigationUrl, NAVIGATION_URL_MAX } from './agent/navigation';
 
 const id = z.string().min(1).max(100).regex(/^[a-zA-Z0-9_-]+$/);
 const target = { target: id };
@@ -26,6 +27,11 @@ export const ActionSchema = z.discriminatedUnion('type', [
   // with no id; the executor performs what the user's own Back button would,
   // and the existing navigation pipeline supplies the fresh observation.
   z.object({ type: z.literal('back') }).strict(),
+  // Open an address directly instead of clicking through the pages that lead
+  // to it. Element-free; only a normalized http(s) URL is representable, and
+  // the worker applies the origin rule in agent/navigation.ts before it acts.
+  z.object({ type: z.literal('navigate'), url: z.string().min(1).max(NAVIGATION_URL_MAX)
+    .refine(url => normalizeNavigationUrl(url) === url) }).strict(),
   z.object({ type: z.literal('done') }).strict(),
 ]);
 export type Action = z.infer<typeof ActionSchema>;
@@ -36,7 +42,7 @@ export const ActionResponseSchema = z.object({ ...envelope, action: ActionSchema
 // `className`/`xpath` are tolerated on the wire and ignored, because a selector
 // invented from a redacted screenshot would reach controls no reviewer saw.
 export const AgentStepSchema = z.object({
-  action: z.enum(['click', 'type', 'select', 'scroll', 'wait', 'finish', 'key', 'keypress', 'back']),
+  action: z.enum(['click', 'type', 'select', 'scroll', 'wait', 'finish', 'key', 'keypress', 'back', 'navigate']),
   id: z.string().max(100).nullable().optional(),
   className: z.string().max(300).nullable().optional(),
   xpath: z.string().max(1000).nullable().optional(),
@@ -121,6 +127,10 @@ export const AbortReasonSchema = z.object({
 }).strict();
 export type AbortReason = z.infer<typeof AbortReasonSchema>;
 
+// 'viewport' photographs the screen the user is looking at; 'page' the whole
+// document in tiles. A scroll action brings the rest of a page into view.
+export const CaptureScopeSchema = z.enum(['viewport', 'page']);
+export type CaptureScope = z.infer<typeof CaptureScopeSchema>;
 export const RectSchema = z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).strict();
 // The geometry a reviewed observation recorded for a control, shared by the
 // panel→background and background→content ACT messages. One schema for both
@@ -135,8 +145,8 @@ export const ExpectSchema = z.object({ role: z.string().max(50), bounds: RectSch
     height: z.number().positive().finite() }).strict().optional() }).strict().optional();
 export const PanelCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('STATUS') }).strict(),
-  z.object({ type: z.literal('START'), instruction: z.string().trim().min(1).max(2000) }).strict(),
-  z.object({ type: z.literal('OBSERVE') }).strict(),
+  z.object({ type: z.literal('START'), instruction: z.string().trim().min(1).max(2000), scope: CaptureScopeSchema.optional() }).strict(),
+  z.object({ type: z.literal('OBSERVE'), scope: CaptureScopeSchema.optional() }).strict(),
   z.object({ type: z.literal('STOP') }).strict(),
   // The panel owns the observation and the review, so it is the only caller
   // allowed to ask for execution. The worker still re-checks its own state.
@@ -146,10 +156,10 @@ export const PanelCommandSchema = z.discriminatedUnion('type', [
     expect: ExpectSchema }).strict(),
 ]);
 export const ContentCommandSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('PREPARE_CAPTURE'), observationId: id }).strict(),
+  z.object({ type: z.literal('PREPARE_CAPTURE'), observationId: id, scope: CaptureScopeSchema.optional() }).strict(),
   z.object({ type: z.literal('FINISH_CAPTURE'), observationId: id }).strict(),
-  z.object({ type: z.literal('COLLECT'), observationId: id }).strict(),
-  z.object({ type: z.literal('CHECK'), observationId: id }).strict(),
+  z.object({ type: z.literal('COLLECT'), observationId: id, scope: CaptureScopeSchema.optional() }).strict(),
+  z.object({ type: z.literal('CHECK'), observationId: id, scope: CaptureScopeSchema.optional() }).strict(),
   z.object({ type: z.literal('RELEASE') }).strict(),
   // `expect` is the geometry the reviewed observation described. The content
   // script compares it against the live element before touching the page.
@@ -162,7 +172,9 @@ export const VisualCategorySchema = z.enum(['aadhaar_card', 'pan_card', 'passpor
   'financial_document', 'private_document', 'signature', 'qr_barcode', 'form_control', 'sensitive_image']);
 export type VisualCategory = z.infer<typeof VisualCategorySchema>;
 export const VisualRegionSchema = z.object({ category: VisualCategorySchema, bounds: RectSchema,
-  confidence: z.number().finite().min(0).max(1) }).strict();
+  confidence: z.number().finite().min(0).max(1),
+  // Drawn vector artwork (SVG), not a photograph. Local use only.
+  vector: z.boolean().optional() }).strict();
 export const ElementSchema = z.object({
   id, role: z.string().max(50), label: z.string().max(200), type: z.string().max(50),
   disabled: z.boolean(), sensitive: z.boolean(), bounds: RectSchema,
@@ -176,6 +188,10 @@ export const DomSnapshotSchema = z.object({
   observationId: id, documentId: id, revision: z.number().int().nonnegative(), origin: z.string().url(),
   viewport: z.object({ width: z.number().positive(), height: z.number().positive(), scrollX: z.number(), scrollY: z.number(), devicePixelRatio: z.number().positive(), visualScale: z.number().positive(), offsetX: z.number(), offsetY: z.number() }).strict(),
   elements: z.array(ElementSchema).max(200), hiddenCount: z.number().int().nonnegative(), truncated: z.boolean(),
+  // Links and buttons on the photographed screen left out of a full budget.
+  // They hold no user value, so context-mode redaction does not depend on
+  // them; strict mode masks every control and still refuses the observation.
+  omittedOnScreen: z.number().int().nonnegative().optional(),
   visualRegions: z.array(VisualRegionSchema).max(500).optional(),
 }).strict();
 export type DomSnapshot = z.infer<typeof DomSnapshotSchema>;
@@ -249,6 +265,10 @@ export const CaptureTileSchema = z.object({
 export type CaptureTile = z.infer<typeof CaptureTileSchema>;
 export const CaptureObservationSchema = z.object({
   dom: DomSnapshotSchema, captureBounds: RectSchema,
+  // The document's full size (CSS pixels) and whether the image is the visible
+  // screen or the whole page. Absent on older observations: full page.
+  pageSize: z.object({ width: z.number().positive().finite(), height: z.number().positive().finite() }).strict().optional(),
+  scope: CaptureScopeSchema.optional(),
   imageWidth: z.number().int().positive(), imageHeight: z.number().int().positive(),
   tileCount: z.number().int().positive().max(2048),
   captureMs: z.number().nonnegative(), domMs: z.number().nonnegative(),

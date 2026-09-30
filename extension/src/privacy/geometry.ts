@@ -41,7 +41,11 @@ export function mergeMasks(input: Mask[]): Mask[] {
   }
   return output;
 }
-export function domBounds(bounds: Rect, observation: LocalObservation): Rect {
+// Where a DOM rectangle lands in the delivered image, or undefined when it lies
+// wholly outside the captured area: a viewport capture photographs one screen,
+// so a control further down the page has no pixels here to mask. Malformed
+// bounds still throw.
+export function visibleDomBounds(bounds: Rect, observation: LocalObservation): Rect | undefined {
   const { viewport } = observation.dom, capture = observation.captureBounds;
   const scaleX = observation.imageWidth / capture.width, scaleY = observation.imageHeight / capture.height;
   const converted = { x: (bounds.x + viewport.scrollX - viewport.offsetX - capture.x) * scaleX,
@@ -51,8 +55,22 @@ export function domBounds(bounds: Rect, observation: LocalObservation): Rect {
   // must never be repaired into apparent validity.
   if (![bounds.x, bounds.y, bounds.width, bounds.height, scaleX, scaleY].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0 || scaleX <= 0 || scaleY <= 0) throw new PrivacyError('INVALID_BOUNDS');
   const clipped = intersection(converted, { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight });
-  if (!clipped) throw new PrivacyError('INVALID_BOUNDS');
-  return validateBounds(clipped, observation.imageWidth, observation.imageHeight);
+  return clipped && validateBounds(clipped, observation.imageWidth, observation.imageHeight);
+}
+export function domBounds(bounds: Rect, observation: LocalObservation): Rect {
+  const visible = visibleDomBounds(bounds, observation);
+  if (!visible) throw new PrivacyError('INVALID_BOUNDS');
+  return visible;
+}
+// The whole document, in CSS pixels and in image pixels. Page-scale evidence
+// rules measure against this frame whichever part of the page was captured, so
+// a viewport capture keeps exactly the decisions a full-page capture made.
+export function pageFrame(observation: Pick<LocalObservation, 'captureBounds' | 'pageSize'>) {
+  return observation.pageSize ?? observation.captureBounds;
+}
+export function imagePageFrame(observation: Pick<LocalObservation, 'captureBounds' | 'pageSize' | 'imageWidth' | 'imageHeight'>) {
+  const page = pageFrame(observation), capture = observation.captureBounds;
+  return { width: page.width * observation.imageWidth / capture.width, height: page.height * observation.imageHeight / capture.height };
 }
 export function tileMasks(masks: Mask[], tile: { y: number; width: number; height: number }): Mask[] {
   return masks.flatMap(mask => {

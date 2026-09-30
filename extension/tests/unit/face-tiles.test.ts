@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { faceTiles, mergeFaces } from '../../src/vision/face/tiles';
+import { smallImages } from '../../src/vision/face/small';
 import type { PerceptionResult } from '../../src/vision/contracts';
+import { fixture } from '../privacy-fixture';
 
 describe('face crops', () => {
   it.each([[1373, 999], [1920, 1080], [3840, 2160], [999, 1373], [10000, 1200]])('covers %i × %i pixels with bounded, overlapping crops', (width, height) => {
@@ -16,6 +18,15 @@ describe('face crops', () => {
     for (let i = 1; i < row.length; i++) expect(row[i - 1].x + row[i - 1].width - row[i].x).toBeGreaterThanOrEqual(Math.floor(row[i].width * .25));
   });
   it('avoids repeating an already small image', () => { expect(faceTiles(400, 300)).toEqual([]); });
+  // Wikipedia's SVG logo sprites scored 0.51-0.68 as faces once enlarged.
+  it('enlarges small photographs but not SVG artwork', () => {
+    const { observation } = fixture();
+    observation.dom.visualRegions = [
+      { category: 'sensitive_image', confidence: .5, bounds: { x: 20, y: 20, width: 40, height: 40 } },
+      { category: 'sensitive_image', confidence: .5, bounds: { x: 100, y: 20, width: 40, height: 40 }, vector: true },
+    ];
+    expect(smallImages(observation, [])).toEqual([observation.dom.visualRegions[0].bounds]);
+  });
 });
 
 describe('face deduplication', () => {

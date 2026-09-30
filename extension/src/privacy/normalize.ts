@@ -2,7 +2,7 @@ import type { Rect } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
 import { canonical, openRedactionCandidates } from './openredaction';
 import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
-import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
+import { DEFAULT_PADDING, mergeMasks, paddedMask, union, validateBounds, visibleDomBounds } from './geometry';
 import { controlIsMasked } from './policy';
 import { Placeholders, sanitizeText } from './text';
 
@@ -79,7 +79,9 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
   const instruction = sanitizeText(data.instruction, 'instruction', placeholders);
   instruction.findings.forEach(append);
   const elements = observation.dom.elements.map(element => {
-    const bounds = domBounds(element.bounds, observation);
+    // A control outside the captured screen has no pixels to mask; its label
+    // is still sanitized below and it is listed without an image box.
+    const bounds = visibleDomBounds(element.bounds, observation);
     const result = sanitizeText(element.label, 'element_description', placeholders, textPolicy);
     result.findings.forEach(finding => append({ ...finding, bounds, elementId: element.id }));
     if (element.sensitive || /password|otp|token|secret/i.test(element.type)) append({ id: 'pending', source: 'dom', kind: 'password',
@@ -90,7 +92,7 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     // whole form, and its visible labels, without hiding any private value.
     // Context mode also trims the document padding: 8px around each of a stack
     // of form rows bridges the gaps and re-creates the single black slab.
-    if (controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
+    if (bounds && controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
     // 'option' is the autocomplete suggestion row exposed by the observer;
     // collapsing it into 'control' would hide the suggestion semantics the
     // server needs to click the visible option instead of guessing.
@@ -106,7 +108,7 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
       // lists it so a visible control whose label the redaction replaced can
       // be matched by position to this exact existing id. Coordinates only:
       // no label, href or attribute value travels with it.
-      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } };
+      ...(bounds ? { bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } } : {}) };
   });
   const words = data.ocr.result!.regions;
   for (const region of words) {
@@ -117,15 +119,11 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
         { kind: region.kind, hasText: !!region.text, hasConfidence: region.confidence !== undefined },
         'incomplete text region');
     }
-    // Strict mode covers every word. Context mode masks a low-confidence word
-    // only when it could be a misread fragment of an identifier, which the
-    // text rules might then miss: one holding '@' or three or more digits.
-    // Low confidence on its own is not evidence. Icons ('4' for a microphone),
-    // non-Latin scripts under the English model ('हिन्दी' read as 'eet') and
-    // stylised link text all score low, and masking them blanked ordinary UI;
-    // a clearly read name is not masked in this mode either.
-    const fragment = region.text.includes('@') || (region.text.match(/\p{N}/gu)?.length ?? 0) >= 3;
-    if (textPolicy === 'all_text' || (region.confidence < 0.35 && fragment)) masks.push(paddedMask(region.bounds, 'document', width, height));
+    // Strict mode covers every word. Context mode masks only the words whose
+    // text OpenRedaction classifies as PII (below). OCR confidence is not
+    // evidence: a badly read article count ('2781 000+' at 12%) looked like an
+    // identifier fragment and was blanked, though nothing classified it.
+    if (textPolicy === 'all_text') masks.push(paddedMask(region.bounds, 'document', width, height));
   }
   const reconstructed = reconstructOcr(words);
   for (const chunk of textChunks(reconstructed.text)) {

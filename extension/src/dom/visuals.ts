@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import type { VisualRegionSchema, VisualCategorySchema } from '../contracts';
+import type { CaptureScope, VisualRegionSchema, VisualCategorySchema } from '../contracts';
 
 // Labels classify a container locally; no label, URL or image value leaves here.
 export function documentCategory(label: string): z.infer<typeof VisualCategorySchema> | undefined {
@@ -37,24 +37,41 @@ export function ocrDocumentCategory(text: string): z.infer<typeof VisualCategory
   return ocrDocumentCue(text)?.category;
 }
 
-export function collectVisualRegions() {
+// SVG artwork is drawn, not photographed: logos, icons and sprite sheets. An
+// <svg> element, an <img> whose source is SVG (or a raster rendition of one,
+// '/logo.svg/60px-logo.svg.png'), or a background made only of SVG images.
+const svgSource = /^data:image\/svg\+xml|^[^?#]*\.svg(?:[/?#]|$)/i;
+function isVector(node: Element, style: CSSStyleDeclaration) {
+  if (node.matches('svg')) return true;
+  if (node instanceof HTMLImageElement) return svgSource.test(node.currentSrc || node.src);
+  if (node.matches('canvas,video,object,embed,iframe')) return false;
+  const sources = [...style.backgroundImage.matchAll(/url\((['"]?)(.*?)\1\)/g)].map(match => match[2]);
+  return sources.length > 0 && sources.every(source => svgSource.test(source));
+}
+
+// A viewport capture needs every visual region on the photographed screen and
+// none of the others, so it walks a larger document and measures the box first:
+// a region off that screen has no pixels to mask and costs no style lookup.
+export function collectVisualRegions(scope: CaptureScope = 'page') {
   const regions: z.infer<typeof VisualRegionSchema>[] = [];
   const nodes = document.querySelectorAll<HTMLElement>('*');
-  let truncated = nodes.length > 10_000;
-  for (const node of Array.from(nodes).slice(0, 10_000)) {
+  const scanLimit = scope === 'viewport' ? 100_000 : 10_000;
+  let truncated = nodes.length > scanLimit;
+  for (const node of Array.from(nodes).slice(0, scanLimit)) {
+    const box = node.getBoundingClientRect();
+    if (box.width <= 0 || box.height <= 0) continue;
+    if (scope === 'viewport' && (box.bottom <= -2 || box.top >= innerHeight + 2)) continue;
     // SVG children are covered by their root. Backgrounds on ordinary elements
     // matter too; a document need not use an <img> tag.
     if (node.parentElement?.closest('svg')) continue;
     const style = getComputedStyle(node);
     const visual = node.matches('img,svg,canvas,video,object,embed,iframe,input,textarea,select,[contenteditable]') || style.backgroundImage !== 'none';
     if (!visual || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
-    const box = node.getBoundingClientRect();
-    if (box.width <= 0 || box.height <= 0) continue;
     if (regions.length >= 500) { truncated = true; break; }
     const label = ['alt', 'aria-label', 'title'].map(name => node.getAttribute(name) ?? '').join(' ').slice(0, 2000);
     const category = node.matches('input,textarea,select,[contenteditable]') ? 'form_control' : documentCategory(label);
     regions.push({ category: category ?? 'sensitive_image', confidence: category ? .8 : .5,
-      bounds: { x: box.x, y: box.y, width: box.width, height: box.height } });
+      bounds: { x: box.x, y: box.y, width: box.width, height: box.height }, ...(isVector(node, style) ? { vector: true } : {}) });
   }
   return { regions, truncated };
 }

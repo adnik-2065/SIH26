@@ -19,4 +19,6 @@ export const PerceptionResultSchema = z.object({
 export type PerceptionResult = z.infer<typeof PerceptionResultSchema>;
 export interface PerceptionAdapter {
   inspect(input: PerceptionInput, signal: AbortSignal): Promise<PerceptionResult>;
+  // How many inspections the adapter runs at once; one when absent.
+  readonly lanes?: number;
 }

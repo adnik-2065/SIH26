@@ -1,6 +1,7 @@
 import { AgentResponseSchema, ActionSchema, type Action, type StepRequest, type TransportError } from '../contracts';
 import { canonical, credentialKinds, openRedactionCandidates } from '../privacy/openredaction';
 import { transportError } from './diagnostics';
+import { normalizeNavigationUrl } from './navigation';
 
 // Why a step was refused. These are shown to the user, never sent anywhere.
 export const rejections = ['UNKNOWN_TARGET', 'SELECTOR_UNSUPPORTED', 'MISSING_VALUE', 'UNSAFE_VALUE',
@@ -83,6 +84,15 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
       console.log(`[ACT DEBUG] MODEL ACTION\naction=${step.action}\nrequested_id=${step.id ?? 'null'}`);
       steps.push({ action: { type: 'back' }, index, literal: false }); continue;
     }
+    if (step.action === 'navigate') {
+      if (!value) { refuse('MISSING_VALUE'); continue; }
+      const url = normalizeNavigationUrl(value);
+      if (!url) { refuse('INVALID_ACTION'); continue; }
+      // The address is server text that reaches the network, held to the
+      // same identifier rule as text keyed into a page.
+      if (carriesIdentifier(decodedUrl(url))) { refuse('UNSAFE_VALUE'); continue; }
+      steps.push({ action: { type: 'navigate', url }, index, literal: true }); continue;
+    }
     if (!value) { refuse('MISSING_VALUE'); continue; }
     // An approved private value travels as the reference the vault minted; the
     // server never holds it. Anything else is literal text it composed itself.
@@ -116,19 +126,28 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
 export function literalTextAllowed(value: string) {
   const text = canonical(value);
   if (!text || text.length > 200) return false;
-  return !openRedactionCandidates(text).some(span => credentialKinds.has(span.kind) ||
+  return !carriesIdentifier(text);
+}
+function carriesIdentifier(text: string) {
+  return openRedactionCandidates(canonical(text)).some(span => credentialKinds.has(span.kind) ||
     ['aadhaar', 'pan', 'passport', 'payment_card', 'bank_account', 'ifsc'].includes(span.kind));
 }
+const decodedUrl = (url: string) => { try { return decodeURIComponent(url.replace(/\+/g, ' ')); } catch { return url; } };
 
-// A batch is a plan, not a script. Clicking, typing or even scrolling retires
-// the element map the rest of the batch was planned against, so exactly one
-// page-touching step runs per observation; `wait` alone may lead it. The
-// remainder is deferred until a fresh scan has been captured and redacted.
+// A batch is a plan, not a script. Clicking, pressing a key, scrolling or
+// opening an address can navigate or reveal content the batch was not planned
+// against, so at most one such step runs per observation, and it ends the batch. Entering a value into
+// a field does not retire the element map (the content script keeps its refs
+// until a navigation or a new scan, and re-checks each target's geometry and
+// occlusion before acting), so `wait` and value entries may lead it: filling a
+// form and submitting it is one round, not one round per field. The remainder
+// is deferred until a fresh scan has been captured and redacted.
+const valueEntries: ReadonlySet<PlannedStep['action']['type']> = new Set(['wait', 'type', 'fill', 'choose', 'select']);
 export function executableNow(steps: PlannedStep[]) {
   const runnable: PlannedStep[] = [];
   for (const step of steps) {
     runnable.push(step);
-    if (step.action.type !== 'wait') break;
+    if (!valueEntries.has(step.action.type)) break;
   }
   return { runnable, deferred: steps.slice(runnable.length) };
 }

@@ -46,6 +46,7 @@ const describe = (action: Action) =>
   : action.type === 'wait' ? `Wait ${action.milliseconds}ms`
   : action.type === 'key' ? `Press ${action.key}`
   : action.type === 'back' ? 'Go back one page'
+  : action.type === 'navigate' ? `Open ${action.url}`
   : action.type === 'done' ? 'Finish the task'
   : action.type === 'type' ? `Type “${action.text}” into ${action.target}`
   : action.type === 'choose' ? `Choose “${action.optionText}” in ${action.target}`
@@ -161,7 +162,7 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
       ...(target !== undefined ? { id: target } : {}),
       value: 'text' in step.action ? step.action.text : 'optionText' in step.action ? step.action.optionText
         : 'valueRef' in step.action ? step.action.valueRef : 'optionRef' in step.action ? step.action.optionRef
-        : 'key' in step.action ? step.action.key : null,
+        : 'key' in step.action ? step.action.key : 'url' in step.action ? step.action.url : null,
       result: outcome.result, ...(outcome.reason !== undefined ? { reason: outcome.reason } : {}) });
     if (ok && step.action.type !== 'done') onExecuted?.({
       observationId,
@@ -274,7 +275,7 @@ export function AgentSteps({ request, bounds, observationId, signal, runId, exec
       })}</ol>
       {!plan.steps.length && <p className="foot-note">The reply contained no step this page can execute.</p>}
       {plan.rejected.length > 0 && <p className="foot-note is-warn">Refused: {plan.rejected.map(item => `#${item.index + 1} ${item.reason}`).join(', ')}.</p>}
-      <p className="foot-note">Only the first page-touching step can run against this scan; performing it retires the reviewed observation.</p>
+      <p className="foot-note">Field entries run against this scan together with at most one click, key press, scroll or address after them; that step retires the reviewed observation.</p>
     </>}
     {outcome && <p role="status" className="banner">{outcome}</p>}
   </section>;

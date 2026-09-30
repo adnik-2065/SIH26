@@ -22,6 +22,7 @@ interface Props {
   onStage?: (stage: 'REDACTING' | 'SENDING' | 'WAITING_RESPONSE' | 'EXECUTING') => void; onContinue?: () => void; onHalt?: (notice: string, error?: ExtensionError) => void;
   onLog?: (kind: 'info' | 'server' | 'action' | 'error', text: string, detail?: unknown) => void;
 }
+const seconds = (ms: number) => `${(ms / 1000).toFixed(2)} s`;
 export function PrivacyReview({ observation, instruction, ocr, faces, modelDocuments, complete, currentState, signal, verificationOcr, auto, runId, executionReport, onExecuted, onActionOutcome, actionHistory, loopTracker, onLoopDetected, onStage, onContinue, onHalt, onLog }: Props) {
   const [result, setResult] = useState<ExportResult>();
   const [busy, setBusy] = useState(false);
@@ -99,7 +100,11 @@ export function PrivacyReview({ observation, instruction, ocr, faces, modelDocum
   useEffect(() => {
     if (!auto || !result) return;
     if (!result.ok) onHalt?.(`Redaction blocked the payload: ${result.blockedReasons.join(', ')}.`);
-    else onLog?.('info', `Redacted: ${result.summary.text} text replacements, ${result.summary.faces} faces, ${result.summary.documents} documents, ${result.summary.masks} masks${result.summary.rewritten ? `, ${result.summary.rewritten} text fields rewritten to remove detected values` : ''}.`);
+    else {
+      onLog?.('info', `Redacted: ${result.summary.text} text replacements, ${result.summary.faces} faces, ${result.summary.documents} documents, ${result.summary.masks} masks${result.summary.rewritten ? `, ${result.summary.rewritten} text fields rewritten to remove detected values` : ''}.`);
+      if (result.stages) onLog?.('info', `Redaction stages: PII ${seconds(result.stages.pii)} · masking ${seconds(result.stages.masking)} · ` +
+        `verification ${seconds(result.stages.verification)} · payload ${seconds(result.stages.payload)}`);
+    }
   }, [auto, result]);
 
   const blocked = result && !result.ok;

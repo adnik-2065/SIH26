@@ -1,9 +1,11 @@
-import { patterns } from '../../vendor/openredaction/patterns.js';
+import { analyzeFullContext, commonFalsePositives, isFalsePositive, patterns } from '../../vendor/openredaction/patterns.js';
 import { LIMITS, privacyError, PrivacyError, type PiiKind } from './contracts';
 
 // OpenRedaction is the source of truth for text PII detection. This adapter
-// iterates the generated vendor pattern set pattern by pattern, executes each
-// pattern's validator against bounded context, and resolves overlaps
+// iterates the generated vendor pattern set pattern by pattern and runs each
+// match through the engine's own stages: the pattern's validator against
+// bounded context, the false-positive filter, and context confidence scoring
+// against the engine's default thresholds. Overlaps are resolved
 // deterministically. The full runtime detect()/restore() pair is deliberately
 // not bundled: those allocate restoration maps and placeholder state the local
 // pipeline must not keep.
@@ -66,6 +68,21 @@ for (const [kind, types] of kindGroups) for (const type of types) if (!(type in 
 // Exposed so tests (and future callers) can verify the required catalog type
 // mappings without executing any detection.
 export const catalogTypeKinds = kinds;
+
+// The engine's defaults: a false-positive rule at this certainty or more
+// discards a match, and a match must score at least this in context.
+const FALSE_POSITIVE_THRESHOLD = .7, CONFIDENCE_THRESHOLD = .5;
+// The engine's false-positive rules that judge the value itself. The others
+// fire on a common word or symbol anywhere in the \u00b150 character window,
+// which is one sentence in a document but several unrelated links and fields
+// on a captured page. They discarded real values: 'Call me on +44 20 7946
+// 0958' ('on' reads as a date), a phone near 'Address' (an IP address), any
+// email near 'https://' or holding 'test' or 'demo' (a code placeholder), and
+// 'akbar@gmail.com' ('bar@' reads as test data).
+const valueRules = new Set(['Year mistaken for PII', 'Port number mistaken for PII', 'Common word after article, not a name',
+  'Common English word mistaken for social username', 'Example email domain', 'Test account/card number']);
+const falsePositiveRules = commonFalsePositives.filter(rule => valueRules.has(rule.description));
+if (falsePositiveRules.length !== valueRules.size) throw new Error('OpenRedaction false-positive rules changed');
 
 // Shape-only catalog patterns whose own validator requires surrounding
 // wording. The keyword sets mirror each validator's own context rule; without
@@ -280,6 +297,16 @@ export function openRedactionCandidates(raw: string): Span[] {
           if (!value) continue;
         }
         const end = start + value.length;
+        // The engine's stages after the validator: its false-positive filter
+        // over the raw window around the value (years, ports, reserved example
+        // domains, all-zero or sequential card numbers), then the context
+        // score, which starts at 0.8 and moves with the surrounding words and
+        // the kind of text (code, email, document).
+        const falsePositive = isFalsePositive(value, pattern.type,
+          text.slice(Math.max(0, start - 50), Math.min(text.length, end + 50)), falsePositiveRules);
+        if (falsePositive.isFalsePositive && falsePositive.confidence >= FALSE_POSITIVE_THRESHOLD) continue;
+        const { confidence } = analyzeFullContext(text, value, pattern.type, start, end);
+        if (confidence < CONFIDENCE_THRESHOLD) continue;
         if (kind === 'phone') {
           // Catalog phone matches can start after '+' or '(' and leave '+1 ('
           // in front of the token; a hyphenated ISBN holds phone-like runs.
@@ -289,7 +316,7 @@ export function openRedactionCandidates(raw: string): Span[] {
         }
         const narrow = narrowContext[pattern.type];
         if (narrow && !narrow.test(window)) continue;
-        push({ start, end, kind, confidence: pattern.validator ? .99 : .9 });
+        push({ start, end, kind, confidence });
       }
     }
     for (const pattern of localPatterns) {
