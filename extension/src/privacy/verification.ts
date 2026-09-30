@@ -3,7 +3,7 @@ import { PerceptionResultSchema, type PerceptionAdapter } from '../vision/contra
 import { openRedactionCandidates } from './openredaction';
 import { PrivacyError, type ExportData, type Finding, type Mask, type StepRequest } from './contracts';
 import { domBounds } from './geometry';
-import { reconstructOcr } from './normalize';
+import { compactKinds, reconstructOcr, textChunks } from './normalize';
 import { controlIsMasked, visualIsMasked, visualRegionIsEvidence } from './policy';
 
 export function verifyMaskCoverage(data: ExportData, masks: Mask[], findings: Finding[] = []) {
@@ -56,9 +56,9 @@ export async function verifyWithOcr(image: NonNullable<StepRequest['sanitizedIma
       if (!result.success || result.data.observationId !== observationId || result.data.source !== 'model' ||
         result.data.regions.some(r => r.kind !== 'text' || !r.text || r.confidence === undefined || r.bounds.x < 0 || r.bounds.y < 0 ||
           r.bounds.width <= 0 || r.bounds.height <= 0 || r.bounds.x + r.bounds.width > width || r.bounds.y + r.bounds.height > height)) throw new PrivacyError('VERIFICATION_FAILED');
-      const text = reconstructOcr(result.data.regions).text;
-      if (openRedactionCandidates(text).length || openRedactionCandidates(text.replace(/\s/g, '')).some(s =>
-        ['email', 'phone', 'pan', 'aadhaar', 'payment_card', 'ifsc', 'passport', 'bank_account'].includes(s.kind))) throw new PrivacyError('VERIFICATION_FAILED');
+      for (const { text } of textChunks(reconstructOcr(result.data.regions).text)) {
+        if (openRedactionCandidates(text).length || openRedactionCandidates(text.replace(/\s/g, '')).some(s => compactKinds.includes(s.kind))) throw new PrivacyError('VERIFICATION_FAILED');
+      }
     };
     await Promise.race([work(), new Promise<never>((_, reject) => {
       timer = setTimeout(() => { controller.abort(); reject(new PrivacyError('VERIFICATION_FAILED')); }, 30_000);

@@ -57,20 +57,15 @@ describe('local PII and text policy', () => {
     expect(sanitizeText('प्रोफ़ाइल पेज खोलें', 'instruction').sanitized).toBe('प्रोफ़ाइल पेज खोलें');
     expect(sanitizeText('pay ₹499 now', 'instruction').sanitized).toBe('pay ₹499 now');
   });
-  it.each([
-    ['a control character', 'bad' + String.fromCharCode(7) + 'bell', 'TEXT_WITHHELD_UNSAFE_CONTROL_CHARACTER', 'U+0007'],
-    ['an unpaired surrogate', 'bad' + String.fromCharCode(0xD800) + 'end', 'TEXT_WITHHELD_INVALID_ENCODING', 'U+D800'],
-  ])('still withholds %s, and says which code point', (_label, text, reason, codePoint) => {
-    try {
-      sanitizeText(text, 'element_description');
-      throw new Error('expected the text to be withheld');
-    } catch (error) {
-      const failure = error as { reason?: string; detail?: { context?: Record<string, unknown> } };
-      expect(failure.reason).toBe(reason);
-      expect(failure.detail?.context).toMatchObject({ codePoint, offset: 3, textLength: text.length });
-      // The text itself never reaches the diagnostics.
-      expect(JSON.stringify(failure.detail)).not.toContain('bad');
-    }
+  // A stray control byte or broken surrogate in one page label used to refuse
+  // the whole export and stop the run. It is replaced one code unit for one,
+  // so detection offsets still land on the same characters.
+  it('repairs control characters and unpaired surrogates instead of refusing the text', () => {
+    expect(sanitizeText('bad' + String.fromCharCode(7) + 'bell', 'instruction').sanitized).toBe('bad bell');
+    expect(sanitizeText('bad' + String.fromCharCode(0xD800) + 'end', 'instruction').sanitized).toBe('bad\uFFFDend');
+    const result = sanitizeText('x' + String.fromCharCode(7) + ' mira@example.test', 'instruction');
+    expect(result.sanitized).toBe('x  [EMAIL_1]');
+    expect(result.findings[0].textRange).toEqual({ start: 3, end: 20 });
   });
   it('allocates deterministic placeholders locally and clears the mapping', () => {
     const tokens = new Placeholders();
@@ -240,11 +235,92 @@ describe('one fail-closed payload gateway', () => {
     expect(() => finalCheck({ ...result.request, rawOcr: fictional[0] }, [], [])).toThrow('RAW_DATA_LEAK');
     expect(StepRequestSchema.safeParse({ ...result.request, sanitizedImage: { mimeType: 'image/png', base64: 'x'.repeat(4_000_001) } }).success).toBe(false);
   });
+  it('rewrites a detected page value repeated in the instruction instead of blocking the step', async () => {
+    const data = fixture();
+    data.instruction = 'message Asha Rao about the form';
+    data.ocr.result!.regions = ['Name:', 'Asha', 'Rao'].map((text, i) => ({ kind: 'text', text, confidence: .99, bounds: { x: 10 + i * 40, y: 50, width: 35, height: 10 } }));
+    const result = await run(data);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.request.sanitizedInstruction).toBe('message [PERSON_1] about the form');
+    expect(result.summary.rewritten).toBe(1);
+    expect(result.withheldReasons).toContain('TEXT_WITHHELD_POLICY');
+    expect(JSON.stringify(result.request)).not.toMatch(/asha|rao/i);
+  });
+  it('reads a long page in chunks instead of refusing it, and still finds values at the end', async () => {
+    const data = fixture();
+    const words = Array.from({ length: 2400 }, () => 'attendance');
+    data.ocr.result!.regions = [...words, 'mira@example.test'].map(text => ({ kind: 'text', text, confidence: .99, bounds: { x: 10, y: 50, width: 30, height: 10 } }));
+    const plan = normalize(data, new Placeholders());
+    expect(plan.findings.some(finding => finding.kind === 'email' && finding.source === 'ocr')).toBe(true);
+    const result = await run(data);
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('mira@example.test');
+  });
   it('fails at aggregate region and mask budgets without truncating data', async () => {
     const data = fixture();
     data.ocr.result!.regions = Array.from({ length: LIMITS.regions }, () => data.ocr.result!.regions[0]);
     expect((await run(data)).ok).toBe(false);
     expect(() => mergeMasks(Array.from({ length: LIMITS.masks + 1 }, () => ({ bounds: { x: 0, y: 0, width: 1, height: 1 }, reasons: ['face'] })))).toThrow('LIMIT_EXCEEDED');
+  });
+});
+
+describe('OpenRedaction adapter precision', () => {
+  const kinds = (text: string) => openRedactionCandidates(text).map(span => [span.kind, text.slice(span.start, span.end)]);
+  it.each([
+    ['a passport label', 'Passport No'],
+    ['a course name', 'Course name: Data Structures'],
+    ['an all-caps heading', 'COMPUTER SCIENCE DEPARTMENT'],
+    ['a title-case heading near a name label', 'Contact us for Student Services Portal'],
+    ['password help text', 'Password is required'],
+    ['OTP help text', 'OTP is invalid, try again'],
+    ['a payment card, as Aadhaar', '4111 1111 1111 1111'],
+    ['a grouped number with a bad checksum', '4918 3726 5010'],
+    ['password help text', 'Password must be at least 8 characters'],
+    ['an unlabeled heading', 'QUICK LINKS BELOW'],
+    ['an ISBN', 'ISBN 978-3-16-148410-0'],
+    ['an IP address', 'IP Address: 10.0.0.12'],
+    ['a greeting to a group', 'Hello ALL USERS'],
+    ['a lowercase phrase after a name label', 'Name: asha rao'],
+  ])('does not flag %s', (_label, text) => {
+    expect(kinds(text).filter(([kind]) => kind !== 'payment_card')).toEqual([]);
+  });
+  it.each([
+    ['person_name', 'Welcome back, Asha Rao', 'Asha Rao'],
+    ['person_name', 'Name: Asha Rao Profile', 'Asha Rao'],
+    ['person_name', 'Logged in as Asha Rao', 'Asha Rao'],
+    ['date_of_birth', 'Demo University portal. DOB: 02/01/1999', '02/01/1999'],
+    ['pan', 'PAN ABCPE1234F', 'ABCPE1234F'],
+    ['phone', 'Call +91 98765 43210 today', '+91 98765 43210'],
+    ['phone', 'Mobile 98765-43210', '98765-43210'],
+    ['aadhaar', '4918 3726 5017', '4918 3726 5017'],
+    ['bank_account', 'Pay to asha.rao@okaxis now', 'asha.rao@okaxis'],
+    ['bank_account', 'UPI ID: asha@mybank', 'asha@mybank'],
+    ['bank_account', 'A/c No: 1234 5678 9012', '1234 5678 9012'],
+    ['document', 'Voter ID ABC1234567', 'ABC1234567'],
+    ['document', 'DL MH-12-2019-0012345', 'MH-12-2019-0012345'],
+    ['document', 'GSTIN 27ABCPE1234F1Z5', '27ABCPE1234F1Z5'],
+    ['passport', 'Passport: J8369854', 'J8369854'],
+    ['otp', 'Your OTP 482913 expires soon', 'OTP 482913'],
+    ['otp', '482913 is your OTP', '482913 is your OTP'],
+    ['person_name', 'Name: ASHA RAO', 'ASHA RAO'],
+    ['person_name', 'Name: R. K. Sharma', 'R. K. Sharma'],
+    ['person_name', 'Student: Asha Rao', 'Asha Rao'],
+    ['date_of_birth', 'DOB: 2002-08-15', '2002-08-15'],
+    ['date_of_birth', 'DOB: 15.08.2002', '15.08.2002'],
+    ['date_of_birth', 'Date of Birth: 15 Aug 2002', '15 Aug 2002'],
+    ['date_of_birth', 'Birth Date: August 15, 2002', 'August 15, 2002'],
+    ['date_of_birth', 'D.O.B. 15/08/2002', '15/08/2002'],
+    ['address', 'Address: Flat 4B, Sunrise Apartments, Andheri West, Mumbai - 400053',
+      'Flat 4B, Sunrise Apartments, Andheri West, Mumbai - 400053'],
+    ['address', 'Address: 221B Baker Street Phone: 98765 43210', '221B Baker Street'],
+    ['phone', 'Tel: +1 (415) 555-2671', '+1 (415) 555-2671'],
+    ['phone', 'Tel: +44 20 7946 0958', '+44 20 7946 0958'],
+    ['password', 'Password: hunter2x Remember me', 'Password: hunter2x'],
+    ['otp', 'OTP: 482913 Resend in 30s', 'OTP: 482913'],
+    ['token', 'Authorization: Bearer abc.def.ghi next', 'Authorization: Bearer abc.def.ghi'],
+  ])('flags %s in %j', (kind, text, value) => {
+    expect(kinds(text)).toContainEqual([kind, value]);
   });
 });
 

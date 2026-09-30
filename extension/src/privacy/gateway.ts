@@ -107,19 +107,31 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
       }
     }
     check();
-    if (image && input.verificationOcr) await verifyWithOcr(image, binding.observationId, input.verificationOcr, input.signal, check);
-    const candidate = payload(binding, plan, placeholders, image);
+    if (image && input.verificationOcr) {
+      // The re-scan reads the masked image back. What it still finds is often
+      // a misread, and the image is optional: withholding it keeps the step
+      // going on the sanitized text and controls, rather than stopping the run.
+      try { await verifyWithOcr(image, binding.observationId, input.verificationOcr, input.signal, check); }
+      catch (error) {
+        check();
+        if (data.image === 'required' || !(error instanceof PrivacyError) || error.reason !== 'VERIFICATION_FAILED') throw error;
+        image = undefined; withheldReasons.push('VERIFICATION_FAILED');
+      }
+    }
     // Known values are the raw texts the detectors positively classified. Words
     // the allowlist merely could not clear are excluded: they are ordinary page
     // vocabulary, and on any real site they overlap the user's own instruction
     // ("lms", "attendance"), which would block every such request as a leak.
-    const request = finalCheck(candidate, plan.findings.flatMap(finding => finding.text && !finding.unclassified ? [finding.text] : []),
-      observation.tiles.map(tile => tile.screenshot), input.vault);
+    const known = plan.findings.flatMap(finding => finding.text && !finding.unclassified ? [{ kind: finding.kind, text: finding.text }] : []);
+    const policy = data.ocrTextPolicy ?? 'all_text';
+    const { request: candidate, rewritten } = payload(binding, plan, placeholders, image, { known, vault: input.vault, policy });
+    const request = finalCheck(candidate, known.map(value => value.text), observation.tiles.map(tile => tile.screenshot), input.vault, policy);
+    if (rewritten) withheldReasons.push('TEXT_WITHHELD_POLICY');
     check();
     // Return the *exact* validated object for local review. No transport exists.
     return { ok: true, request, decision: image ? 'safe' : 'safe_without_image', withheldReasons,
       summary: { text: plan.findings.filter(f => f.redactText).length, faces: plan.findings.filter(f => f.source === 'face').length,
-        documents: plan.findings.filter(f => f.source === 'document').length, masks: plan.masks.length } };
+        documents: plan.findings.filter(f => f.source === 'document').length, masks: plan.masks.length, rewritten } };
   } catch (error) {
     input.vault?.clear();
     const failure = error instanceof PrivacyError ? error : undefined;

@@ -5,7 +5,9 @@ export type { StepRequest };
 import { PerceptionResultSchema } from '../vision/contracts';
 
 // Local resource budgets, independent of the version-1 wire contract.
-export const LIMITS = Object.freeze({ text: 16_000, findings: 20_000, masks: 20_000,
+// `text` bounds one detection call; `pageText` bounds a whole reconstructed
+// OCR page, which is detected in `text`-sized chunks.
+export const LIMITS = Object.freeze({ text: 16_000, pageText: 400_000, findings: 20_000, masks: 20_000,
   regions: 10_000, tiles: 2048, sourcePixels: 32_000_000, summaryPixels: 1_000_000,
   summarySide: 1600, imageBytes: 3_000_000, base64: 4_000_000, ttlMs: 300_000 });
 export const IdSchema = z.string().min(1).max(100).regex(/^[a-zA-Z0-9_-]+$/);
@@ -89,6 +91,7 @@ export const ExportDataSchema = z.object({ binding: BindingSchema, observation: 
   image: z.enum(['none', 'optional', 'required']) }).strict();
 export type ExportData = z.infer<typeof ExportDataSchema>;
 export type ExportResult = { ok: true; request: StepRequest; decision: 'safe' | 'safe_without_image';
-  summary: { text: number; faces: number; documents: number; masks: number }; withheldReasons: BlockReason[] }
+  // `rewritten` counts text fields the final check repaired instead of refusing.
+  summary: { text: number; faces: number; documents: number; masks: number; rewritten: number }; withheldReasons: BlockReason[] }
   // `blockedDetails` carries the stage, cause and safe context for each reason.
   | { ok: false; blockedReasons: BlockReason[]; blockedDetails?: ExtensionError[] };

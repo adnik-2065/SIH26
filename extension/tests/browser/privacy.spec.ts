@@ -129,6 +129,8 @@ test('document model boxes retain both tile overlaps and mask a multi-tile docum
   const result = await page.evaluate(async () => {
     const h = window.PrivacyHarness, data = h.visualFixture(1, true);
     let calls = 0;
+    // Model boxes are kept only over an image-like DOM region.
+    data.observation.dom.visualRegions = [{ category: 'sensitive_image', confidence: .5, bounds: { x: 60, y: 220, width: 50, height: 70 } }];
     data.documents = await h.inspectDocumentTiles(data.observation, { inspect: async ({ observationId, image }) => {
       const tileCall = ++calls;
       // Bounded boxes from each tile that overlap across the seam at row 250:
@@ -195,20 +197,23 @@ for (const corruption of ['white', 'transparent', 'dimensions']) test(`encoded-o
 test('optional OCR verifies sanitized output and blocks remaining PII, failures and stale results', async ({ page }) => {
   const results = await page.evaluate(async () => {
     const h = window.PrivacyHarness, results = [];
-    for (const mode of ['safe', 'pii', 'failure', 'stale']) {
+    for (const mode of ['safe', 'pii', 'failure', 'stale', 'optional']) {
       const data = h.visualFixture();
+      // An optional image that fails the re-scan is withheld, not the step.
+      if (mode === 'optional') data.image = 'optional';
       results.push(await h.buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal,
         verificationOcr: { inspect: async ({ image, observationId }) => {
           image.close();
           if (mode === 'failure') throw new Error('mira@example.test');
           return { observationId: mode === 'stale' ? 'old' : observationId, source: 'model', elapsedMs: 1,
-            regions: mode === 'pii' ? [{ kind: 'text', confidence: .9, text: 'mira@example.test', bounds: { x: 1, y: 1, width: 10, height: 10 } }] : [] };
+            regions: mode === 'pii' || mode === 'optional' ? [{ kind: 'text', confidence: .9, text: 'mira@example.test', bounds: { x: 1, y: 1, width: 10, height: 10 } }] : [] };
         } } }));
     }
     return results;
   });
   expect(results[0].ok).toBe(true);
-  for (const result of results.slice(1)) expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  for (const result of results.slice(1, 4)) expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  expect(results[4]).toMatchObject({ ok: true, decision: 'safe_without_image', withheldReasons: ['VERIFICATION_FAILED'] });
   expect(JSON.stringify(results)).not.toContain('mira@example.test');
 });
 

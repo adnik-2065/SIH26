@@ -99,7 +99,7 @@ export function PrivacyReview({ observation, instruction, ocr, faces, modelDocum
   useEffect(() => {
     if (!auto || !result) return;
     if (!result.ok) onHalt?.(`Redaction blocked the payload: ${result.blockedReasons.join(', ')}.`);
-    else onLog?.('info', `Redacted: ${result.summary.text} text replacements, ${result.summary.faces} faces, ${result.summary.documents} documents, ${result.summary.masks} masks.`);
+    else onLog?.('info', `Redacted: ${result.summary.text} text replacements, ${result.summary.faces} faces, ${result.summary.documents} documents, ${result.summary.masks} masks${result.summary.rewritten ? `, ${result.summary.rewritten} text fields rewritten to remove detected values` : ''}.`);
   }, [auto, result]);
 
   const blocked = result && !result.ok;
@@ -116,7 +116,7 @@ export function PrivacyReview({ observation, instruction, ocr, faces, modelDocum
       </label>
       {verificationOcr && <label className="switch-row">
         <input type="checkbox" checked={rescan} disabled={busy} onChange={event => setRescan(event.target.checked)} />
-        <span><strong>Re-scan the redacted image</strong><small>Read the masked image back and block it if any text PII remains. Slower.</small></span>
+        <span><strong>Re-scan the redacted image</strong><small>Read the masked image back and withhold the image if any text PII remains. Slower.</small></span>
       </label>}
     </div>
     <button type="button" className="btn accent wide" disabled={!complete || busy} onClick={() => void prepare()}>{busy ? 'Preparing redaction…' : 'Prepare redacted preview'}</button>

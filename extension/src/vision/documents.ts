@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { VisualCategorySchema, type LocalObservation, type Rect } from '../contracts';
 import type { PerceptionResult } from './contracts';
 import { ocrDocumentCue } from '../dom/visuals';
-import { BoundsSchema, DocumentEvidenceSchema, LIMITS, privacyError, PrivacyError } from '../privacy/contracts';
+import { BoundsSchema, DocumentEvidenceSchema, privacyError, PrivacyError } from '../privacy/contracts';
 import { domBounds, intersection, union, validateBounds } from '../privacy/geometry';
 import { reconstructOcr } from '../privacy/normalize';
 import { visualIsMasked, visualRegionIsEvidence } from '../privacy/policy';
@@ -51,7 +51,6 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
   // caught by the text rules, and labelled or model-detected document regions
   // still cover the rest of a real document.
   const reconstructed = reconstructOcr(ocr.regions);
-  if (reconstructed.text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
   const cue = ocrDocumentCue(reconstructed.text);
   if (cue) {
     const page: Rect = { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight };
@@ -83,6 +82,33 @@ export function mergeDocumentEvidence(base: DocumentEvidence, model: DocumentEvi
   return DocumentEvidenceSchema.parse({ ...base, detector: 'vision_model', regions });
 }
 
+// A document the model can see is a picture on the page: an <img>, canvas,
+// video frame, embedded viewer or CSS background image. The bundled model also
+// fires on plain HTML — an ordinary <form> read as an identity card at .9, an
+// empty page as a signature — so a model box is kept only when most of it lies
+// on an image-like DOM region. Text-only documents are covered by the OCR
+// document cues and text rules instead. This is model-agnostic; set
+// MODEL_BOX_ON_IMAGE to 0 to trust a replacement model's boxes on their own.
+export const MODEL_BOX_ON_IMAGE = .5;
+function imageRegions(observation: LocalObservation): Rect[] {
+  return (observation.dom.visualRegions ?? []).filter(region => region.category !== 'form_control').flatMap(region => {
+    // A region wholly outside the capture has no image-space box; it cannot
+    // corroborate anything, and is not an error here.
+    try { return [domBounds(region.bounds, observation)]; } catch { return []; }
+  });
+}
+function onImage(box: Rect, images: Rect[]) {
+  if (MODEL_BOX_ON_IMAGE <= 0) return true;
+  const area = box.width * box.height;
+  // Overlapping image regions are summed, capped at the box itself, which is
+  // enough for nested regions (a background image under an <img>).
+  const covered = images.reduce((sum, image) => {
+    const shared = intersection(box, image);
+    return sum + (shared ? shared.width * shared.height : 0);
+  }, 0);
+  return Math.min(area, covered) >= area * MODEL_BOX_ON_IMAGE;
+}
+
 function overlap(a: { x: number; y: number; width: number; height: number }, b: typeof a) {
   const intersection = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) *
     Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
@@ -98,6 +124,7 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
   const regions: DocumentEvidence['regions'] = [];
   const check = () => { if (signal.aborted) throw new PrivacyError('STOPPED'); };
   const observationId = observation.dom.observationId;
+  const images = imageRegions(observation);
   for (const [tileIndex, tile] of observation.tiles.entries()) {
     check();
     let image: ImageBitmap | undefined;
@@ -128,6 +155,7 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         // space, so a false positive over ordinary UI can never become a
         // page-wide mask. Bounded detections still union across tile seams.
         if (!visualRegionIsEvidence(pageBox, { width: observation.imageWidth, height: observation.imageHeight })) continue;
+        if (!onImage(pageBox, images)) continue;
         // The same document seen by neighbouring tiles arrives as one box per
         // crop. Union same-category intersecting boxes into one region: the
         // candidate list is deduplicated, while every crop's boxes keep their
@@ -137,8 +165,6 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         const existing = regions.find(region => region.category === detection.type && intersection(region.bounds, pageBox));
         if (existing) existing.bounds = union(existing.bounds, pageBox);
         else regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence, bounds: pageBox });
-        // eslint-disable-next-line no-console -- temporary runtime provenance diagnostic
-        console.log('[DOC-PROBE] accepted', JSON.stringify({ category: detection.type, confidence: detection.confidence, pageBox, tile: { y: tile.y, width: tile.width, height: tile.height } }));
       }
       if (regions.length > 500) throw new PrivacyError('LIMIT_EXCEEDED');
     } catch (error) {

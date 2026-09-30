@@ -9,9 +9,15 @@ export const onnxCategory = (name: OnnxClass): VisualCategory => ({
 }[name] as VisualCategory);
 
 export interface Candidate { category: VisualCategory; confidence: number; bounds: Rect }
+// Minimum class score a detection needs. At .25 the bundled model reported a
+// 'signature' over an empty white page (.68 is its worst case, which the
+// visual corroboration in documents.ts removes) and identity cards over plain
+// HTML forms. Tune this with the model: a better-calibrated replacement can
+// run lower.
+export const ONNX_SCORE_THRESHOLD = .4;
 
 export function decodeOnnxOutput(data: Float32Array, count: number, imageWidth: number, imageHeight: number,
-  scale: number, padX: number, padY: number, threshold = .25): Candidate[] {
+  scale: number, padX: number, padY: number, threshold = ONNX_SCORE_THRESHOLD): Candidate[] {
   const candidates: Candidate[] = [];
   for (let i = 0; i < count; i++) {
     let best = 0, confidence = 0;

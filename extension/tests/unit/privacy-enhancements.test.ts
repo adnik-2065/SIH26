@@ -205,6 +205,31 @@ describe('context mode masks private values, not the whole page', () => {
     const plan = normalize(data, new Placeholders());
     expect(covers(plan.masks, data.observation.dom.elements[1].bounds)).toBe(true);
   });
+  // Words OCR read with low confidence on google.com: a microphone icon, Indic
+  // language links under the English model, and a stylised link.
+  it('masks a low-confidence OCR word only when it could be an identifier fragment', () => {
+    const data = form();
+    const words = ['4', 'Ld', 'eet', 'pexwoge', 'Setings', 'birthday!', '98765', 'mira@exa', 'I234'];
+    data.ocr.result!.regions = words.map((text, i) => ({ kind: 'text', text, confidence: .2, bounds: { x: 120, y: 10 + i * 15, width: 60, height: 10 } }));
+    const plan = normalize(data, new Placeholders());
+    expect(words.filter((_, i) => covers(plan.masks, data.ocr.result!.regions[i].bounds))).toEqual(['98765', 'mira@exa', 'I234']);
+    expect(() => verifyMaskCoverage(data, plan.masks, plan.findings)).not.toThrow();
+    data.ocrTextPolicy = 'all_text';
+    const strict = normalize(data, new Placeholders());
+    for (const region of data.ocr.result!.regions) expect(covers(strict.masks, region.bounds)).toBe(true);
+  });
+  it('describes controls by their own labels and withholds only classified PII', async () => {
+    const data = form();
+    const labels = ['About', 'Sign in', "I'm Feeling Lucky", 'हिन्दी', 'Contact mira@example.test'];
+    data.observation.dom.elements = labels.map((label, i) => ({ id: `${binding.observationId}_e${i + 1}`, role: 'link', type: 'a', label,
+      sensitive: false, disabled: false, filled: false, bounds: { x: 10, y: 10 + i * 25, width: 150, height: 20 } }));
+    const result = await buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.request.elements.map(element => element.description)).toEqual([...labels.slice(0, 4), 'Contact [EMAIL_1]']);
+    expect(result.withheldReasons).not.toContain('TEXT_WITHHELD_POLICY');
+    expect(sanitizeText("I'm Feeling Lucky", 'element_description').sanitized).toBe('[DOCUMENT_1] [DOCUMENT_2] [DOCUMENT_3]');
+  });
   it('treats form controls and unlabelled images as context, not documents', () => {
     const data = form();
     data.observation.dom.visualRegions = [

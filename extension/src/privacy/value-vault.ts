@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { ObservedElement } from '../contracts';
 import { canonical, credentialKinds, openRedactionCandidates } from './openredaction';
-import { BindingSchema, IdSchema, LIMITS, PrivacyError, type Binding } from './contracts';
+import { BindingSchema, IdSchema, LIMITS, PrivacyError, type Binding, type PiiKind } from './contracts';
+import type { Placeholders } from './text';
 
 export const LocalValueRecordSchema = z.object({ id: IdSchema, taskId: IdSchema, observationId: IdSchema, origin: z.string().url(),
   target: IdSchema, purpose: z.string().max(100), value: z.string().min(1).max(2000), expiresAt: z.number().finite() }).strict();
@@ -9,6 +10,7 @@ const ApprovalSchema = z.object({ source: z.literal('approved_profile'), approve
   kind: z.enum(['person_name', 'email', 'phone', 'address', 'date_of_birth']), value: z.string().min(1).max(2000),
   target: IdSchema }).strict();
 const purposes = { person_name: 'Applicant name', email: 'Contact email', phone: 'Contact phone', address: 'Postal address', date_of_birth: 'Date of birth' };
+const purposeKinds = Object.fromEntries(Object.entries(purposes).map(([kind, purpose]) => [purpose, kind])) as Record<string, PiiKind>;
 export const sameBinding = (a: Binding, b: Binding) => (Object.keys(a) as Array<keyof Binding>).every(key => a[key] === b[key]);
 
 export class LocalValueVault {
@@ -68,6 +70,13 @@ export class LocalValueVault {
     this.#check();
     const value = canonical(text).toLowerCase().replace(/\s/g, '');
     return [...this.#records.values()].some(record => value.includes(record.value.toLowerCase().replace(/\s/g, '')));
+  }
+  // Replaces approved values in outgoing text with their placeholder tokens,
+  // so an instruction that repeats the user's own name is rewritten rather
+  // than refused. The values never leave this class.
+  scrub(text: string, placeholders: Placeholders) {
+    this.#check();
+    return placeholders.scrub(text, [...this.#records.values()].map(record => ({ kind: purposeKinds[record.purpose] ?? 'document', text: record.value })));
   }
   clear = () => { this.#closed = true; this.#records.clear(); clearTimeout(this.#timer); this.signal.removeEventListener('abort', this.clear); };
 }

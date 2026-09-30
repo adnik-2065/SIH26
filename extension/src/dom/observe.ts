@@ -1,7 +1,11 @@
 import type { DomSnapshot, ObservedElement } from '../contracts';
 import { collectVisualRegions } from './visuals';
 
-export const candidates = 'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"],[role="checkbox"]';
+// Rich-text editors (comment boxes, chat composers, mail bodies) are
+// contenteditable regions with no role. Without them here the text a user
+// typed into one was never described, so context mode never masked it.
+export const candidates = 'input,textarea,select,button,a[href],[role="button"],[role="textbox"],[role="combobox"],[role="checkbox"],' +
+  '[contenteditable]:not([contenteditable="false"])';
 
 // ---------------------------------------------------------------------------
 // Autocomplete / search-suggestion candidates.
@@ -46,8 +50,11 @@ function labelFor(el: HTMLElement) {
 }
 // One local boolean, never the value. A checkbox/radio reports the constant
 // "on" through .value, so only a checked state counts as user input there.
+// A button-type input's .value is its caption ('Google Search'), set by the
+// page, not typed by the user; counting it masked every such button.
 function hasValue(el: HTMLElement) {
   const control = el as HTMLInputElement;
+  if (el.matches('input[type="submit" i],input[type="button" i],input[type="reset" i],input[type="image" i]')) return false;
   if (el.matches('input[type="checkbox"],input[type="radio"],[role="checkbox"]')) return control.checked === true || el.getAttribute('aria-checked') === 'true';
   if (el.matches('input,textarea,select')) return Boolean(control.value);
   // A custom widget has no .value; whatever it renders is its value.

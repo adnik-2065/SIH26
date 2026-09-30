@@ -4,6 +4,7 @@ import { PanelEventSchema, TaskStateSchema, type CaptureTile, type ErrorCode, ty
 import { CAPTURE_RETRY_BACKOFF_MS, CAPTURE_RETRY_LIMIT, initialState, lifecycleStateLog, newActionHistory, newLoopTracker, nextCaptureRetry, nextRound, recordActionHistory, resetActionHistory, roundVerdict, RUN_LIMIT, type ActionHistoryEntry } from '../agent/lifecycle';
 import { TesseractAdapter, type OcrProgress } from '../vision/ocr/tesseract';
 import { MediaPipeAdapter } from '../vision/face/mediapipe';
+import { inspectSmallFaces } from '../vision/face/small';
 import { inspectCapturedPage } from '../vision/page';
 import { validateDeliveredTiles } from '../capture/tiles';
 import { AGENT_ENDPOINT, runtimePermissions, validateAgentEndpoint } from '../config';
@@ -275,8 +276,13 @@ function App() {
         if (!current()) return;
         const adapter = kind === 'text' ? adapterRef.current! : faceAdapterRef.current!;
         const update = (result: PerceptionResult) => { if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); } };
-        const result = await inspectCapturedPage(observation, adapter, controller.signal, update,
+        const page = await inspectCapturedPage(observation, adapter, controller.signal, update,
           (index, count) => { if (kind === 'text') ocrSectionRef.current = { index, count }; });
+        // Small pictures get a second, enlarged look for faces. It only adds
+        // regions: if it fails, the page pass result stands on its own.
+        const result = kind === 'face' && current()
+          ? await inspectSmallFaces(observation, adapter, controller.signal, page).catch(reason => { if (controller.signal.aborted) throw reason; return page; })
+          : page;
         if (current()) { if (kind === 'text') setOcr(result); else setFaces(result); }
       } catch (reason) {
 
