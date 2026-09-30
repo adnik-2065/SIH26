@@ -90,13 +90,40 @@ describe('translating a server response into actions', () => {
     expect(runnable.map(step => step.action.type)).toEqual(['back']);
     expect(deferred.map(step => step.action.type)).toEqual(['click', 'done']);
   });
+  it('opens a normalized http(s) address and ends the batch there', () => {
+    const plan = planActions(reply([
+      { action: 'type', id: 'obs_1_e1', value: 'Demo Student' },
+      { action: 'navigate', value: 'en.wikipedia.org/wiki/Artificial_intelligence' },
+      { action: 'click', id: 'obs_1_e4' },
+    ]), request);
+    if (!plan.ok) throw new Error('expected a plan');
+    expect(plan.steps[1].action).toEqual({ type: 'navigate', url: 'https://en.wikipedia.org/wiki/Artificial_intelligence' });
+    const { runnable, deferred } = executableNow(plan.steps);
+    expect(runnable.map(step => step.action.type)).toEqual(['type', 'navigate']);
+    expect(deferred.map(step => step.action.type)).toEqual(['click']);
+  });
+  it.each([
+    ['javascript:alert(1)', 'INVALID_ACTION'],
+    ['JavaScript:alert(1)', 'INVALID_ACTION'],
+    ['data:text/html,<script>alert(1)</script>', 'INVALID_ACTION'],
+    ['file:///etc/passwd', 'INVALID_ACTION'],
+    ['chrome://settings', 'INVALID_ACTION'],
+    ['https://user:secret@example.com/', 'INVALID_ACTION'],
+    ['https://exa mple.com/', 'INVALID_ACTION'],
+    ['', 'MISSING_VALUE'],
+    ['https://example.com/?card=4111%201111%201111%201111', 'UNSAFE_VALUE'],
+  ])('refuses the address %j', (value, reason) => {
+    const plan = planActions(reply([{ action: 'navigate', value }]), request);
+    expect(plan.ok && plan.steps).toEqual([]);
+    expect(plan.ok && plan.rejected).toEqual([{ index: 0, reason }]);
+  });
   it('ignores anything the model appends after it said it had finished', () => {
     const plan = planActions(reply([{ action: 'finish' }, { action: 'click', id: 'obs_1_e4' }]), request);
     expect(plan.ok && plan.steps.map(step => step.action)).toEqual([{ type: 'done' }]);
     expect(plan.ok && plan.rejected).toEqual([{ index: 1, reason: 'AFTER_FINISH' }]);
   });
   it.each([
-    ['unknown action verbs', reply([{ action: 'navigate', value: 'https://example.test' }])],
+    ['unknown action verbs', reply([{ action: 'download', value: 'https://example.test/file' }])],
     ['injected script fields', reply([{ action: 'click', id: 'obs_1_e4', script: 'alert(1)' }])],
     ['a missing output list', { thought: 'done' }],
     ['an empty output list', reply([])],
@@ -111,13 +138,25 @@ describe('translating a server response into actions', () => {
     expect(planActions(reply([{ action: 'finish' }], { observationId: 'obs_9' }), request)).toMatchObject({ ok: false, reason: 'WRONG_REQUEST' });
     expect(planActions(reply([{ action: 'finish' }], { requestId: 'request_1', taskId: 'task_1' }), request).ok).toBe(true);
   });
-  it('runs one page-touching step per observation and defers the rest', () => {
+  it('runs field entries and one page-touching step per observation and defers the rest', () => {
     const plan = planActions(reply([{ action: 'wait', value: '200' }, { action: 'type', id: 'obs_1_e1', value: 'Demo Student' },
       { action: 'click', id: 'obs_1_e4' }, { action: 'finish' }]), request);
     if (!plan.ok) throw new Error('expected a plan');
     const { runnable, deferred } = executableNow(plan.steps);
-    expect(runnable.map(step => step.action.type)).toEqual(['wait', 'type']);
-    expect(deferred.map(step => step.action.type)).toEqual(['click', 'done']);
+    expect(runnable.map(step => step.action.type)).toEqual(['wait', 'type', 'click']);
+    expect(deferred.map(step => step.action.type)).toEqual(['done']);
+  });
+  it.each([
+    ['a click ends the batch before a field entry', [{ action: 'click', id: 'obs_1_e4' }, { action: 'type', id: 'obs_1_e1', value: 'Demo Student' }], ['click'], ['type']],
+    ['field entries lead a key press', [{ action: 'type', id: 'obs_1_e1', value: 'Demo' }, { action: 'type', id: 'obs_1_e1', value: 'Student' },
+      { action: 'key', id: 'obs_1_e1', value: 'Enter' }, { action: 'finish' }], ['type', 'type', 'key'], ['done']],
+    ['a scroll ends the batch', [{ action: 'scroll', value: 'down' }, { action: 'click', id: 'obs_1_e4' }], ['scroll'], ['click']],
+  ])('%s', (_label, output, now, later) => {
+    const plan = planActions(reply(output), request);
+    if (!plan.ok) throw new Error('expected a plan');
+    const { runnable, deferred } = executableNow(plan.steps);
+    expect(runnable.map(step => step.action.type)).toEqual(now);
+    expect(deferred.map(step => step.action.type)).toEqual(later);
   });
   it('keeps ordinary form text usable', () => {
     for (const value of ['Demo Student', '2026-01-01', 'Morning session', 'Room 4B']) expect(literalTextAllowed(value)).toBe(true);
@@ -220,6 +259,12 @@ describe('the body sent to the reasoning server', () => {
     // …and every addressable id is still one the payload exported.
     for (const id of body.page_info.match(/id=\S+/g) ?? []) expect(withBoxes.elements.some(element => id === `id=${element.id}`)).toBe(true);
     expect(body.page_info).not.toContain('xpath');
+  });
+  it('says which listed controls lie outside a viewport screenshot', () => {
+    const body = toAgentBody({ ...request, elements: [{ ...request.elements[0], bounds: { x: 8, y: 8, width: 100, height: 24 } }, request.elements[3]],
+      sanitizedImage: { mimeType: 'image/png' as const, base64: 'AAAA', width: 480, height: 720 } });
+    expect(body.page_info).toContain('id=obs_1_e4 role=button label="Submit" (outside the screenshot)');
+    expect(body.problem_context).toContain('navigate');
   });
   it('adds no box when no screenshot is attached', () => {
     const body = toAgentBody({ ...request });

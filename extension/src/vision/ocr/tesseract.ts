@@ -1,10 +1,13 @@
 import { PerceptionResultSchema, type PerceptionAdapter, type PerceptionInput, type PerceptionResult } from '../contracts';
+import { mergeRuntimes, newDetectorRuntime, readRuntimeSample, recordRuntime, resetRuntime } from '../../metrics/timings';
 
 export interface OcrProgress { status: string; progress: number }
 
 export class TesseractAdapter implements PerceptionAdapter {
   private worker?: Worker;
   private cancel?: () => void;
+  // Where this engine's time went, for the run log.
+  readonly runtime = newDetectorRuntime();
 
   constructor(private readonly onProgress: (progress: OcrProgress) => void = () => {}, private readonly timeoutMs = 90_000) {}
 
@@ -12,6 +15,17 @@ export class TesseractAdapter implements PerceptionAdapter {
     this.cancel?.();
     this.worker?.terminate();
     this.worker = undefined;
+  }
+
+  get busy() { return !!this.cancel; }
+
+  // Loads the engine ahead of the first inspection. A failure here is left for
+  // that inspection to meet and report.
+  warm() {
+    try {
+      this.worker ??= new Worker(new URL('./tesseract.worker.ts', import.meta.url), { type: 'module' });
+      this.worker.postMessage({ type: 'warm', assetRoot: chrome.runtime.getURL('ocr') });
+    } catch { /* the next inspection creates the worker and reports its failure */ }
   }
 
   inspect(input: PerceptionInput, signal: AbortSignal): Promise<PerceptionResult> {
@@ -57,6 +71,8 @@ export class TesseractAdapter implements PerceptionAdapter {
           if (result.data.regions.some(({ kind, bounds: b }) => kind !== 'text' || b.x < 0 || b.y < 0 || b.x + b.width > width || b.y + b.height > height)) {
             fail('OCR_INVALID_BOUNDS'); return;
           }
+          const sample = readRuntimeSample(data.runtime);
+          if (sample) recordRuntime(this.runtime, sample);
           cleanup(); resolve(result.data);
         }
       };
@@ -65,3 +81,30 @@ export class TesseractAdapter implements PerceptionAdapter {
     });
   }
 }
+
+// Several engines, each on its own worker, so the strips of one screen are read
+// side by side. Each lane is an ordinary single-worker adapter.
+export class TesseractPool implements PerceptionAdapter {
+  private readonly pool: TesseractAdapter[];
+
+  constructor(readonly lanes: number, onProgress: (progress: OcrProgress) => void = () => {}) {
+    this.pool = Array.from({ length: Math.max(1, lanes) }, () => new TesseractAdapter(onProgress));
+  }
+
+  dispose() { for (const lane of this.pool) lane.dispose(); }
+
+  warm() { for (const lane of this.pool) lane.warm(); }
+
+  get runtime() { return mergeRuntimes(this.pool.map(lane => lane.runtime)); }
+  resetRuntime() { for (const lane of this.pool) resetRuntime(lane.runtime); }
+
+  inspect(input: PerceptionInput, signal: AbortSignal): Promise<PerceptionResult> {
+    const lane = this.pool.find(candidate => !candidate.busy);
+    if (!lane) { input.image.close(); return Promise.reject(new Error(signal.aborted ? 'STOPPED' : 'OCR_BUSY')); }
+    return lane.inspect(input, signal);
+  }
+}
+
+// Leave cores for the face and document detectors running alongside, and cap
+// the engines' memory: each lane holds its own model.
+export const ocrLanes = (cores = navigator.hardwareConcurrency || 1) => Math.max(1, Math.min(4, Math.floor(cores / 3)));

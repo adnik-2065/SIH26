@@ -140,7 +140,7 @@ test('scroll and done need no target and touch no control', async ({ page }) => 
   expect(await run(page, { type: 'done' })).toEqual({ ok: true });
 });
 
-test('a whole server reply becomes at most one page-touching step', async ({ page }) => {
+test('a whole server reply runs its field entries and at most one page-touching step', async ({ page }) => {
   const ids = await page.evaluate(() => (window as unknown as { scan: () => Record<string, string> }).scan());
   const result = await page.evaluate(ids => {
     const request = { protocolVersion: 1 as const, requestId: 'request_1', taskId: 'task_1', observationId: 'obs_1',
@@ -161,10 +161,10 @@ test('a whole server reply becomes at most one page-touching step', async ({ pag
   }, ids);
   expect(result.ok).toBe(true);
   if (!result.ok) return;
-  expect(result.outcomes).toEqual([{ ok: true }]);
+  expect(result.outcomes).toEqual([{ ok: true }, { ok: true }]);
   expect(result.value).toBe('Demo Student');
-  // The click was planned but not performed: the form it was planned against
-  // no longer exists as the user reviewed it.
-  expect(result.deferred).toEqual(['click', 'done']);
-  expect(result.title).not.toBe('submitted');
+  // Typing leaves the reviewed form in place, so the submit runs on the same
+  // scan. `finish` waits for a fresh observation of the page the click left.
+  expect(result.deferred).toEqual(['done']);
+  expect(result.title).toBe('submitted');
 });

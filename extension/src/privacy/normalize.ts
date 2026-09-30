@@ -2,9 +2,13 @@ import type { Rect } from '../contracts';
 import type { PerceptionResult } from '../vision/contracts';
 import { canonical, openRedactionCandidates } from './openredaction';
 import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type Mask } from './contracts';
-import { DEFAULT_PADDING, domBounds, mergeMasks, paddedMask, union, validateBounds } from './geometry';
+import { DEFAULT_PADDING, mergeMasks, paddedMask, union, validateBounds, visibleDomBounds } from './geometry';
 import { controlIsMasked } from './policy';
 import { Placeholders, sanitizeText } from './text';
+
+// The kinds worth re-detecting with whitespace removed: fixed formats that OCR
+// splits at arbitrary characters.
+export const compactKinds: readonly string[] = ['email', 'phone', 'pan', 'aadhaar', 'payment_card', 'ifsc', 'passport', 'bank_account'];
 
 export function reconstructOcr(regions: PerceptionResult['regions']) {
   const lines: Array<{ bounds: Rect; words: PerceptionResult['regions'] }> = [];
@@ -30,11 +34,29 @@ export function reconstructOcr(regions: PerceptionResult['regions']) {
         'empty text region');
       if (wordIndex) text += ' ';
       const start = text.length; text += value;
-      if (text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
+      if (text.length > LIMITS.pageText) throw new PrivacyError('LIMIT_EXCEEDED');
       spans.push({ start, end: text.length, bounds: word.bounds });
     }
   }
   return { text, spans };
+}
+
+// Long pages read to more text than one detection call accepts. Refusing them
+// stopped every run on a long page, so the text is split at line boundaries
+// (a word boundary for a single oversized line) into pieces detection accepts.
+// A value is only split if one line is longer than the limit.
+export function textChunks(text: string, limit: number = LIMITS.text) {
+  const chunks: Array<{ start: number; text: string }> = [];
+  for (let start = 0; start < text.length;) {
+    let end = Math.min(text.length, start + limit);
+    if (end < text.length) {
+      const line = text.lastIndexOf('\n', end - 1), space = text.lastIndexOf(' ', end - 1);
+      end = line > start ? line + 1 : space > start ? space + 1 : end;
+    }
+    chunks.push({ start, text: text.slice(start, end) });
+    start = end;
+  }
+  return chunks;
 }
 
 export function normalize(data: ExportData, placeholders: Placeholders) {
@@ -57,8 +79,10 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
   const instruction = sanitizeText(data.instruction, 'instruction', placeholders);
   instruction.findings.forEach(append);
   const elements = observation.dom.elements.map(element => {
-    const bounds = domBounds(element.bounds, observation);
-    const result = sanitizeText(element.label, 'element_description', placeholders);
+    // A control outside the captured screen has no pixels to mask; its label
+    // is still sanitized below and it is listed without an image box.
+    const bounds = visibleDomBounds(element.bounds, observation);
+    const result = sanitizeText(element.label, 'element_description', placeholders, textPolicy);
     result.findings.forEach(finding => append({ ...finding, bounds, elementId: element.id }));
     if (element.sensitive || /password|otp|token|secret/i.test(element.type)) append({ id: 'pending', source: 'dom', kind: 'password',
       confidence: 1, bounds, elementId: element.id, exportPolicy: 'withhold', redactText: true, redactPixels: true });
@@ -68,7 +92,7 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     // whole form, and its visible labels, without hiding any private value.
     // Context mode also trims the document padding: 8px around each of a stack
     // of form rows bridges the gaps and re-creates the single black slab.
-    if (controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
+    if (bounds && controlIsMasked(element, textPolicy)) masks.push(paddedMask(bounds, 'document', width, height, controlPadding));
     // 'option' is the autocomplete suggestion row exposed by the observer;
     // collapsing it into 'control' would hide the suggestion semantics the
     // server needs to click the visible option instead of guessing.
@@ -84,7 +108,7 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
       // lists it so a visible control whose label the redaction replaced can
       // be matched by position to this exact existing id. Coordinates only:
       // no label, href or attribute value travels with it.
-      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } };
+      ...(bounds ? { bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height } } : {}) };
   });
   const words = data.ocr.result!.regions;
   for (const region of words) {
@@ -95,53 +119,51 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
         { kind: region.kind, hasText: !!region.text, hasConfidence: region.confidence !== undefined },
         'incomplete text region');
     }
-    // A word box without a single letter or digit carries nothing any PII rule
-    // could classify: 'â€”' and '||' over thumbnails and borders are OCR noise,
-    // and context mode keeps them visible. Strict mode still covers every
-    // word, and every real word keeps the low-confidence conservative mask.
-    const garbage = !/\p{L}|\p{N}/u.test(region.text);
-    if (textPolicy === 'all_text' || (region.confidence < 0.35 && !garbage)) masks.push(paddedMask(region.bounds, 'document', width, height));
+    // Strict mode covers every word. Context mode masks only the words whose
+    // text OpenRedaction classifies as PII (below). OCR confidence is not
+    // evidence: a badly read article count ('2781 000+' at 12%) looked like an
+    // identifier fragment and was blanked, though nothing classified it.
+    if (textPolicy === 'all_text') masks.push(paddedMask(region.bounds, 'document', width, height));
   }
   const reconstructed = reconstructOcr(words);
-  const result = sanitizeText(reconstructed.text, 'ocr', placeholders, textPolicy);
-  result.findings.forEach((finding, index) => {
-    const span = result.spans[index];
-    const boxes = reconstructed.spans.filter(box => box.start < span.end && box.end > span.start).map(box => box.bounds);
-    if (!boxes.length) throw new PrivacyError('INVALID_BOUNDS');
-    append({ ...finding, bounds: boxes.reduce(union) });
-  });
-  // Also classify compact OCR: emails/IDs may split at arbitrary characters,
-  // line wraps or capture seams. Keep an offset map back to every source box.
-  // Compact detection runs in both policies: whitespace-collapsed text is
-  // where split emails and identifiers rejoin, and its offset map keeps every
-  // mask on the source OCR boxes.
-  for (const block of reconstructed.text.matchAll(/[^\n]+(?:\n(?!\n)[^\n]+)*/g)) {
-    const compact = block[0].replace(/\s/g, '');
-    const offsets: number[] = [];
-    for (let i = 0; i < block[0].length; i++) if (!/\s/.test(block[0][i])) offsets.push(block.index! + i);
-    // Compact only format-based candidates. Ordinary prose becomes a long
-    // opaque-looking token when spaces are removed; that is not token evidence.
-    const spans = openRedactionCandidates(compact).filter(span => ['email', 'phone', 'pan', 'aadhaar', 'payment_card', 'ifsc', 'passport', 'bank_account'].includes(span.kind));
-    spans.forEach(span => {
-      const start = offsets[span.start], end = offsets[span.end - 1] + 1;
-      // The same value, with its real spaces restored, was already offered to
-      // detection above. If that pass classified it, its findings carry the
-      // value's own boxes; a compact re-detection here would only widen them
-      // to the whole block, so keep the tighter evidence.
-      // The same block with its real spaces restored was already offered to
-      // detection above. If that pass found a value of this kind inside the
-      // compact candidate, the compact form is prose glued onto an already
-      // detected value, and keeping it would widen the mask from the value's
-      // own boxes to the whole block. Only genuinely split values survive.
-      const value = compact.slice(span.start, span.end);
-      if (openRedactionCandidates(block[0]).some(other => other.kind === span.kind &&
-        value.includes(block[0].slice(other.start, other.end).replace(/\s/g, '')))) return;
+  for (const chunk of textChunks(reconstructed.text)) {
+    const result = sanitizeText(chunk.text, 'ocr', placeholders, textPolicy);
+    result.findings.forEach((finding, index) => {
+      const span = result.spans[index], start = chunk.start + span.start, end = chunk.start + span.end;
       const boxes = reconstructed.spans.filter(box => box.start < end && box.end > start).map(box => box.bounds);
       if (!boxes.length) throw new PrivacyError('INVALID_BOUNDS');
-      append({ id: 'pending', source: 'ocr', kind: span.kind, confidence: 1, text: compact.slice(span.start, span.end),
-        textRange: { start, end }, detector: span.detector ?? 'openredaction',
-        exportPolicy: 'replace', redactText: true, redactPixels: true, bounds: boxes.reduce(union) });
+      append({ ...finding, ...(finding.textRange ? { textRange: { start, end } } : {}), bounds: boxes.reduce(union) });
     });
+    // Also classify compact OCR: emails/IDs may split at arbitrary characters,
+    // line wraps or capture seams. Keep an offset map back to every source box.
+    // Compact detection runs in both policies: whitespace-collapsed text is
+    // where split emails and identifiers rejoin, and its offset map keeps every
+    // mask on the source OCR boxes.
+    for (const block of chunk.text.matchAll(/[^\n]+(?:\n(?!\n)[^\n]+)*/g)) {
+      const blockStart = chunk.start + block.index!;
+      const compact = block[0].replace(/\s/g, '');
+      const offsets: number[] = [];
+      for (let i = 0; i < block[0].length; i++) if (!/\s/.test(block[0][i])) offsets.push(blockStart + i);
+      // Compact only format-based candidates. Ordinary prose becomes a long
+      // opaque-looking token when spaces are removed; that is not token evidence.
+      const spans = openRedactionCandidates(compact).filter(span => compactKinds.includes(span.kind));
+      spans.forEach(span => {
+        const start = offsets[span.start], end = offsets[span.end - 1] + 1;
+        // The same block with its real spaces restored was already offered to
+        // detection above. If that pass found a value of this kind inside the
+        // compact candidate, the compact form is prose glued onto an already
+        // detected value, and keeping it would widen the mask from the value's
+        // own boxes to the whole block. Only genuinely split values survive.
+        const value = compact.slice(span.start, span.end);
+        if (openRedactionCandidates(block[0]).some(other => other.kind === span.kind &&
+          value.includes(block[0].slice(other.start, other.end).replace(/\s/g, '')))) return;
+        const boxes = reconstructed.spans.filter(box => box.start < end && box.end > start).map(box => box.bounds);
+        if (!boxes.length) throw new PrivacyError('INVALID_BOUNDS');
+        append({ id: 'pending', source: 'ocr', kind: span.kind, confidence: 1, text: value,
+          textRange: { start, end }, detector: span.detector ?? 'openredaction',
+          exportPolicy: 'replace', redactText: true, redactPixels: true, bounds: boxes.reduce(union) });
+      });
+    }
   }
   for (const region of data.faces.result!.regions) {
     validateBounds(region.bounds, width, height);

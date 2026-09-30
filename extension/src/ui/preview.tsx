@@ -45,7 +45,8 @@ function PreviewTile({ tile, ...props }: PreviewProps & { tile: CaptureTile }) {
       if (showControls) for (const [i, element] of observation.dom.elements.entries()) {
         const box = element.bounds;
         context.strokeStyle = element.disabled ? '#c77a13' : '#16816a'; context.fillStyle = context.strokeStyle;
-        const x = (box.x + vp.scrollX - vp.offsetX) * sx, y = (box.y + vp.scrollY - vp.offsetY) * sy;
+        const x = (box.x + vp.scrollX - vp.offsetX - observation.captureBounds.x) * sx,
+          y = (box.y + vp.scrollY - vp.offsetY - observation.captureBounds.y) * sy;
         context.strokeRect(x, y, box.width * sx, box.height * sy);
         context.fillText(String(i + 1), x + 3, y + 13 * sy);
       }

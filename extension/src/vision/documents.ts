@@ -2,11 +2,12 @@ import { z } from 'zod';
 import { VisualCategorySchema, type LocalObservation, type Rect } from '../contracts';
 import type { PerceptionResult } from './contracts';
 import { ocrDocumentCue } from '../dom/visuals';
-import { BoundsSchema, DocumentEvidenceSchema, LIMITS, privacyError, PrivacyError } from '../privacy/contracts';
-import { domBounds, intersection, union, validateBounds } from '../privacy/geometry';
+import { BoundsSchema, DocumentEvidenceSchema, privacyError, PrivacyError } from '../privacy/contracts';
+import { imagePageFrame, intersection, pageFrame, union, validateBounds, visibleDomBounds } from '../privacy/geometry';
 import { reconstructOcr } from '../privacy/normalize';
 import { visualIsMasked, visualRegionIsEvidence } from '../privacy/policy';
 import { bounded, pngBytes, validateTiles } from '../privacy/image';
+import { tileDigest, type ResultCache } from './reuse';
 
 export const VisionDocumentResultSchema = z.object({ observationId: z.string(), truncated: z.literal(false),
   detections: z.array(z.object({ type: VisualCategorySchema, source: z.literal('vision_model'),
@@ -38,12 +39,13 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
     { observationId: observation.dom.observationId, source: ocr.source }, 'result source is not the model');
   // Keep legitimate visual candidates, but never let a page-sized container
   // become a page-scale document mask: that is how a screenshot turned black.
+  // A region wholly outside the captured screen has no pixels to mask here.
   const regions: DocumentEvidence['regions'] = (observation.dom.visualRegions ?? [])
-    .filter(region => visualIsMasked(region.category, textPolicy) && visualRegionIsEvidence(region.bounds, observation.captureBounds))
-    .map(region => ({
-    kind: kind(region.category), category: region.category, confidence: region.confidence,
-    bounds: domBounds(region.bounds, observation),
-  }));
+    .filter(region => visualIsMasked(region.category, textPolicy) && visualRegionIsEvidence(region.bounds, pageFrame(observation)))
+    .flatMap(region => {
+      const bounds = visibleDomBounds(region.bounds, observation);
+      return bounds ? [{ kind: kind(region.category), category: region.category, confidence: region.confidence, bounds }] : [];
+    });
   // OCR gives cues, not a trustworthy document boundary. One phrase is not
   // evidence for a page-scale rectangle, so both policies mask the lines the
   // cue actually sits on, widened across the capture: that is the largest
@@ -51,7 +53,6 @@ export function detectLocalDocuments(observation: LocalObservation, ocr: Percept
   // caught by the text rules, and labelled or model-detected document regions
   // still cover the rest of a real document.
   const reconstructed = reconstructOcr(ocr.regions);
-  if (reconstructed.text.length > LIMITS.text) throw new PrivacyError('LIMIT_EXCEEDED');
   const cue = ocrDocumentCue(reconstructed.text);
   if (cue) {
     const page: Rect = { x: 0, y: 0, width: observation.imageWidth, height: observation.imageHeight };
@@ -83,6 +84,33 @@ export function mergeDocumentEvidence(base: DocumentEvidence, model: DocumentEvi
   return DocumentEvidenceSchema.parse({ ...base, detector: 'vision_model', regions });
 }
 
+// A document the model can see is a picture on the page: an <img>, canvas,
+// video frame, embedded viewer or CSS background image. The bundled model also
+// fires on plain HTML — an ordinary <form> read as an identity card at .9, an
+// empty page as a signature — so a model box is kept only when most of it lies
+// on an image-like DOM region. Text-only documents are covered by the OCR
+// document cues and text rules instead. This is model-agnostic; set
+// MODEL_BOX_ON_IMAGE to 0 to trust a replacement model's boxes on their own.
+export const MODEL_BOX_ON_IMAGE = .5;
+function imageRegions(observation: LocalObservation): Rect[] {
+  return (observation.dom.visualRegions ?? []).filter(region => region.category !== 'form_control').flatMap(region => {
+    // A region wholly outside the capture has no image-space box; it cannot
+    // corroborate anything, and is not an error here.
+    try { const box = visibleDomBounds(region.bounds, observation); return box ? [box] : []; } catch { return []; }
+  });
+}
+function onImage(box: Rect, images: Rect[]) {
+  if (MODEL_BOX_ON_IMAGE <= 0) return true;
+  const area = box.width * box.height;
+  // Overlapping image regions are summed, capped at the box itself, which is
+  // enough for nested regions (a background image under an <img>).
+  const covered = images.reduce((sum, image) => {
+    const shared = intersection(box, image);
+    return sum + (shared ? shared.width * shared.height : 0);
+  }, 0);
+  return Math.min(area, covered) >= area * MODEL_BOX_ON_IMAGE;
+}
+
 function overlap(a: { x: number; y: number; width: number; height: number }, b: typeof a) {
   const intersection = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) *
     Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
@@ -92,34 +120,51 @@ function overlap(a: { x: number; y: number; width: number; height: number }, b: 
 // Optional model boundary; deliberately independent of YOLO and masking.
 // Keep every crop's boxes, including overlap margins. Center ownership can
 // discard a truncated document that is visible in only one crop.
+export type Detections = z.infer<typeof VisionDocumentResultSchema>['detections'];
+// `cache` holds the model's raw boxes per tile's pixels; the filters below are
+// applied to them afresh for every observation.
 export async function inspectDocumentTiles(observation: LocalObservation, adapter: DocumentVisionAdapter,
-  signal: AbortSignal): Promise<DocumentEvidence> {
+  signal: AbortSignal, cache?: ResultCache<Detections>): Promise<DocumentEvidence> {
   validateTiles(observation);
   const regions: DocumentEvidence['regions'] = [];
   const check = () => { if (signal.aborted) throw new PrivacyError('STOPPED'); };
   const observationId = observation.dom.observationId;
+  const images = imageRegions(observation);
   for (const [tileIndex, tile] of observation.tiles.entries()) {
     check();
+    // Every box the model can return lies inside its tile, and `onImage` keeps
+    // only boxes mostly on an image region. A tile no image region touches can
+    // therefore contribute nothing, so the model is not run on it.
+    if (MODEL_BOX_ON_IMAGE > 0 && !images.some(box => intersection(box, { x: 0, y: tile.y, width: tile.width, height: tile.height }))) {
+      if (cache) cache.skips++;
+      continue;
+    }
     let image: ImageBitmap | undefined;
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(abort, 90_000);
     try {
-      const bytes = pngBytes(tile.screenshot, tile.width, tile.height);
-      image = await bounded(createImageBitmap(new Blob([bytes], { type: 'image/png' })), controller.signal, late => late.close()); check();
-      if (image.width !== tile.width || image.height !== tile.height) throw new PrivacyError('INVALID_BOUNDS');
-      // The adapter owns its model timeout and returns a detector-specific
-      // error. Do not wrap it in the image helper, whose generic timeout code
-      // would hide whether the ONNX worker failed or the PNG decode failed.
-      const parsed = VisionDocumentResultSchema.safeParse(await adapter.inspect({ observationId, image }, controller.signal)); check();
-      if (!parsed.success) throw privacyError('DOCUMENT_DETECTION_FAILED', 'DOCUMENT_DETECTION',
-        'The document model returned a result that does not match its contract.',
-        { observationId, tileIndex, schema: 'VisionDocumentResultSchema' }, 'MODEL_RESULT_INVALID');
-      if (parsed.data.observationId !== observationId) throw privacyError('INCOMPLETE_DETECTION_BINDING', 'DOCUMENT_DETECTION',
-        'The document model answered for a different observation.',
-        { observationId, evidenceObservationId: parsed.data.observationId, tileIndex }, 'observation id mismatch');
-      for (const detection of parsed.data.detections) {
+      const key = cache && `${await tileDigest(tile)}|${tile.width}x${tile.height}`;
+      let detections = key ? cache!.get(key) : undefined;
+      if (!detections) {
+        const bytes = pngBytes(tile.screenshot, tile.width, tile.height);
+        image = await bounded(createImageBitmap(new Blob([bytes], { type: 'image/png' })), controller.signal, late => late.close()); check();
+        if (image.width !== tile.width || image.height !== tile.height) throw new PrivacyError('INVALID_BOUNDS');
+        // The adapter owns its model timeout and returns a detector-specific
+        // error. Do not wrap it in the image helper, whose generic timeout code
+        // would hide whether the ONNX worker failed or the PNG decode failed.
+        const parsed = VisionDocumentResultSchema.safeParse(await adapter.inspect({ observationId, image }, controller.signal)); check();
+        if (!parsed.success) throw privacyError('DOCUMENT_DETECTION_FAILED', 'DOCUMENT_DETECTION',
+          'The document model returned a result that does not match its contract.',
+          { observationId, tileIndex, schema: 'VisionDocumentResultSchema' }, 'MODEL_RESULT_INVALID');
+        if (parsed.data.observationId !== observationId) throw privacyError('INCOMPLETE_DETECTION_BINDING', 'DOCUMENT_DETECTION',
+          'The document model answered for a different observation.',
+          { observationId, evidenceObservationId: parsed.data.observationId, tileIndex }, 'observation id mismatch');
+        detections = parsed.data.detections;
+        if (key) cache!.set(key, detections);
+      }
+      for (const detection of detections) {
         const box = validateBounds(detection.bbox, tile.width, tile.height);
         const pageBox = { ...box, y: box.y + tile.y };
         // A detection covering essentially the whole capture describes the page
@@ -127,7 +172,8 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         // evidence rule that gates DOM candidates gates model output, in image
         // space, so a false positive over ordinary UI can never become a
         // page-wide mask. Bounded detections still union across tile seams.
-        if (!visualRegionIsEvidence(pageBox, { width: observation.imageWidth, height: observation.imageHeight })) continue;
+        if (!visualRegionIsEvidence(pageBox, imagePageFrame(observation))) continue;
+        if (!onImage(pageBox, images)) continue;
         // The same document seen by neighbouring tiles arrives as one box per
         // crop. Union same-category intersecting boxes into one region: the
         // candidate list is deduplicated, while every crop's boxes keep their
@@ -137,8 +183,6 @@ export async function inspectDocumentTiles(observation: LocalObservation, adapte
         const existing = regions.find(region => region.category === detection.type && intersection(region.bounds, pageBox));
         if (existing) existing.bounds = union(existing.bounds, pageBox);
         else regions.push({ kind: kind(detection.type), category: detection.type, confidence: detection.confidence, bounds: pageBox });
-        // eslint-disable-next-line no-console -- temporary runtime provenance diagnostic
-        console.log('[DOC-PROBE] accepted', JSON.stringify({ category: detection.type, confidence: detection.confidence, pageBox, tile: { y: tile.y, width: tile.width, height: tile.height } }));
       }
       if (regions.length > 500) throw new PrivacyError('LIMIT_EXCEEDED');
     } catch (error) {

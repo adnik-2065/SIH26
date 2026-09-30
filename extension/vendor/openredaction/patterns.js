@@ -1,4 +1,497 @@
 // Generated from @openredaction/core 1.1.5 (MIT). See LICENSE and scripts/openredaction.mjs.
+function extractContext(text, startPos, endPos, wordsBefore = 5, wordsAfter = 5) {
+	const beforeWords = text.substring(Math.max(0, startPos - 250), startPos).split(/\s+/).filter((w) => w.length > 0).slice(-wordsBefore);
+	const before = beforeWords.join(" ");
+	const afterWords = text.substring(endPos, Math.min(text.length, endPos + 250)).split(/\s+/).filter((w) => w.length > 0).slice(0, wordsAfter);
+	return {
+		before,
+		after: afterWords.join(" "),
+		beforeWords,
+		afterWords,
+		sentence: extractSentence(text, startPos, endPos)
+	};
+}
+function extractSentence(text, startPos, endPos) {
+	const sentenceStart = findSentenceStart(text, startPos);
+	const sentenceEnd = findSentenceEnd(text, endPos);
+	return text.substring(sentenceStart, sentenceEnd).trim();
+}
+function findSentenceStart(text, pos) {
+	for (let i = pos - 1; i >= 0; i--) {
+		const char = text[i];
+		if (char === "." || char === "!" || char === "?" || char === "\n") return i + 1;
+	}
+	return 0;
+}
+function findSentenceEnd(text, pos) {
+	for (let i = pos; i < text.length; i++) {
+		const char = text[i];
+		if (char === "." || char === "!" || char === "?" || char === "\n") return i + 1;
+	}
+	return text.length;
+}
+function inferDocumentType(text) {
+	const sample = text.substring(0, Math.min(1e3, text.length)).toLowerCase();
+	const emailScore = (sample.match(/\b(from|to|subject|dear|regards|sincerely|cc|bcc):/gi) || []).length;
+	const codeScore = (sample.match(/\b(function|const|let|var|class|import|export|return|if|else|for|while)\b/g) || []).length;
+	const chatScore = (sample.match(/<.*?>|^\[?\d{1,2}:\d{2}\]?|^>|^@/gm) || []).length;
+	if (codeScore > 5) return "code";
+	if (emailScore > 2) return "email";
+	if (chatScore > 3) return "chat";
+	return "document";
+}
+function analyzeContextFeatures(fullContext) {
+	const lower = fullContext.toLowerCase();
+	const hasTechnicalContext = (lower.match(/\b(api|sdk|cli|gui|json|xml|http|url|database|server|client|endpoint|variable|function|method|class|interface|code|debug|log)\b/g) || []).length > 0;
+	const hasBusinessContext = (lower.match(/\b(company|corporation|corp|ltd|llc|inc|ceo|cto|cfo|manager|director|employee|staff|team|department|office|business)\b/g) || []).length > 0;
+	const hasMedicalContext = (lower.match(/\b(patient|doctor|physician|nurse|hospital|clinic|medical|health|diagnosis|treatment|prescription|medication|surgery|exam|test|lab|specimen)\b/g) || []).length > 0;
+	const hasFinancialContext = (lower.match(/\b(bank|account|payment|transaction|transfer|wire|credit|debit|balance|deposit|withdrawal|loan|mortgage|investment|trading|stock|bond)\b/g) || []).length > 0;
+	const strongTestPatterns = [
+		/\b(test|testing|dummy|mock|fake)\s+(data|value|example|user|account|email|phone)/i,
+		/\bfor\s+(testing|demonstration|example)\s+purposes/i,
+		/\b(this|here)\s+is\s+(an?\s+)?(example|sample|test)/i,
+		/\bxxx+|000+|111+|123+/i,
+		/\blorem\s+ipsum/i
+	];
+	const weakMatches = (lower.match(/\b(example|sample|test|demo|placeholder|dummy|mock)\b/g) || []).length;
+	return {
+		hasTechnicalContext,
+		hasBusinessContext,
+		hasMedicalContext,
+		hasFinancialContext,
+		hasExampleContext: strongTestPatterns.some((pattern) => pattern.test(fullContext)) || weakMatches >= 2,
+		relativePosition: 0
+	};
+}
+function calculateContextConfidence(_value, patternType, context) {
+	let confidence = .8;
+	if (context.documentType === "code") {
+		if (![
+			"API_KEY",
+			"JWT",
+			"BEARER_TOKEN",
+			"AWS_ACCESS_KEY",
+			"GITHUB_TOKEN",
+			"SECRET"
+		].some((p) => patternType.includes(p))) confidence -= .15;
+	} else if (context.documentType === "email") {
+		if ([
+			"EMAIL",
+			"PHONE",
+			"NAME",
+			"ADDRESS"
+		].includes(patternType.split("_")[0])) confidence += .1;
+	}
+	if (context.features.hasExampleContext && patternType === "EMAIL") confidence -= .15;
+	if (context.features.hasMedicalContext && [
+		"MEDICAL",
+		"MRN",
+		"PATIENT",
+		"NHS",
+		"NPI",
+		"DEA",
+		"ICD",
+		"CPT",
+		"PRESCRIPTION"
+	].some((p) => patternType.includes(p))) confidence += .15;
+	if (context.features.hasFinancialContext && [
+		"ACCOUNT",
+		"TRANSACTION",
+		"SWIFT",
+		"IBAN",
+		"BITCOIN",
+		"ETHEREUM",
+		"CRYPTO",
+		"PAYMENT",
+		"CREDIT_CARD"
+	].some((p) => patternType.includes(p))) confidence += .15;
+	if (context.features.hasTechnicalContext && ![
+		"API_KEY",
+		"TOKEN",
+		"SECRET",
+		"AWS",
+		"GITHUB",
+		"STRIPE",
+		"JWT"
+	].some((p) => patternType.includes(p))) confidence -= .05;
+	const beforeLower = context.before.toLowerCase();
+	const afterLower = context.after.toLowerCase();
+	for (const indicator of [
+		{
+			pattern: /\b(dear|hello|hi|mr|mrs|ms|dr)\s*$/i,
+			boost: .2,
+			types: ["NAME"]
+		},
+		{
+			pattern: /^(is|was|wrote|said|told)/i,
+			boost: .15,
+			types: ["NAME"]
+		},
+		{
+			pattern: /\b(call|phone|tel|mobile):\s*$/i,
+			boost: .2,
+			types: ["PHONE"]
+		},
+		{
+			pattern: /\b(email|e-mail|contact):\s*$/i,
+			boost: .2,
+			types: ["EMAIL"]
+		},
+		{
+			pattern: /\b(patient|subject|participant):\s*$/i,
+			boost: .25,
+			types: [
+				"NAME",
+				"PATIENT_ID",
+				"MRN"
+			]
+		},
+		{
+			pattern: /\b(account|acct)[\s#:]*$/i,
+			boost: .2,
+			types: ["ACCOUNT", "BANK"]
+		}
+	]) if (indicator.pattern.test(beforeLower)) {
+		if (indicator.types.some((t) => patternType.includes(t))) confidence += indicator.boost;
+	}
+	for (const indicator of [
+		{
+			pattern: /\b(the|a|an)\s*$/i,
+			penalty: .3,
+			types: ["NAME"]
+		},
+		{
+			pattern: /\b(version|v|release)\s*$/i,
+			penalty: .4,
+			types: ["PHONE", "NUMBER"]
+		},
+		{
+			pattern: /^\s*(street|avenue|road|drive|way)/i,
+			penalty: .2,
+			types: ["NAME"]
+		}
+	]) if (indicator.pattern.test(beforeLower) || indicator.pattern.test(afterLower)) {
+		if (indicator.types.some((t) => patternType.includes(t))) confidence -= indicator.penalty;
+	}
+	return Math.max(0, Math.min(1, confidence));
+}
+function analyzeFullContext(text, value, patternType, startPos, endPos) {
+	const { before, after, beforeWords, afterWords, sentence } = extractContext(text, startPos, endPos);
+	const documentType = inferDocumentType(text);
+	const features = analyzeContextFeatures(before + " " + value + " " + after);
+	features.relativePosition = startPos / text.length;
+	return {
+		beforeWords,
+		afterWords,
+		sentence,
+		documentType,
+		confidence: calculateContextConfidence(value, patternType, {
+			before,
+			after,
+			sentence,
+			documentType,
+			features
+		})
+	};
+}
+const commonFalsePositives = [
+	{
+		patternType: [
+			"PHONE",
+			"PHONE_UK",
+			"PHONE_US"
+		],
+		matcher: (value, context) => {
+			if (/\b(version|v|ver|release|build)\s*[:\s]*/i.test(context)) return true;
+			if (/^\d{1,2}\.\d{1,2}\.\d{1,4}$/.test(value.replace(/[\s()-]/g, ""))) return true;
+			return false;
+		},
+		description: "Version number mistaken for phone number",
+		severity: "high"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"PHONE_UK",
+			"PHONE_US"
+		],
+		matcher: (value, context) => {
+			if (/\b(date|born|birth|dob|created|updated|on|since|until|before|after)\s*[:\s]*/i.test(context)) return true;
+			const datePatterns = [
+				/^\d{2}[-/]\d{2}[-/]\d{4}$/,
+				/^\d{4}[-/]\d{2}[-/]\d{2}$/,
+				/^\d{2}[-/]\d{2}[-/]\d{2}$/
+			];
+			const cleaned = value.replace(/[\s()]/g, "");
+			return datePatterns.some((pattern) => pattern.test(cleaned));
+		},
+		description: "Date mistaken for phone number",
+		severity: "high"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"ACCOUNT",
+			"ID"
+		],
+		matcher: (value, context) => {
+			if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) return true;
+			return /\b(ip|address|server|host|network|subnet)\s*[:\s]*/i.test(context);
+		},
+		description: "IP address mistaken for PII",
+		severity: "high"
+	},
+	{
+		patternType: ["PHONE", "NUMBER"],
+		matcher: (value, context) => {
+			return /\b(cm|mm|km|m|ft|in|inch|meter|mile|kg|lb|oz|gram|litre|liter|ml|gb|mb|kb)\s*$/i.test(context + " " + value) || /\b(size|width|height|length|weight|distance|volume|capacity|dimension)\s*[:\s]*/i.test(context);
+		},
+		description: "Measurement mistaken for PII",
+		severity: "medium"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"ID",
+			"NUMBER"
+		],
+		matcher: (value) => {
+			const yearPattern = /^(19|20)\d{2}$/;
+			const cleaned = value.replace(/[\s()-]/g, "");
+			return yearPattern.test(cleaned);
+		},
+		description: "Year mistaken for PII",
+		severity: "medium"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"ACCOUNT",
+			"NUMBER"
+		],
+		matcher: (value, context) => {
+			if (/\b(price|cost|amount|total|subtotal|fee|charge|payment|\$|£|€|¥|USD|GBP|EUR)\s*[:\s]*/i.test(context)) return true;
+			return /^\d{1,6}\.\d{2}$/.test(value.replace(/[\s,]/g, ""));
+		},
+		description: "Price mistaken for PII",
+		severity: "medium"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"ID",
+			"NUMBER"
+		],
+		matcher: (value, context) => {
+			return /\bport[:\s]*$/i.test(context) && /^([1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/.test(value);
+		},
+		description: "Port number mistaken for PII",
+		severity: "high"
+	},
+	{
+		patternType: ["PHONE", "NUMBER"],
+		matcher: (value, context) => {
+			const fullContext = context + " " + value;
+			return /\d+(\.\d+)?\s*(percent|percentage|%)/i.test(fullContext);
+		},
+		description: "Percentage mistaken for PII",
+		severity: "high"
+	},
+	{
+		patternType: ["NAME", "EMAIL"],
+		matcher: (value, context) => {
+			if (/\b(foo|bar|baz|qux|example|test|demo|sample|placeholder|dummy|mock)\b/i.test(value.toLowerCase())) return true;
+			return /(\/\/|\/\*|<!--|(^|\n)\s*#|(^|\n)\s*--)/.test(context);
+		},
+		description: "Technical placeholder mistaken for PII",
+		severity: "high"
+	},
+	{
+		patternType: [
+			"EMAIL",
+			"NAME",
+			"PHONE",
+			"ADDRESS"
+		],
+		matcher: (value) => {
+			return [
+				/test\d*@/i,
+				/example\.com$/i,
+				/foo@/i,
+				/bar@/i,
+				/johndoe/i,
+				/janedoe/i,
+				/^xxx+$/i,
+				/^000[-\s]*000[-\s]*000/i
+			].some((pattern) => pattern.test(value));
+		},
+		description: "Test data mistaken for PII",
+		severity: "high"
+	},
+	{
+		patternType: ["NAME"],
+		matcher: (_value, context) => {
+			return /\b(the|a|an)\s*$/i.test(context);
+		},
+		description: "Common word after article, not a name",
+		severity: "medium"
+	},
+	{
+		patternType: ["INSTAGRAM_USERNAME", "TIKTOK_USERNAME"],
+		matcher: (value, _context) => {
+			return (/* @__PURE__ */ new Set([
+				"its",
+				"and",
+				"the",
+				"for",
+				"are",
+				"but",
+				"not",
+				"you",
+				"all",
+				"can",
+				"had",
+				"her",
+				"was",
+				"one",
+				"our",
+				"out",
+				"has",
+				"him",
+				"his",
+				"how",
+				"man",
+				"new",
+				"now",
+				"old",
+				"see",
+				"way",
+				"who",
+				"boy",
+				"did",
+				"get",
+				"let",
+				"put",
+				"say",
+				"she",
+				"too",
+				"use",
+				"latest",
+				"design",
+				"deliver",
+				"flexible",
+				"personalized",
+				"entertainment",
+				"experience",
+				"powered",
+				"portable",
+				"projector",
+				"designed",
+				"announced",
+				"launch",
+				"global",
+				"range",
+				"spaces",
+				"more",
+				"cross",
+				"wide"
+			])).has(value.toLowerCase());
+		},
+		description: "Common English word mistaken for social username",
+		severity: "high"
+	},
+	{
+		patternType: ["NAME"],
+		matcher: (value, context) => {
+			const keywords = [
+				"function",
+				"const",
+				"let",
+				"var",
+				"class",
+				"interface",
+				"type",
+				"enum",
+				"public",
+				"private",
+				"protected",
+				"static",
+				"async",
+				"await",
+				"return",
+				"import",
+				"export",
+				"from",
+				"default",
+				"extends",
+				"implements"
+			];
+			const valueLower = value.toLowerCase();
+			if (keywords.includes(valueLower)) return true;
+			return /\b(def|fn|func|method|prop|attr)\s*[:\s]*/i.test(context);
+		},
+		description: "Programming keyword mistaken for name",
+		severity: "high"
+	},
+	{
+		patternType: ["EMAIL"],
+		matcher: (value) => {
+			const commonDomains = [
+				"localhost",
+				"example.com",
+				"example.org",
+				"example.net",
+				"test.com",
+				"demo.com",
+				"sample.com",
+				"invalid.com",
+				"domain.com"
+			];
+			const domain = value.split("@")[1]?.toLowerCase();
+			return commonDomains.includes(domain);
+		},
+		description: "Example email domain",
+		severity: "high"
+	},
+	{
+		patternType: ["ACCOUNT", "CARD"],
+		matcher: (value, _context) => {
+			if (/^0+$/.test(value.replace(/[\s-]/g, ""))) return true;
+			const cleaned = value.replace(/[\s-]/g, "");
+			if (/^(\d)\1+$/.test(cleaned)) return true;
+			if (/^(0123456789|1234567890|9876543210)/.test(cleaned)) return true;
+			return false;
+		},
+		description: "Test account/card number",
+		severity: "high"
+	},
+	{
+		patternType: [
+			"PHONE",
+			"ID",
+			"NUMBER"
+		],
+		matcher: (_value, context) => {
+			return /\b(timestamp|time|epoch|unix|millis|seconds|created.at|updated.at)\s*[:\s]*/i.test(context);
+		},
+		description: "Timestamp mistaken for PII",
+		severity: "medium"
+	}
+];
+function isFalsePositive(value, patternType, context, rules = commonFalsePositives) {
+	for (const rule of rules) {
+		if (!(Array.isArray(rule.patternType) ? rule.patternType.some((t) => patternType.includes(t)) : patternType.includes(rule.patternType))) continue;
+		if (rule.matcher(value, context)) return {
+			isFalsePositive: true,
+			matchedRule: rule,
+			confidence: rule.severity === "high" ? .9 : rule.severity === "medium" ? .7 : .5
+		};
+	}
+	return {
+		isFalsePositive: false,
+		confidence: 0
+	};
+}
 function validateLuhn(cardNumber, _context) {
 	const cleaned = cardNumber.replace(/[\s-]/g, "");
 	if (!/^\d{13,19}$/.test(cleaned)) return false;
@@ -191,6 +684,7 @@ function validateEmail(email, _context) {
 	if (!domain.includes(".")) return false;
 	return true;
 }
+export { analyzeFullContext, commonFalsePositives, isFalsePositive };
 export const patterns = [
 { type: "EMAIL", regex: /\b[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\b/g, validator: (value, context) => {
 			if (!validateEmail(value)) return false;

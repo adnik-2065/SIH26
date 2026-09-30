@@ -1,5 +1,5 @@
 import { ContentCommandSchema, type PageChangedDetail, type PageChangeReason,
-  type StabilitySnapshot } from '../contracts';
+  type CaptureScope, type StabilitySnapshot } from '../contracts';
 import { emptyMutationSummary, pageChangedDetail, type StabilityState } from '../capture/stability';
 import { collect } from './observe';
 import { act } from './act';
@@ -107,9 +107,35 @@ if (!scope.__sih26Installed) {
       totalElementCount, interactiveElementCount: snapshot.elements.length,
     };
   };
-  const snapshotResponse = (commandObservationId: string) => {
-    const snapshot = collect(commandObservationId, documentId, revision, refs);
+  const snapshotResponse = (commandObservationId: string, scope: CaptureScope = 'page') => {
+    const snapshot = collect(commandObservationId, documentId, revision, refs, scope);
     return { snapshot, stability: stabilitySnapshot(snapshot), mutations: emptyMutationSummary() };
+  };
+  // Whether an action is leaving this document. A link, a script's location
+  // change or a history traversal fires the Navigation API's `navigate` event
+  // while the action runs. A form submission schedules its navigation for
+  // later, so an uncancelled submit of a form that targets this frame counts
+  // too. The worker is only told of the new load once the response commits,
+  // which on a slow server is well after the action has been answered.
+  const watchLeaving = () => {
+    let leaving = false;
+    const submits: SubmitEvent[] = [];
+    const pageNavigation = (window as unknown as { navigation?: EventTarget }).navigation;
+    const navigate = (event: Event) => { if (!(event as Event & { destination?: { sameDocument?: boolean } }).destination?.sameDocument) leaving = true; };
+    const submit = (event: Event) => { submits.push(event as SubmitEvent); };
+    pageNavigation?.addEventListener('navigate', navigate);
+    window.addEventListener('submit', submit, true);
+    return () => {
+      pageNavigation?.removeEventListener('navigate', navigate);
+      window.removeEventListener('submit', submit, true);
+      return leaving || submits.some(event => {
+        const form = event.target;
+        if (event.defaultPrevented || !(form instanceof HTMLFormElement)) return false;
+        const target = event.submitter?.getAttribute('formtarget') ?? form.target;
+        const method = event.submitter?.getAttribute('formmethod') ?? form.method;
+        return ['', '_self'].includes(target.toLowerCase()) && method.toLowerCase() !== 'dialog';
+      });
+    };
   };
   chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
     if (sender.id !== chrome.runtime.id) return;
@@ -134,7 +160,7 @@ if (!scope.__sih26Installed) {
       // Lazy images are still decoded before the screenshots, so the capture
       // does not photograph half-loaded content. Nothing waits for the DOM to
       // fall quiet any more.
-      void prepareImages(imagePreparation.signal).then(() => reply({ ok: true }),
+      void prepareImages(imagePreparation.signal, undefined, command.scope).then(() => reply({ ok: true }),
         () => reply({ error: 'CAPTURE_FAILED' }));
       return true;
     }
@@ -163,8 +189,10 @@ if (!scope.__sih26Installed) {
       if (observationId !== command.observationId) { reply({ error: 'PAGE_CHANGED' }); return; }
       // [ACT DEBUG] The command's observation id and the content script's live
       // one ride along for diagnostic logging only; resolution is unchanged.
-      reply(act({ action: command.action, refs, expect: command.expect, resolved: command.resolved,
-        observationId: command.observationId, currentObservationId: observationId }));
+      const leaving = watchLeaving();
+      const result = act({ action: command.action, refs, expect: command.expect, resolved: command.resolved,
+        observationId: command.observationId, currentObservationId: observationId });
+      reply(leaving() && 'ok' in result ? { ...result, navigating: true } : result);
       return;
     }
     if (command.type === 'CHECK' && observationId !== command.observationId) {
@@ -175,7 +203,7 @@ if (!scope.__sih26Installed) {
     if (command.type === 'COLLECT' && capture?.observationId === observationId) {
       capture.layoutSize = size(); capture.scrollX = scrollX; capture.scrollY = scrollY;
     }
-    const response = snapshotResponse(observationId);
+    const response = snapshotResponse(observationId, command.scope);
     if (command.type === 'COLLECT' && capture) capture.before = { dom: response.snapshot, stability: response.stability };
     // The only thing that can invalidate a capture from inside the page now is
     // navigation, which is recorded as it happens.

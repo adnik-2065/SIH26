@@ -1,12 +1,17 @@
-import { PanelCommandSchema, PageChangedSchema, TaskStateSchema, type ErrorCode, type ExtensionError, type TaskState } from '../contracts';
+import { PanelCommandSchema, PageChangedSchema, TaskStateSchema, type CaptureScope, type ErrorCode, type ExtensionError, type TaskState } from '../contracts';
 import { acceptsResult, initialState, invalidate, lifecycleLog, lifecycleStateLog, recover } from '../agent/lifecycle';
 import { observeTab } from '../capture/observe';
+import { navigationAllowed } from '../agent/navigation';
 import { captureEndingClass, emptyMutationSummary, PageChangedError, pageChangedDetail } from '../capture/stability';
 import { CaptureError, captureErrorCategory } from '../capture/errors';
 
 let state = initialState();
 let captureController: AbortController | undefined;
 let captureDone: Promise<unknown> = Promise.resolve();
+// What each observation photographs: the visible screen unless a task asked
+// for the whole page. A task keeps its choice through its retries; a worker
+// restart falls back to the screen.
+let captureScope: CaptureScope = 'viewport';
 // When a capture ended because the page navigated mid-capture, the new page
 // needs to finish loading before the next attempt can photograph it. The
 // background prefers the browser's own signal — tabs.onUpdated fires with
@@ -21,19 +26,46 @@ const SETTLE_CHECK_PHASE_MS = 250; // a CHECK-phase ending caught only the tail 
 let settleTimer: ReturnType<typeof setTimeout> | undefined;
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 // Resolve only once the tab's current navigation has settled, or after the
-// bounded fallback. A load that already completed returns immediately.
+// bounded fallback. A load that already completed returns immediately: the
+// listener only hears future events, so the tab's status is read as well.
+// Without that read, a retry armed after the load finished sat out the whole
+// fallback waiting for a 'complete' that had already happened.
 function awaitLoadSettled(tabId: number | undefined, fallbackMs: number): Promise<void> {
   if (tabId === undefined) return Promise.resolve();
+  let listener: ((changedTabId: number, change: chrome.tabs.TabChangeInfo) => void) | undefined;
   const event = new Promise<void>(resolve => {
-    const listener = (changedTabId: number, change: chrome.tabs.TabChangeInfo) => {
-      if (changedTabId === tabId && change.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    };
+    listener = (changedTabId, change) => { if (changedTabId === tabId && change.status === 'complete') resolve(); };
+    chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.get(tabId).then(tab => { if (tab.status === 'complete') resolve(); }, () => resolve());
+  });
+  return Promise.race([event, delay(fallbackMs)]).finally(() => chrome.tabs.onUpdated.removeListener(listener!));
+}
+// A click, a key press or Back can navigate the page it acts on. The content
+// script reports a navigation the page itself started; the tab only reports
+// it as loading once the response commits. Without that report (a traversal,
+// say), a load that starts within this window is still waited for, so an
+// action that navigates nowhere costs at most this window.
+const NAVIGATING_ACTIONS: ReadonlySet<string> = new Set(['click', 'key', 'back', 'navigate']);
+const NAVIGATION_START_MS = 300;
+// Stop must not queue behind an action's settle wait.
+let settleAbort: AbortController | undefined;
+// Listen before the action is dispatched, so a navigation that starts while
+// the content script is still answering is not missed.
+function watchNavigation(tabId: number) {
+  let listener: ((changedTabId: number, change: chrome.tabs.TabChangeInfo) => void) | undefined;
+  const started = new Promise<boolean>(resolve => {
+    listener = (changedTabId, change) => { if (changedTabId === tabId && (change.status === 'loading' || change.url)) resolve(true); };
     chrome.tabs.onUpdated.addListener(listener);
   });
-  return Promise.race([event, delay(fallbackMs)]);
+  return { started: (ms: number) => Promise.race([started, delay(ms).then(() => false)]),
+    dispose: () => chrome.tabs.onUpdated.removeListener(listener!) };
+}
+async function openAddress(tabId: number, url: string, origin: string | undefined): Promise<{ ok: true; navigating: true } | { error: ErrorCode }> {
+  if (!navigationAllowed(url, origin)) {
+    lifecycleLog('act_navigate_refused', { tabId, sameOrigin: false });
+    return { error: 'TARGET_UNSAFE' };
+  }
+  return chrome.tabs.update(tabId, { url }).then(() => ({ ok: true as const, navigating: true as const }), () => ({ error: 'ACTION_FAILED' as const }));
 }
 const publish = (message: unknown) => { void chrome.runtime.sendMessage(message).catch(() => {}); };
 const persist = async () => {
@@ -94,7 +126,7 @@ function launch(snapshot: TaskState) {
     check();
   }, context => {
     end.phase = context.phase; end.steps = context.steps; end.signalAborted = context.signalAborted;
-  });
+  }, captureScope);
   captureDone = capture;
   void capture.then(observation => serial(async () => {
     check();
@@ -157,6 +189,7 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
   if (!isPanel) return;
   const parsed = PanelCommandSchema.safeParse(raw);
   if (!parsed.success) { reply({ ok: false, error: 'INVALID_MESSAGE' }); return; }
+  if (parsed.data.type === 'STOP') settleAbort?.abort();
   void serial(async () => {
     const command = parsed.data;
     if (command.type === 'STOP') await pause('STOPPED', 'stopped');
@@ -181,9 +214,35 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
       }
       const forwarded = { type: 'ACT' as const, observationId: command.observationId, action: command.action,
         resolved: command.resolved, expect: command.expect };
-      const result = await chrome.tabs.sendMessage(state.tabId, forwarded, { frameId: 0 }).catch(() => ({ error: 'PAGE_CHANGED' as const }));
-      if (result?.error) { if (result.error === 'PAGE_CHANGED') await pause('PAGE_CHANGED'); return { ok: false, error: result.error, state }; }
-      return { ok: true, state };
+      const tabId = state.tabId;
+      const navigation = NAVIGATING_ACTIONS.has(command.action.type) ? watchNavigation(tabId) : undefined;
+      try {
+        // An address is opened by the worker itself, under the origin rule in
+        // agent/navigation.ts; it never passes through the page.
+        const result = command.action.type === 'navigate'
+          ? await openAddress(tabId, command.action.url, state.origin)
+          : await chrome.tabs.sendMessage(tabId, forwarded, { frameId: 0 }).catch(() => ({ error: 'PAGE_CHANGED' as const }));
+        if (result?.error) { if (result.error === 'PAGE_CHANGED') await pause('PAGE_CHANGED'); return { ok: false, error: result.error, state }; }
+        // The action navigated. Answering now let the panel's next scan race
+        // the load and die as PAGE_CHANGED_NAVIGATION, then retry after a
+        // settle wait. Wait here for the new document instead (the same
+        // bounded load signal the retry path uses) and retire the observation
+        // this action consumed, so the next scan starts on the settled page.
+        settleAbort = new AbortController();
+        const stopped = new Promise<false>(resolve => settleAbort!.signal.addEventListener('abort', () => resolve(false), { once: true }));
+        const leaving = (result as { navigating?: boolean } | undefined)?.navigating === true;
+        if (navigation && await Promise.race([navigation.started(leaving ? SETTLE_FALLBACK_MS : NAVIGATION_START_MS), stopped])) {
+          const settleStarted = Date.now();
+          await Promise.race([awaitLoadSettled(tabId, SETTLE_FALLBACK_MS), stopped]);
+          lifecycleLog('act_navigation_settled', { tabId, action: command.action.type, elapsedMs: Date.now() - settleStarted });
+          if (state.observationId === command.observationId) {
+            state = invalidate(state, 'paused');
+            await persist();
+          }
+          return { ok: true, state };
+        }
+        return { ok: true, state };
+      } finally { navigation?.dispose(); settleAbort = undefined; }
     }
     if (command.type === 'START' || command.type === 'OBSERVE') {
       if (state.status === 'observing') return { ok: false, error: 'BUSY', state };
@@ -202,6 +261,8 @@ chrome.runtime.onMessage.addListener((raw: unknown, sender, reply) => {
         await awaitLoadSettled(tab.id, settleMs || SETTLE_FALLBACK_MS);
       }
       settleMs = 0;
+      if (command.type === 'START') captureScope = command.scope ?? 'viewport';
+      else if (command.scope) captureScope = command.scope;
       lifecycleLog('generation_observe', { caller: 'START_or_OBSERVE', oldGeneration: state.generation, newGeneration: state.generation + 1,
         taskId: (command.type === 'START' ? undefined : state.taskId?.slice(0, 8)), tabId: tab.id, url: new URL(tab.url).origin });
       state = { status: 'observing', taskId: command.type === 'START' ? crypto.randomUUID() : state.taskId,
@@ -228,6 +289,11 @@ chrome.tabs.onUpdated.addListener((tabId, change) => { if (change.status === 'lo
       settleMs = SETTLE_FALLBACK_MS;
       settleTimer = setTimeout(() => { awaitingLoad = false; }, settleMs);
     }
+    // Nothing is left to retire: an action that navigated already invalidated
+    // its observation, and one navigation fires several of these events.
+    // Pausing again only reported a second PAGE_CHANGED for the same load,
+    // which the panel counts as a failed scan and retries.
+    if (state.status === 'paused' && !state.observationId) return;
     await pause('PAGE_CHANGED', 'paused',
       pageChangedDetail('PAGE_CHANGED_NAVIGATION', emptyMutationSummary(), undefined, undefined, 'The tab navigated while its capture was active.'));
   }

@@ -1,14 +1,25 @@
 import { PerceptionResultSchema, type PerceptionAdapter, type PerceptionInput, type PerceptionResult } from '../contracts';
+import { newDetectorRuntime, readRuntimeSample, recordRuntime } from '../../metrics/timings';
 
 export class MediaPipeAdapter implements PerceptionAdapter {
   private worker?: Worker;
   private cancel?: () => void;
+  // Where the detector's time went, for the run log.
+  readonly runtime = newDetectorRuntime();
   constructor(private readonly timeoutMs = 30_000) {}
 
   dispose() {
     this.cancel?.();
     this.worker?.terminate();
     this.worker = undefined;
+  }
+
+  // Loads the detector ahead of the first inspection, which reports any failure.
+  warm() {
+    try {
+      this.worker ??= new Worker(chrome.runtime.getURL('vision/face.worker.js'));
+      this.worker.postMessage({ type: 'warm', assetRoot: chrome.runtime.getURL('vision') });
+    } catch { /* the next inspection creates the worker and reports its failure */ }
   }
 
   inspect(input: PerceptionInput, signal: AbortSignal): Promise<PerceptionResult> {
@@ -45,6 +56,8 @@ export class MediaPipeAdapter implements PerceptionAdapter {
           result.data.regions.some(({ kind, bounds: b }) => kind !== 'face' || b.x < 0 || b.y < 0 || b.width <= 0 || b.height <= 0 || b.x + b.width > width || b.y + b.height > height)) {
           fail('FACE_INVALID_RESULT'); return;
         }
+        const sample = readRuntimeSample(data.runtime);
+        if (sample) recordRuntime(this.runtime, sample);
         cleanup(); resolve(result.data);
       };
       try { worker.postMessage({ ...input, assetRoot: chrome.runtime.getURL('vision') }, [input.image]); }

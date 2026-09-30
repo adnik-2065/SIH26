@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Page } from 'tesseract.js';
 import { normalizeOcr } from '../../src/vision/ocr/normalize';
-import { TesseractAdapter } from '../../src/vision/ocr/tesseract';
+import { ocrLanes, TesseractAdapter, TesseractPool } from '../../src/vision/ocr/tesseract';
 
 function data(words = [{ text: 'student@example.test', confidence: 96, bbox: { x0: 210, y0: 320, x1: 390, y1: 345 } }]) {
   return { blocks: [{ paragraphs: [{ lines: [{ words }] }] }] } as unknown as Pick<Page, 'blocks'>;
@@ -94,5 +94,35 @@ describe('OCR worker lifecycle', () => {
     await expect(adapter.inspect(setup(), new AbortController().signal)).rejects.toThrow('OCR_BUSY');
     const rejected = expect(pending).rejects.toThrow('STOPPED');
     adapter.dispose(); await rejected;
+  });
+});
+
+describe('OCR lanes', () => {
+  it('runs one inspection per idle lane and refuses a fourth while three are busy', async () => {
+    const input = () => setup(), pool = new TesseractPool(3);
+    const runs = [pool.inspect(input(), new AbortController().signal), pool.inspect(input(), new AbortController().signal),
+      pool.inspect(input(), new AbortController().signal)];
+    expect(FakeWorker.instances).toHaveLength(3);
+    const extra = input();
+    await expect(pool.inspect(extra, new AbortController().signal)).rejects.toThrow('OCR_BUSY');
+    expect(extra.image.close).toHaveBeenCalledOnce();
+    for (const worker of FakeWorker.instances) worker.reply({ type: 'result', result: result() });
+    await expect(Promise.all(runs)).resolves.toHaveLength(3);
+    // A freed lane takes the next inspection on its existing worker.
+    const again = pool.inspect(input(), new AbortController().signal);
+    FakeWorker.instances[0].reply({ type: 'result', result: result() });
+    await again;
+    expect(FakeWorker.instances).toHaveLength(3);
+    pool.dispose();
+    for (const worker of FakeWorker.instances) expect(worker.terminate).toHaveBeenCalledOnce();
+  });
+  it('warms every lane\'s engine without an inspection', () => {
+    setup();
+    new TesseractPool(2).warm();
+    expect(FakeWorker.instances.map(worker => worker.postMessage.mock.calls)).toEqual([
+      [[{ type: 'warm', assetRoot: 'chrome-extension://test/ocr' }]], [[{ type: 'warm', assetRoot: 'chrome-extension://test/ocr' }]]]);
+  });
+  it('leaves cores for the other detectors and caps the engines', () => {
+    expect([1, 2, 4, 6, 8, 16, 64].map(ocrLanes)).toEqual([1, 1, 1, 2, 2, 4, 4]);
   });
 });

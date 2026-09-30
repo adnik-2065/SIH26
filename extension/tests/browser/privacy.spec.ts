@@ -129,6 +129,8 @@ test('document model boxes retain both tile overlaps and mask a multi-tile docum
   const result = await page.evaluate(async () => {
     const h = window.PrivacyHarness, data = h.visualFixture(1, true);
     let calls = 0;
+    // Model boxes are kept only over an image-like DOM region.
+    data.observation.dom.visualRegions = [{ category: 'sensitive_image', confidence: .5, bounds: { x: 60, y: 220, width: 50, height: 70 } }];
     data.documents = await h.inspectDocumentTiles(data.observation, { inspect: async ({ observationId, image }) => {
       const tileCall = ++calls;
       // Bounded boxes from each tile that overlap across the seam at row 250:
@@ -141,10 +143,13 @@ test('document model boxes retain both tile overlaps and mask a multi-tile docum
     // Coverage invariant: no mask may swallow the page. The union of the two
     // seam boxes (60,220,50x70) must survive as one padded document mask.
     const pageArea = data.observation.imageWidth * data.observation.imageHeight;
-    return { ok: result.ok, calls, tiles: data.observation.tileCount, masks: plan.masks, pageArea };
+    // Only tiles the image region touches reach the model: both seam tiles.
+    const touched = data.observation.tiles.filter(tile => tile.y < 290 && tile.y + tile.height > 220).length;
+    return { ok: result.ok, calls, touched, masks: plan.masks, pageArea };
   });
   expect(result.ok).toBe(true);
-  expect(result.calls).toBe(result.tiles);
+  expect(result.touched).toBe(2);
+  expect(result.calls).toBe(result.touched);
   const docMask = result.masks.find(m => m.bounds.x <= 52 && m.bounds.y <= 212 &&
     m.bounds.x + m.bounds.width >= 118 && m.bounds.y + m.bounds.height >= 298);
   expect(docMask).toBeDefined();
@@ -154,6 +159,8 @@ test('document model boxes retain both tile overlaps and mask a multi-tile docum
 test('document adapter rejects failure, stale output, malformed bounds and cancellation', async ({ page }) => {
   const failures = await page.evaluate(async () => {
     const h = window.PrivacyHarness, data = h.visualFixture();
+    // The model only runs on a tile an image region touches.
+    data.observation.dom.visualRegions = [{ category: 'sensitive_image', confidence: .5, bounds: { x: 10, y: 10, width: 20, height: 170 } }];
     const failures: string[] = [];
     for (const mode of ['failure', 'stale', 'bounds', 'stop']) {
       const abort = new AbortController();
@@ -172,6 +179,40 @@ test('document adapter rejects failure, stale output, malformed bounds and cance
   expect(failures).toHaveLength(4);
   expect(failures).not.toContain('private-model-error');
   expect(failures.at(-1)).toBe('STOPPED');
+});
+
+test('document model skips tiles without an image region and reuses boxes for unchanged pixels', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    const h = window.PrivacyHarness, data = h.visualFixture();
+    let calls = 0;
+    const adapter = { inspect: async ({ observationId, image }: { observationId: string; image: ImageBitmap }) => {
+      calls++; image.close();
+      return { observationId, truncated: false as const, detections: [{ type: 'signature' as const, source: 'vision_model' as const, confidence: .7,
+        bbox: { x: 10, y: 20, width: 20, height: 20 } }] };
+    } };
+    // No image region: every box would be dropped as off-image, so none is computed.
+    const bare = await h.inspectDocumentTiles(data.observation, adapter, new AbortController().signal);
+    const skipped = calls;
+    // An image under the first tile only: that tile alone reaches the model.
+    data.observation.dom.visualRegions = [{ category: 'sensitive_image', confidence: .5, bounds: { x: 5, y: 15, width: 30, height: 30 } }];
+    const cache = new h.ResultCache<never>();
+    const first = await h.inspectDocumentTiles(data.observation, adapter, new AbortController().signal, cache);
+    const firstCalls = calls - skipped;
+    // A new observation of identical pixels reuses the boxes, re-filtered and
+    // bound to the new observation.
+    data.observation.dom.observationId = 'obs_again';
+    const again = await h.inspectDocumentTiles(data.observation, adapter, new AbortController().signal, cache);
+    const againCalls = calls - skipped - firstCalls;
+    return { bare, skipped, first, firstCalls, again, againCalls, hits: cache.hits };
+  });
+  expect(result.skipped).toBe(0);
+  expect(result.bare).toMatchObject({ status: 'complete', detector: 'vision_model', regions: [] });
+  expect(result.firstCalls).toBe(1);
+  expect(result.first.regions).toEqual([{ kind: 'document', category: 'signature', confidence: .7, bounds: { x: 10, y: 20, width: 20, height: 20 } }]);
+  expect(result.againCalls).toBe(0);
+  expect(result.hits).toBe(1);
+  expect(result.again.observationId).toBe('obs_again');
+  expect(result.again.regions).toEqual(result.first.regions);
 });
 
 for (const corruption of ['white', 'transparent', 'dimensions']) test(`encoded-output verification blocks ${corruption} mask corruption`, async ({ page }) => {
@@ -195,20 +236,23 @@ for (const corruption of ['white', 'transparent', 'dimensions']) test(`encoded-o
 test('optional OCR verifies sanitized output and blocks remaining PII, failures and stale results', async ({ page }) => {
   const results = await page.evaluate(async () => {
     const h = window.PrivacyHarness, results = [];
-    for (const mode of ['safe', 'pii', 'failure', 'stale']) {
+    for (const mode of ['safe', 'pii', 'failure', 'stale', 'optional']) {
       const data = h.visualFixture();
+      // An optional image that fails the re-scan is withheld, not the step.
+      if (mode === 'optional') data.image = 'optional';
       results.push(await h.buildSafeStepRequest({ data, current: () => data.binding, signal: new AbortController().signal,
         verificationOcr: { inspect: async ({ image, observationId }) => {
           image.close();
           if (mode === 'failure') throw new Error('mira@example.test');
           return { observationId: mode === 'stale' ? 'old' : observationId, source: 'model', elapsedMs: 1,
-            regions: mode === 'pii' ? [{ kind: 'text', confidence: .9, text: 'mira@example.test', bounds: { x: 1, y: 1, width: 10, height: 10 } }] : [] };
+            regions: mode === 'pii' || mode === 'optional' ? [{ kind: 'text', confidence: .9, text: 'mira@example.test', bounds: { x: 1, y: 1, width: 10, height: 10 } }] : [] };
         } } }));
     }
     return results;
   });
   expect(results[0].ok).toBe(true);
-  for (const result of results.slice(1)) expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  for (const result of results.slice(1, 4)) expect(result).toMatchObject({ ok: false, blockedReasons: ['VERIFICATION_FAILED'] });
+  expect(results[4]).toMatchObject({ ok: true, decision: 'safe_without_image', withheldReasons: ['VERIFICATION_FAILED'] });
   expect(JSON.stringify(results)).not.toContain('mira@example.test');
 });
 
@@ -228,6 +272,20 @@ test('DOM visual metadata covers offscreen containers without copying raw attrib
   expect(evidence.regions?.some(r => r.category === 'aadhaar_card' && r.bounds.y >= 2000)).toBe(true);
   expect(evidence.regions?.some(r => r.category === 'signature')).toBe(true);
   expect(evidence.regions!.length).toBeGreaterThanOrEqual(7);
+});
+
+test('DOM visual metadata marks SVG artwork and leaves photographs unmarked', async ({ page }) => {
+  const vector = await page.evaluate(() => {
+    const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>');
+    const box = 'width:40px;height:40px;display:block';
+    document.body.innerHTML = `<svg width="40" height="40"></svg>
+      <img style="${box}" src="${svg}"><img style="${box}" src="/logo.svg/60px-logo.svg.png">
+      <div style="${box};background-image:linear-gradient(transparent,transparent),url('/sprite.svg')"></div>
+      <img style="${box}" src="data:image/png;base64,eA=="><img style="${box}" src="/photo.jpg">
+      <div style="${box};background-image:url('/sprite.svg'),url('/photo.jpg')"></div><canvas width="40" height="40"></canvas>`;
+    return window.PrivacyHarness.collect('observation', 'document', 0, new Map()).visualRegions!.map(r => r.vector === true);
+  });
+  expect(vector).toEqual([true, true, true, true, false, false, false, false]);
 });
 
 test('the filled flag reports that a control holds input, never the input itself', async ({ page }) => {

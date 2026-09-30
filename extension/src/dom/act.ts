@@ -121,6 +121,9 @@ function elementFacts(element: HTMLElement) {
 export function act(input: ActInput): ActResult {
   const { action } = input;
   if (action.type === 'done') return { ok: true };
+  // Opening an address is the worker's job (chrome.tabs.update); a page script
+  // is never asked to navigate itself.
+  if (action.type === 'navigate') return { error: 'INVALID_MESSAGE' };
   // The key action does not address an element: it dispatches Enter to whatever
   // the reviewed flow left focused, exactly as a person pressing the key would.
   if (action.type === 'key') {

@@ -7,6 +7,7 @@ export { Placeholders } from '../src/privacy/text';
 export { LIMITS } from '../src/privacy/contracts';
 export { fixture } from './privacy-fixture';
 export { inspectDocumentTiles, detectLocalDocuments } from '../src/vision/documents';
+export { ResultCache } from '../src/vision/reuse';
 export { collect } from '../src/dom/observe';
 export { act } from '../src/dom/act';
 export { planActions, executableNow } from '../src/agent/protocol';

@@ -26,17 +26,26 @@ const names = [
 ];
 const patterns = new LiteOpenRedaction({ patterns: names, enableCache: false, debug: false }).getPatterns();
 if (patterns.length !== names.length) throw new Error('OpenRedaction catalog changed');
+// Validators, plus the engine's own post-validator stages: the false-positive
+// filter (isFalsePositive over commonFalsePositives) and context confidence
+// scoring (analyzeFullContext and the helpers it calls).
+const helperNames = ['validateIBAN', 'mod97', 'validateSSN', 'validateEmail', 'validateLuhn', 'validateUKPassport', 'validateName',
+  'extractContext', 'extractSentence', 'findSentenceStart', 'findSentenceEnd', 'inferDocumentType', 'analyzeContextFeatures',
+  'calculateContextConfidence', 'analyzeFullContext', 'commonFalsePositives', 'isFalsePositive'];
 const helpers = new Map();
 for (const file of await readdir(root)) {
   if (!file.endsWith('.mjs')) continue;
   const source = await readFile(resolve(root, file), 'utf8');
   const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  for (const node of ast.statements) if (ts.isFunctionDeclaration(node) &&
-    ['validateIBAN', 'mod97', 'validateSSN', 'validateEmail', 'validateLuhn', 'validateUKPassport', 'validateName'].includes(node.name?.text)) helpers.set(node.name.text, node.getText(ast));
+  for (const node of ast.statements) {
+    const name = ts.isFunctionDeclaration(node) ? node.name?.text
+      : ts.isVariableStatement(node) && node.declarationList.declarations.length === 1 ? node.declarationList.declarations[0].name.getText(ast) : undefined;
+    if (helperNames.includes(name)) helpers.set(name, node.getText(ast));
+  }
 }
-if (helpers.size !== 7) throw new Error('OpenRedaction validator layout changed: ' + [...helpers.keys()].join(','));
+if (helpers.size !== helperNames.length) throw new Error('OpenRedaction helper layout changed: ' + [...helpers.keys()].join(','));
 const output = '// Generated from ' + '@openredaction/core 1.1.5 (MIT). See LICENSE and scripts/openredaction.mjs.\n' +
-  [...helpers.values()].join('\n') + '\nexport const patterns = [\n' + patterns.map(p =>
+  [...helpers.values()].join('\n') + '\nexport { analyzeFullContext, commonFalsePositives, isFalsePositive };\nexport const patterns = [\n' + patterns.map(p =>
     '{ type: ' + JSON.stringify(p.type) + ', regex: ' + p.regex + ', validator: ' + (p.validator?.toString() ?? 'undefined') + ' }').join(',\n') + '\n];\n';
 const directory = new URL('../vendor/openredaction/', import.meta.url);
 await mkdir(directory, { recursive: true });

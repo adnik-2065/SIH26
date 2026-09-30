@@ -58,6 +58,12 @@ describe('why the privacy gateway refused', () => {
     expect(await run(data => { data.observation.dom.truncated = true; })).toMatchObject({ ok: false,
       blockedReasons: ['INCOMPLETE_DETECTION_OBSERVATION'], blockedDetails: [{ cause: 'control or region limit reached during collection' }] });
   });
+  it('lets a screen with left-out links through in context mode but refuses it in strict mode', async () => {
+    expect(await run(data => { data.observation.dom.omittedOnScreen = 12; data.ocrTextPolicy = 'sensitive_only'; }))
+      .toMatchObject({ ok: true });
+    expect(await run(data => { data.observation.dom.omittedOnScreen = 12; data.ocrTextPolicy = 'all_text'; })).toMatchObject({
+      ok: false, blockedReasons: ['INCOMPLETE_DETECTION_OBSERVATION'], blockedDetails: [{ cause: 'on-screen link limit reached in strict mode' }] });
+  });
   it('keeps page content out of every refusal', async () => {
     const blocked = await run(data => { data.ocr.status = 'incomplete'; });
     expect(JSON.stringify(blocked)).not.toContain('mira@example.test');

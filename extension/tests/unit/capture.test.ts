@@ -27,8 +27,8 @@ beforeEach(() => {
   sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true } : response());
   attach.mockResolvedValue(undefined); detach.mockResolvedValue(undefined);
   executeScript.mockResolvedValue([]); insertCSS.mockResolvedValue(undefined); removeCSS.mockResolvedValue(undefined);
-  sendCommand.mockImplementation(async (_target, method: string) => method === 'Page.getLayoutMetrics'
-    ? { cssContentSize: { width: 800, height: 1800 } } : { data: png() });
+  sendCommand.mockImplementation(async (_target, method: string, params?: { clip?: { width: number; height: number } }) => method === 'Page.getLayoutMetrics'
+    ? { cssContentSize: { width: 800, height: 1800 } } : { data: params?.clip ? png(params.clip.width, params.clip.height) : png() });
   vi.stubGlobal('chrome', { tabs: { query, sendMessage, captureVisibleTab },
     scripting: { executeScript, insertCSS, removeCSS },
     debugger: { attach, detach, sendCommand, onDetach: { addListener, removeListener } } });
@@ -37,10 +37,11 @@ afterEach(() => { vi.unstubAllGlobals(); vi.resetAllMocks(); vi.useRealTimers();
 
 describe('non-scrolling full-page capture', () => {
   it('captures the full document once without any scrolling or visible-tab capture', async () => {
-    const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
+    const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, undefined, undefined, undefined, 'page');
     expect(result.dom).toEqual(snapshot);
     expect(result.imageHeight).toBe(1800);
     expect(result.captureBounds).toEqual({ x: 0, y: 0, width: 800, height: 1800 });
+    expect(result).toMatchObject({ scope: 'page', pageSize: { width: 800, height: 1800 } });
     expect(sendCommand.mock.calls.map(([, method]) => method)).toEqual(['Page.getLayoutMetrics', 'Emulation.setDeviceMetricsOverride', 'Page.captureScreenshot', 'Emulation.clearDeviceMetricsOverride']);
     expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Page.captureScreenshot', {
       format: 'png', fromSurface: true, captureBeyondViewport: true, clip: { x: 0, y: 0, width: 800, height: 1800, scale: 1 },
@@ -51,6 +52,28 @@ describe('non-scrolling full-page capture', () => {
     expect(insertCSS).toHaveBeenCalledOnce();
     expect(insertCSS.mock.calls[0][0].css).toContain('animation-play-state: paused');
     expect(removeCSS).toHaveBeenCalledWith(insertCSS.mock.calls[0][0]);
+  });
+  it('captures only the visible screen at the reviewed scroll position by default', async () => {
+    const onTile = vi.fn().mockResolvedValue(undefined);
+    const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, undefined, onTile);
+    expect(result).toMatchObject({ scope: 'viewport', captureBounds: { x: 0, y: 250, width: 800, height: 600 },
+      pageSize: { width: 800, height: 1800 }, imageWidth: 800, imageHeight: 600, tileCount: 1 });
+    expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Page.captureScreenshot', {
+      format: 'png', fromSurface: true, captureBeyondViewport: true, clip: { x: 0, y: 250, width: 800, height: 600, scale: 1 },
+    });
+    expect(onTile.mock.calls[0][0]).toMatchObject({ y: 0, start: 0, end: 600, width: 800, height: 600 });
+  });
+  it('clips a viewport capture to the end of the document', async () => {
+    const dom = { ...snapshot, viewport: { ...snapshot.viewport, scrollY: 1500, devicePixelRatio: 2 } };
+    sendMessage.mockImplementation(async (_tab, command) => command.type === 'PREPARE_CAPTURE' ? { ok: true }
+      : response(dom, { ...stability, scrollY: 1500 }));
+    sendCommand.mockImplementation(async (_target, method, params) => method === 'Page.getLayoutMetrics'
+      ? { cssContentSize: { width: 800, height: 1800 } } : method === 'Page.captureScreenshot'
+        ? { data: png(params.clip.width * 2, params.clip.height * 2) } : {});
+    const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {});
+    expect(result).toMatchObject({ captureBounds: { x: 0, y: 1500, width: 800, height: 300 }, imageWidth: 1600, imageHeight: 600 });
+    expect(sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Page.captureScreenshot', expect.objectContaining({
+      clip: { x: 0, y: 1500, width: 800, height: 300, scale: 1 } }));
   });
   it('reserves classic scrollbar space only during capture and removes the exact stylesheet', async () => {
     executeScript.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([{ result: true }]);
@@ -130,7 +153,7 @@ describe('non-scrolling full-page capture', () => {
         ? { cssContentSize: { width, height } } : method === 'Page.captureScreenshot'
           ? { data: png(Math.round(params.clip.width * dpr), Math.round(params.clip.height * dpr)) } : {});
       const onTile = vi.fn().mockResolvedValue(undefined);
-      const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, undefined, onTile);
+      const result = await observeTab(1, 1, snapshot.origin, 'obs_1', () => {}, undefined, onTile, undefined, 'page');
       expect(result.imageWidth).toBe(width * dpr);
       expect(result.imageHeight).toBe(height * dpr);
       expect(result.tileCount).toBeGreaterThan(1);

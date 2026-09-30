@@ -1,22 +1,66 @@
 import { StepRequestSchema } from '../contracts';
-import { PrivacyError, type Binding, type RedactionPlan, type StepRequest } from './contracts';
+import { PrivacyError, type Binding, type PiiKind, type RedactionPlan, type StepRequest } from './contracts';
 import { containsLeak, opaqueIdentifier, Placeholders, sanitizeText } from './text';
 import type { LocalValueVault } from './value-vault';
 
+type TextContext = 'instruction' | 'element_description';
+type TextPolicy = 'all_text' | 'sensitive_only';
+// `policy` is the text policy the plan was built under. Descriptions are
+// re-sanitized with it, so a label context mode left readable is not read as
+// a leak by strict rules here.
+export interface PayloadGuard { known: ReadonlyArray<{ kind: PiiKind; text: string }>; vault?: LocalValueVault; policy?: TextPolicy }
+
+// The same test finalCheck applies to every text field, so a field settled
+// here is one finalCheck accepts.
+const clean = (value: string, context: TextContext, knownValues: readonly string[], vault?: LocalValueVault, policy?: TextPolicy) =>
+  !containsLeak(value, knownValues) && !vault?.hasLeak(value) && sanitizeText(value, context, undefined, policy).sanitized === value;
+
+// A text field that still carries a detected value, or reads differently when
+// sanitized again, used to refuse the whole step, and a refused step stops the
+// run. One page heading misread as a name, repeated in the instruction, was
+// enough. Now the field is rewritten until it is stable: each known value is
+// replaced by its own token and the field is sanitized again with the same
+// allocator. This only ever removes text, so nothing new leaves the device.
+function settle(value: string, context: TextContext, guard: PayloadGuard, knownValues: readonly string[], placeholders: Placeholders) {
+  let text = value;
+  for (let pass = 0; pass < 4; pass++) {
+    if (clean(text, context, knownValues, guard.vault, guard.policy)) return text;
+    const scrubbed = placeholders.scrub(text, guard.known);
+    text = sanitizeText(guard.vault ? guard.vault.scrub(scrubbed, placeholders) : scrubbed, context, placeholders, guard.policy).sanitized;
+  }
+  return clean(text, context, knownValues, guard.vault, guard.policy) ? text : undefined;
+}
+
 // Internal only. The public barrel exposes just the gateway, not this builder.
-export function payload(binding: Binding, plan: RedactionPlan, placeholders: Placeholders, image?: StepRequest['sanitizedImage']): StepRequest {
-  return { protocolVersion: 1, requestId: `request_${crypto.randomUUID()}`, taskId: binding.taskId, observationId: binding.observationId,
-    sanitizedInstruction: sanitizeText(plan.sanitizedInstruction, 'instruction', placeholders).sanitized,
+export function payload(binding: Binding, plan: RedactionPlan, placeholders: Placeholders, image?: StepRequest['sanitizedImage'],
+  guard: PayloadGuard = { known: [] }) {
+  const knownValues = guard.known.map(value => value.text);
+  let rewritten = 0;
+  const field = (value: string, context: TextContext, fallback: () => string | undefined) => {
+    const first = sanitizeText(value, context, placeholders, guard.policy).sanitized;
+    const settled = settle(first, context, guard, knownValues, placeholders) ?? fallback();
+    if (settled === undefined) throw new PrivacyError('RAW_DATA_LEAK');
+    if (settled !== first) rewritten++;
+    return settled;
+  };
+  // A description that cannot be settled is withheld as a whole. The
+  // instruction falls back to the strict page-text allowlist, which keeps only
+  // task vocabulary and placeholders, before the step is refused.
+  const description = (value: string) => field(value, 'element_description', () => 'Sensitive field');
+  const request: StepRequest = { protocolVersion: 1, requestId: `request_${crypto.randomUUID()}`, taskId: binding.taskId, observationId: binding.observationId,
+    sanitizedInstruction: field(plan.sanitizedInstruction, 'instruction', () => settle(
+      sanitizeText(plan.sanitizedInstruction, 'element_description', placeholders, 'all_text').sanitized, 'instruction', guard, knownValues, placeholders)),
     elements: plan.sanitizedElements.map(element => ({ id: element.id, role: element.role,
-      description: sanitizeText(element.description, 'element_description', placeholders).sanitized,
+      description: description(element.description),
       // The credential-state boolean only, never a value. Non-credential
       // elements carry no filled field at all.
       ...(element.filled !== undefined ? { filled: element.filled } : {}),
       ...(element.bounds ? { bounds: element.bounds } : {}) })),
-    valueRefs: plan.valueRefs.map(ref => ({ id: ref.id, target: ref.target,
-      purpose: sanitizeText(ref.purpose, 'element_description', placeholders).sanitized })), ...(image ? { sanitizedImage: image } : {}) };
+    valueRefs: plan.valueRefs.map(ref => ({ id: ref.id, target: ref.target, purpose: description(ref.purpose) })),
+    ...(image ? { sanitizedImage: image } : {}) };
+  return { request, rewritten };
 }
-export function finalCheck(candidate: unknown, knownValues: string[], originals: string[], vault?: LocalValueVault) {
+export function finalCheck(candidate: unknown, knownValues: string[], originals: string[], vault?: LocalValueVault, policy: TextPolicy = 'all_text') {
   const parsed = StepRequestSchema.safeParse(candidate);
   if (!parsed.success) throw new PrivacyError('RAW_DATA_LEAK');
   const request = parsed.data;
@@ -36,7 +80,7 @@ export function finalCheck(candidate: unknown, knownValues: string[], originals:
       // every word outside the small task vocabulary and reads that rewrite as a
       // leak, which blocks the payload for an ordinary instruction.
       const context = path === 'sanitizedInstruction' ? 'instruction' : 'element_description';
-      if (!identifier && sanitizeText(value, context).sanitized !== value) throw new PrivacyError('RAW_DATA_LEAK');
+      if (!identifier && sanitizeText(value, context, undefined, policy).sanitized !== value) throw new PrivacyError('RAW_DATA_LEAK');
     } else if (Array.isArray(value)) value.forEach((item, i) => scan(item, `${path}.${i}`));
     else if (value && typeof value === 'object') Object.entries(value).forEach(([key, child]) => scan(child, path ? `${path}.${key}` : key));
   };

@@ -25,6 +25,13 @@ function requireEvidence(data: ExportData, observationId: string, tileCount: num
       { observationId, reason: 'dom.truncated', elements: data.observation.dom.elements.length,
         hiddenCount: data.observation.dom.hiddenCount }, 'control or region limit reached during collection');
   }
+  // Strict mode masks every control's box, so it needs all of them on screen.
+  if (data.observation.dom.omittedOnScreen && (data.ocrTextPolicy ?? 'all_text') === 'all_text') {
+    throw privacyError('INCOMPLETE_DETECTION_OBSERVATION', 'PRIVACY_GATEWAY',
+      'Strict masking needs every control on screen, and this screen had more links than the observation can list.',
+      { observationId, reason: 'dom.omittedOnScreen', elements: data.observation.dom.elements.length,
+        omittedOnScreen: data.observation.dom.omittedOnScreen }, 'on-screen link limit reached in strict mode');
+  }
   const documents = data.documents;
   const documentContext = { observationId, detector: documents.detector ?? 'none', expectedStatus: 'complete',
     actualStatus: documents.status, required: documents.required, regions: documents.regions.length };
@@ -88,13 +95,17 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
     };
     check(); validateTiles(observation);
     requireEvidence(data, binding.observationId, observation.tileCount);
+    const stages = { pii: 0, masking: 0, verification: 0, payload: 0 };
+    let mark = performance.now();
+    const lap = (stage: keyof typeof stages) => { const now = performance.now(); stages[stage] += now - mark; mark = now; };
     const normalized = normalize(data, placeholders);
     const plan = RedactionPlanSchema.parse({ observationId: binding.observationId, ...normalized,
       valueRefs: input.vault?.references(binding) ?? [], coverage: { instruction: 'complete', dom: 'complete', ocr: 'complete', faces: 'complete',
         documents: data.documents.status, image: data.image === 'none' ? 'not_requested' : 'complete' },
       decision: data.image === 'none' ? 'safe_without_image' : 'safe', blockedReasons: [] });
-    check();
+    check(); lap('pii');
     verifyMaskCoverage(data, plan.masks, plan.findings);
+    lap('verification');
     let image: StepRequest['sanitizedImage'];
     const withheldReasons: BlockReason[] = [];
     if (data.image !== 'none') {
@@ -106,20 +117,33 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
         withheldReasons.push(reason);
       }
     }
-    check();
-    if (image && input.verificationOcr) await verifyWithOcr(image, binding.observationId, input.verificationOcr, input.signal, check);
-    const candidate = payload(binding, plan, placeholders, image);
+    check(); lap('masking');
+    if (image && input.verificationOcr) {
+      // The re-scan reads the masked image back. What it still finds is often
+      // a misread, and the image is optional: withholding it keeps the step
+      // going on the sanitized text and controls, rather than stopping the run.
+      try { await verifyWithOcr(image, binding.observationId, input.verificationOcr, input.signal, check); }
+      catch (error) {
+        check();
+        if (data.image === 'required' || !(error instanceof PrivacyError) || error.reason !== 'VERIFICATION_FAILED') throw error;
+        image = undefined; withheldReasons.push('VERIFICATION_FAILED');
+      }
+    }
+    lap('verification');
     // Known values are the raw texts the detectors positively classified. Words
     // the allowlist merely could not clear are excluded: they are ordinary page
     // vocabulary, and on any real site they overlap the user's own instruction
     // ("lms", "attendance"), which would block every such request as a leak.
-    const request = finalCheck(candidate, plan.findings.flatMap(finding => finding.text && !finding.unclassified ? [finding.text] : []),
-      observation.tiles.map(tile => tile.screenshot), input.vault);
-    check();
+    const known = plan.findings.flatMap(finding => finding.text && !finding.unclassified ? [{ kind: finding.kind, text: finding.text }] : []);
+    const policy = data.ocrTextPolicy ?? 'all_text';
+    const { request: candidate, rewritten } = payload(binding, plan, placeholders, image, { known, vault: input.vault, policy });
+    const request = finalCheck(candidate, known.map(value => value.text), observation.tiles.map(tile => tile.screenshot), input.vault, policy);
+    if (rewritten) withheldReasons.push('TEXT_WITHHELD_POLICY');
+    check(); lap('payload');
     // Return the *exact* validated object for local review. No transport exists.
-    return { ok: true, request, decision: image ? 'safe' : 'safe_without_image', withheldReasons,
+    return { ok: true, request, decision: image ? 'safe' : 'safe_without_image', withheldReasons, stages,
       summary: { text: plan.findings.filter(f => f.redactText).length, faces: plan.findings.filter(f => f.source === 'face').length,
-        documents: plan.findings.filter(f => f.source === 'document').length, masks: plan.masks.length } };
+        documents: plan.findings.filter(f => f.source === 'document').length, masks: plan.masks.length, rewritten } };
   } catch (error) {
     input.vault?.clear();
     const failure = error instanceof PrivacyError ? error : undefined;

@@ -1,5 +1,5 @@
 import { build } from 'vite';
-import { cp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import './openredaction.mjs';
@@ -88,9 +88,17 @@ await build({ configFile: false, build: {
 // the bundled worker remains compatible with Chrome's extension worker loader.
 const documentWorkerPath = 'dist/vision/document.worker.js';
 await writeFile(documentWorkerPath, (await readFile(documentWorkerPath, 'utf8')).replaceAll('import.meta.url', 'self.location.href'));
+// Vite also emits ORT's default wasm copies under vision/assets. The worker
+// always sets wasmPaths to the files copied below, and those defaults resolve
+// to /assets/ at the extension root, which does not exist, so they are dropped.
+for (const file of await readdir('dist/vision/assets').catch(() => []))
+  if (/^ort-wasm-simd-threaded.*\.wasm$/.test(file)) await rm(`dist/vision/assets/${file}`);
 await cp(documentModel, 'dist/vision/document.onnx');
 await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm', 'dist/vision/ort-wasm-simd-threaded.wasm');
 await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs', 'dist/vision/ort-wasm-simd-threaded.mjs');
+// The WebGPU runtime, loaded only when the worker finds a hardware GPU.
+await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm', 'dist/vision/ort-wasm-simd-threaded.asyncify.wasm');
+await cp('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs', 'dist/vision/ort-wasm-simd-threaded.asyncify.mjs');
 await cp('assets/onnxruntime/LICENSE', 'dist/licenses/ONNXRUNTIME-LICENSE');
 await cp('../models/README.md', 'dist/vision/DOCUMENT-MODEL.md');
 // Generate the future Python-compatible protocol from the same runtime schemas.
