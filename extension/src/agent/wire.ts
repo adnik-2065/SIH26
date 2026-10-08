@@ -48,7 +48,7 @@ export function describePage(request: StepRequest) {
     : '- (no interactive element was visible in this view)';
   const values = request.valueRefs.length
     ? `\n\nApproved stored values. Use the reference itself as "value"; the text is held on the device and is never shown here:\n${
-      request.valueRefs.map(ref => `- ${ref.id} fills ${ref.target} (${ref.purpose})`).join('\n')}`
+      request.valueRefs.map(ref => `- ${ref.id} ${ref.target ? `fills ${ref.target}` : 'may fill a compatible field on a locally approved destination'} (${ref.purpose})${ref.placeholder ? ` corresponds to ${ref.placeholder}` : ''}`).join('\n')}`
     : '';
   const image = request.sanitizedImage
     ? `A redacted screenshot of this same view is attached (${request.sanitizedImage.width}x${request.sanitizedImage.height} px). Masked boxes hide private content.`

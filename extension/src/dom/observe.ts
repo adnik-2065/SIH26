@@ -182,7 +182,7 @@ export function collect(observationId: string, documentId: string, revision: num
     const sensitive = sensitiveControl(el);
     const id = `${observationId}_e${elements.length + 1}`;
     refs.set(id, el);
-    elements.push({ id, type, sensitive, filled: hasValue(el), credential: credentialControl(el),
+    elements.push({ id, type, sensitive, filled: hasValue(el), credential: credentialControl(el), autocomplete: (el.getAttribute('autocomplete') || '').slice(0, 100),
       label: sensitive ? 'Sensitive field' : labelFor(el),
       role: (el.getAttribute('role') || (el.matches('button') ? 'button' : el.matches('select') ? 'combobox' : el.matches('a') ? 'link' : type === 'checkbox' ? 'checkbox' : 'textbox')).slice(0, 50),
       disabled: el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true',

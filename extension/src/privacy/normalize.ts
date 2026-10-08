@@ -5,6 +5,7 @@ import { LIMITS, privacyError, PrivacyError, type ExportData, type Finding, type
 import { DEFAULT_PADDING, mergeMasks, paddedMask, union, validateBounds, visibleDomBounds } from './geometry';
 import { controlIsMasked } from './policy';
 import { Placeholders, sanitizeText } from './text';
+import type { LocalValueVault } from './value-vault';
 
 // The kinds worth re-detecting with whitespace removed: fixed formats that OCR
 // splits at arbitrary characters.
@@ -59,7 +60,7 @@ export function textChunks(text: string, limit: number = LIMITS.text) {
   return chunks;
 }
 
-export function normalize(data: ExportData, placeholders: Placeholders) {
+export function normalize(data: ExportData, placeholders: Placeholders, vault?: LocalValueVault) {
   const { observation } = data, { imageWidth: width, imageHeight: height } = observation;
   const textPolicy = data.ocrTextPolicy ?? 'all_text';
   const controlPadding = textPolicy === 'all_text' ? DEFAULT_PADDING : { ...DEFAULT_PADDING, document: 2 };
@@ -84,6 +85,8 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     const bounds = visibleDomBounds(element.bounds, observation);
     const result = sanitizeText(element.label, 'element_description', placeholders, textPolicy);
     result.findings.forEach(finding => append({ ...finding, bounds, elementId: element.id }));
+    vault?.matches(element.label).forEach(match => append({ id: 'pending', source: 'dom', kind: match.kind, text: match.text,
+      confidence: 1, exportPolicy: 'replace', redactText: true, redactPixels: true, bounds, elementId: element.id }));
     if (element.sensitive || /password|otp|token|secret/i.test(element.type)) append({ id: 'pending', source: 'dom', kind: 'password',
       confidence: 1, bounds, elementId: element.id, exportPolicy: 'withhold', redactText: true, redactPixels: true });
     // Control values are intentionally absent from DOM metadata, so a control
@@ -126,6 +129,12 @@ export function normalize(data: ExportData, placeholders: Placeholders) {
     if (textPolicy === 'all_text') masks.push(paddedMask(region.bounds, 'document', width, height));
   }
   const reconstructed = reconstructOcr(words);
+  vault?.matches(reconstructed.text).forEach(match => {
+    const boxes = reconstructed.spans.filter(box => box.start < match.end && box.end > match.start).map(box => box.bounds);
+    if (!boxes.length) throw new PrivacyError('INVALID_BOUNDS');
+    append({ id: 'pending', source: 'ocr', kind: match.kind, text: match.text, confidence: 1,
+      exportPolicy: 'replace', redactText: true, redactPixels: true, bounds: boxes.reduce(union) });
+  });
   for (const chunk of textChunks(reconstructed.text)) {
     const result = sanitizeText(chunk.text, 'ocr', placeholders, textPolicy);
     result.findings.forEach((finding, index) => {

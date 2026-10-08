@@ -13,6 +13,7 @@ export interface ExportInput {
   signal: AbortSignal;
   current: () => Binding | undefined;
   vault?: LocalValueVault;
+  placeholders?: Placeholders;
   verificationOcr?: PerceptionAdapter;
 }
 // Fail-closed, unchanged: every condition below still refuses the export. What
@@ -80,7 +81,7 @@ function requireEvidence(data: ExportData, observationId: string, tileCount: num
 }
 
 export async function buildSafeStepRequest(input: ExportInput): Promise<ExportResult> {
-  const placeholders = new Placeholders();
+  const placeholders = input.placeholders ?? new Placeholders();
   const expiresAt = Date.now() + LIMITS.ttlMs;
   try {
     const parsed = ExportDataSchema.safeParse(input.data);
@@ -98,7 +99,8 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
     const stages = { pii: 0, masking: 0, verification: 0, payload: 0 };
     let mark = performance.now();
     const lap = (stage: keyof typeof stages) => { const now = performance.now(); stages[stage] += now - mark; mark = now; };
-    const normalized = normalize(data, placeholders);
+    const normalized = normalize(data, placeholders, input.vault);
+    input.vault?.capture(normalized.findings, placeholders);
     const plan = RedactionPlanSchema.parse({ observationId: binding.observationId, ...normalized,
       valueRefs: input.vault?.references(binding) ?? [], coverage: { instruction: 'complete', dom: 'complete', ocr: 'complete', faces: 'complete',
         documents: data.documents.status, image: data.image === 'none' ? 'not_requested' : 'complete' },
@@ -151,5 +153,5 @@ export async function buildSafeStepRequest(input: ExportInput): Promise<ExportRe
       message: 'The redacted export could not be produced.', timestamp: new Date().toISOString(),
       ...(error instanceof Error ? { cause: error.name } : {}) };
     return { ok: false, blockedReasons: [failure?.reason ?? 'INVALID_INPUT'], blockedDetails: [detail] };
-  } finally { placeholders.clear(); }
+  } finally { if (!input.placeholders) placeholders.clear(); }
 }

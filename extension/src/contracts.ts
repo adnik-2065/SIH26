@@ -9,7 +9,7 @@ const target = { target: id };
 // before it is ever keyed into the page. `key` carries no text at all — it
 // dispatches one Enter to the focused control, the path a real user takes when
 // an autocomplete offers no clickable suggestion.
-export const LiteralTextSchema = z.string().min(1).max(200);
+export const LiteralTextSchema = z.string().min(1).max(2000);
 export const ActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('click'), ...target }).strict(),
   z.object({ type: z.literal('fill'), ...target, valueRef: id }).strict(),
@@ -68,7 +68,7 @@ export const StepRequestSchema = z.object({ ...envelope,
     // Credential-state only: whether a credential field (password, login
     // identifier) currently holds user input. A boolean, never the value.
     filled: z.boolean().optional() }).strict()).max(200),
-  valueRefs: z.array(z.object({ id, purpose: z.string().max(100), target: id }).strict()).max(100),
+  valueRefs: z.array(z.object({ id, purpose: z.string().max(100), target: id.optional(), placeholder: z.string().max(60).optional() }).strict()).max(100),
   sanitizedImage: z.object({ mimeType: z.literal('image/png'), base64: z.string().max(4_000_000),
     // The delivered image's own pixel size. Element boxes in page_info are
     // expressed in this space so the model can match what it sees to exact
@@ -183,6 +183,7 @@ export const ElementSchema = z.object({
   // A credential field (password, one-time code, login identifier): the agent
   // must never type into it, and only its filled state may reach the server.
   credential: z.boolean().optional(),
+  autocomplete: z.string().max(100).optional(),
 }).strict();
 export const DomSnapshotSchema = z.object({
   observationId: id, documentId: id, revision: z.number().int().nonnegative(), origin: z.string().url(),

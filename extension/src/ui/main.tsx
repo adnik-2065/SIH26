@@ -15,6 +15,7 @@ import { formatRoundRuntime, formatRoundTimings, formatRoundWork, markDetector, 
 import { OnnxDocumentAdapter } from '../vision/documents/onnx';
 import { PagePreview } from './preview';
 import { PrivacyReview } from '../privacy/review';
+import { TaskValues } from '../privacy/task-values';
 import { TransportFailureNotice } from '../agent/steps';
 import { abortWith } from '../agent/diagnostics';
 import type { AbortSource, ExtensionError } from '../contracts';
@@ -172,6 +173,7 @@ function App() {
   const captureTilesRef = useRef<CaptureTile[]>([]);
   const [captureProgress, setCaptureProgress] = useState<{ index: number; count: number }>();
   const stopPending = useRef(false);
+  const taskValuesRef = useRef<TaskValues | undefined>(undefined);
   // Set only while a run is parked waiting for the user to grant activeTab
   // access to the tab's current origin (a START/OBSERVE answered
   // ACCESS_REQUIRED). The user is the only grant actor — the toolbar icon — so
@@ -213,6 +215,8 @@ function App() {
     setOcr(undefined); setOcrBusy(false); setProgress(undefined); setOcrError(''); setSelected(undefined);
   };
   const applyState = (next: TaskState) => {
+    if (next.status === 'stopped' || next.status === 'failed' ||
+      (next.tabId !== undefined && stateRef.current.tabId !== undefined && next.tabId !== stateRef.current.tabId)) taskValuesRef.current?.clear();
     if (next.generation !== stateRef.current.generation || next.observationId !== stateRef.current.observationId || next.status === 'stopped') {
       // The exact user-visible refusal line, now timestamped with the old and
       // new generation so a task_replaced abort can be tied to the event that
@@ -272,6 +276,7 @@ function App() {
       if (parsed.success && parsed.data.generation >= stateRef.current.generation) applyState(parsed.data);
     }).catch(() => setError('Reload the extension and open the panel again.'));
     const dispose = (event?: Event) => {
+      taskValuesRef.current?.clear();
       if (controllerRef.current) abortWith(controllerRef.current, event?.type === 'pagehide' ? 'pagehide' : 'panel_unmount',
         event?.type === 'pagehide' ? 'the panel document was hidden' : 'the panel unmounted', { runId: runIdRef.current, scope: 'detections' });
       adapterRef.current?.dispose(); faceAdapterRef.current?.dispose(); documentAdapterRef.current?.dispose(); clearReuse(); };
@@ -377,6 +382,7 @@ function App() {
       return;
     }
     runRef.current = outcome.run;
+    taskValuesRef.current?.clear(); taskValuesRef.current = new TaskValues();
     setRunStage(outcome.run.stage);
     // A new task never inherits a pending access wait or an in-flight recovery.
     accessWaitRef.current = false; recoveringAccessRef.current = false;
@@ -393,6 +399,7 @@ function App() {
   // A halted run keeps its structured failure, so the panel can still say what
   // failed after the observation (and the section that reported it) is gone.
   function stopRun(notice: string, failure?: ExtensionError) {
+    taskValuesRef.current?.clear();
     // Any terminal run — manual Stop, a halted verdict, a completed task —
     // ends an access wait and any in-flight recovery with it.
     accessWaitRef.current = false;
@@ -757,6 +764,7 @@ function App() {
         </section>
 
         <PrivacyReview observation={observation} instruction={instruction} ocr={ocr} faces={faces} modelDocuments={documents} complete={complete}
+          taskValues={autoRun ? taskValuesRef.current : undefined}
           currentState={() => stateRef.current} signal={controllerRef.current?.signal} verificationOcr={ocrAdapter}
           auto={autoRun} runId={runId} executionReport={executionReport} onExecuted={setExecutionReport} onStage={stage} onHalt={stopRun}
           actionHistory={actionHistoryRef.current} loopTracker={loopTrackerRef.current}

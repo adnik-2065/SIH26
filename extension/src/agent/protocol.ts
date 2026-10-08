@@ -90,7 +90,7 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
       if (!url) { refuse('INVALID_ACTION'); continue; }
       // The address is server text that reaches the network, held to the
       // same identifier rule as text keyed into a page.
-      if (carriesIdentifier(decodedUrl(url))) { refuse('UNSAFE_VALUE'); continue; }
+      if (openRedactionCandidates(decodedUrl(url)).length || /value_|\[(?:EMAIL|PHONE|PERSON|ADDRESS)_/i.test(decodedUrl(url))) { refuse('UNSAFE_VALUE'); continue; }
       steps.push({ action: { type: 'navigate', url }, index, literal: true }); continue;
     }
     if (!value) { refuse('MISSING_VALUE'); continue; }
@@ -98,13 +98,14 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
     // server never holds it. Anything else is literal text it composed itself.
     const reference = valueRefs.get(value);
     if (reference) {
-      if (reference.target !== target) { refuse('UNKNOWN_TARGET'); continue; }
+      if (reference.target && reference.target !== target) { refuse('UNKNOWN_TARGET'); continue; }
       steps.push({ action: { type: step.action === 'type' ? 'fill' : 'select', target, ...(step.action === 'type' ? { valueRef: value } : { optionRef: value }) } as Action, index, literal: false });
       continue;
     }
+    if (/^value_|\[(?:EMAIL|PHONE|PERSON|ADDRESS|DOCUMENT|DATE_OF_BIRTH)_\d+\]/.test(value)) { refuse('UNSAFE_VALUE'); continue; }
     if (element && /sensitive/i.test(element.description)) { refuse('SENSITIVE_TARGET'); continue; }
     if (!literalTextAllowed(value)) { refuse('UNSAFE_VALUE'); continue; }
-    const text = canonical(value).slice(0, 200);
+    const text = canonical(value);
     if (!text) { refuse('MISSING_VALUE'); continue; }
     steps.push({ action: step.action === 'type' ? { type: 'type', target, text } : { type: 'choose', target, optionText: text }, index, literal: true });
   }
@@ -125,7 +126,7 @@ export function planActions(raw: unknown, request: StepRequest, runId?: string):
 // credential, nor to echo back personal data that redaction just removed.
 export function literalTextAllowed(value: string) {
   const text = canonical(value);
-  if (!text || text.length > 200) return false;
+  if (!text || text.length > 2000) return false;
   return !carriesIdentifier(text);
 }
 function carriesIdentifier(text: string) {

@@ -24,6 +24,7 @@ export interface TransportInput {
   // What the executor actually did in earlier rounds of this task, recorded at
   // the executor boundary and sent with every planning request.
   actionHistory?: ActionHistoryEntry[];
+  guardBody?: (body: ReturnType<typeof toAgentBody>) => ReturnType<typeof toAgentBody>;
   // Every stage, in order, including the failing one. It cannot change the
   // request or the verdict.
   onEvent?: StageListener;
@@ -115,7 +116,8 @@ export async function requestStep(input: TransportInput): Promise<TransportResul
   const call = input.fetchImpl ?? fetch;
   let body: string;
   try {
-    body = JSON.stringify(toAgentBody(request, input.executionReport, input.actionHistory));
+    const candidate = toAgentBody(request, input.executionReport, input.actionHistory);
+    body = JSON.stringify(input.guardBody ? input.guardBody(candidate) : candidate);
   } catch (error) {
     return fail('AGENT_UNKNOWN_ERROR', 'The redacted payload could not be serialized.', { error, cause: 'JSON.stringify threw' });
   }
