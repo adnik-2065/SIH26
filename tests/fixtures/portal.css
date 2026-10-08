@@ -1,0 +1,16 @@
+:root { font-family: system-ui, sans-serif; color: #18332e; background: #f3f7f5; }
+body { margin: 0; } main { max-width: 1060px; margin: 36px auto; padding: 0 24px; }
+h1 { font-size: 34px; letter-spacing: -1px; margin: 10px 0; } h2 { font-size: 19px; }
+.eyebrow { color: #386b59; font-size: 12px; font-weight: 750; letter-spacing: 2px; }
+.tools { display: flex; flex-wrap: wrap; gap: 8px; padding: 20px 0; }
+.columns { display: grid; grid-template-columns: 1.1fr 1fr; gap: 28px; align-items: start; }
+.columns.reversed form { order: 2; } .columns.reversed aside { order: 1; }
+form, aside { padding: 24px; border: 1px solid #d6e1db; border-radius: 16px; background: white; }
+label { display: block; font-size: 14px; font-weight: 600; margin: 0 0 15px; }
+input:not([type=checkbox]), select { display: block; box-sizing: border-box; width: 100%; padding: 11px; margin-top: 6px; border: 1px solid #afc2b8; border-radius: 7px; font: inherit; }
+input:disabled { background: #edf0ef; } select { margin-bottom: 15px; } .checkbox { display: flex; gap: 9px; align-items: center; }
+[hidden] { display: none !important; } button { padding: 10px 14px; border: 1px solid #a7c0b4; background: white; border-radius: 8px; cursor: pointer; font: inherit; }
+.primary { background: #146b4d; color: white; border-color: #146b4d; } button:hover { filter: brightness(.94); }
+.card { width: 100%; height: auto; border: 1px solid #d6e1db; } .portrait { object-fit: cover; margin-top: 18px; border-radius: 12px; }
+.below { margin-top: 300px; padding-bottom: 150px; } #result { font-weight: 600; } :focus-visible { outline: 3px solid #61a6ee; outline-offset: 2px; }
+@media (max-width: 700px) { .columns { grid-template-columns: 1fr; } }

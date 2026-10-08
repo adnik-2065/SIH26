@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Synthetic application portal</title><link rel="stylesheet" href="/portal.css"></head>
+<body>
+  <main>
+    <p class="eyebrow">SIH26 · SYNTHETIC TEST PORTAL</p>
+    <h1>Apply for the campus workshop</h1>
+    <p>Use made-up details only. This form stays in this browser and does not send a request.</p>
+    <section class="tools" aria-label="Fixture controls">
+      <button id="layout" type="button">Change layout</button>
+      <button id="delay" type="button">Add field after 2 seconds</button>
+      <button id="disable" type="button">Toggle phone disabled</button>
+      <button id="reset" type="button">Reset fixture</button>
+    </section>
+    <div class="columns" id="columns">
+      <form id="application">
+        <label>Full name<input id="name" name="name" autocomplete="off" required placeholder="Demo Student"></label>
+        <label>Email address<input id="email" name="email" type="email" autocomplete="off" required placeholder="student@example.test"></label>
+        <label>Phone number<input id="phone" name="phone" type="tel" autocomplete="off" required placeholder="0000000000"></label>
+        <label for="workshop">Workshop</label><select id="workshop" name="workshop" required><option value="">Choose a workshop</option><option value="web">Web development</option><option value="vision">Computer vision</option></select>
+        <label class="checkbox"><input id="consent" name="consent" type="checkbox" required>I agree to register for this synthetic workshop.</label>
+        <div id="delayed"></div>
+        <input type="hidden" value="SYNTHETIC_HIDDEN_VALUE">
+        <label hidden>Hidden field<input id="hidden-field" value="SYNTHETIC_HIDDEN_VALUE"></label>
+        <label>Unavailable reference<input id="unavailable" disabled placeholder="Not editable"></label>
+        <button class="primary" type="submit">Submit application</button>
+        <p id="result" role="status" aria-live="polite">No application submitted.</p>
+        <p>Submission count: <output id="submission-count">0</output></p>
+      </form>
+      <aside>
+        <h2>Image-only test content</h2>
+        <img class="card" src="/assets/synthetic-details.svg" alt="Synthetic details image for OCR testing" width="720" height="240">
+        <img class="portrait" src="/assets/synthetic-face.png" alt="AI-generated fictional portrait for face detection" width="220" height="220">
+        <p>This is a fictional person, generated for this fixture.</p>
+      </aside>
+    </div>
+    <section class="below"><h2>Below the fold</h2><p>Scroll here to check observation invalidation.</p><button type="button">Extra fixture button</button></section>
+  </main>
+  <script src="/portal.js"></script>
+</body>
+</html>

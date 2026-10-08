@@ -164,3 +164,16 @@ htmlcov/
 ngrok.yml
 ngrok.yaml
 .ngrok2/
+tests/
+evidence/
+.freebuff/
+evidence-probe-after
+
+# Browser automation test artifacts (Playwright/Puppeteer): screenshots,
+# videos, traces, error contexts, retry diffs and HTML reports written by
+# test runs. Matched at any depth so extension/ runs are covered too.
+test-results/
+playwright-report/
+blob-report/
+.last-run.json
+.playwright/

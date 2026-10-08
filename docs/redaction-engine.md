@@ -1,0 +1,80 @@
+# Local redaction engine
+
+Implemented under `extension/src/privacy/`. There is no network transport or action executor. The version-1 `StepRequestSchema` is unchanged.
+
+## Entry point and local review
+
+`buildSafeStepRequest` is the only public request builder. It accepts the current tiled `LocalObservation`, completed local OCR/MediaPipe results, document coverage status, the user instruction, a live binding callback and an abort signal. An optional `LocalValueVault` supplies explicitly approved profile references. The public barrel does not expose the internal payload or image builders.
+
+The panel adds one **Redacted export preview** section after capture. **Prepare redacted preview** uses the final gateway; its image and expandable JSON show the exact locally prepared representation. The original preview is unchanged. Nothing is transmitted. Existing capture, detector, task and cleanup code is preserved; the panel integration consists of an import, a review component and an updated privacy notice.
+
+The caller must supply extension-controlled completion evidence only after `inspectCapturedPage` resolves successfully, never from its partial-result callback. Each detector must match the observation and complete every capture tile without truncation. Local aggregate results use the existing region schema with an explicit 10,000-region page budget; the 500-region per-inference vision contract is unchanged. Missing, mock, stale, malformed, incomplete and over-limit results block the request.
+
+The gateway checks task, observation, document, revision, origin, generation and tab bindings before work and after asynchronous boundaries. The review inherits the existing detector abort signal. Stop, rescanning, changed instruction, invalidation, opt-out, unmount and page hide discard the result. Reviews and vault sessions expire after five minutes. A future transport must re-enter the gateway against the current binding; a previously returned JSON object is not a durable authorization to send.
+
+## Conservative text and image policy
+
+- Local candidate rules cover email, plausible phone numbers, PAN, 12-digit Aadhaar candidates, Luhn-valid cards, structural IFSC, labelled names/addresses/birth dates/accounts/passports, credentials, private-document labels and opaque tokens. No Aadhaar checksum or identity validation is claimed.
+- Strings are normalized with NFKC and invisible formatting characters removed. Unsupported scripts/control characters or excessive text are withheld by blocking. There is no NER model: in page text and OCR, words outside a small task/control vocabulary are replaced with local document placeholders when they cannot be classified. This sacrifices some task detail. The instruction is exempt from that allowlist: it is the user's own sentence, typed into the panel rather than read off the page, and applying the allowlist to it left the server "[DOCUMENT_1] [DOCUMENT_2] this [DOCUMENT_3] portal" for "login into this lms portal" — unusable, and no safer. Classified PII, including credentials, is still redacted from it, and the panel says so beneath the input.
+- OCR reconstruction retains a span-to-box mapping across words, adjacent lines and capture seams. A compact pass handles arbitrary word splits. Large vertical gaps separate compact reconstruction blocks.
+- The privacy preview masks detected OCR PII by default and preserves ordinary page text and unrelated images for context. Faces, identified documents and controls that hold a value or a secret remain masked; empty fields, buttons and links keep their pixels so the surrounding form and its labels stay readable. Strict mode masks all OCR text, every control and unclassified visual containers. Detector misses can leave sensitive content visible in context mode; raw control values remain absent from DOM metadata.
+- Source pixels are masked on a separate opaque tile canvas. Every affected tile's overlap margin is masked. Only ownership bands are copied into a bounded summary; projected masks are painted again with an extra pixel of padding after scaling. The original tiles are not mutated. PNG decoding checks the header dimensions before allocation, and newly encoded output strips original PNG metadata.
+- PNG failure or oversized output can withhold an optional image; a required image blocks. Invalid bounds, stale state, raw-data leaks and detector failures block the request. There is no original-image fallback.
+- Every outgoing textual field, including identifiers, is checked again after construction. The re-check sanitizes each field under the policy that produced it, so the instruction is re-checked as an instruction; using the page-text rules on it rewrote the field the gateway had deliberately exempted and reported that rewrite as `RAW_DATA_LEAK`. The known-value list it is compared against holds only raw texts the detectors positively classified. Words withheld solely because the allowlist could not clear them are excluded: they are ordinary page vocabulary, and on a real site they overlap the user's own wording ("lms", "attendance"), which blocked every such request as a leak. Findings carry `unclassified` to mark that distinction. Outgoing identifiers must use the UUID formats generated by the current extension, including its element suffixes and request/value prefixes; arbitrary name-like ID strings are rejected. Unknown fields are rejected by the existing strict version-1 schema. The only binary field is produced internally by the masking encoder; callers cannot supply a candidate image or arbitrary payload.
+
+## Budgets
+
+| Resource | Limit |
+| --- | --- |
+| Instruction | 2,000 characters, existing wire contract |
+| Local reconstructed text | 16,000 characters |
+| Regions per aggregated detector | Fewer than 10,000; reaching the cap blocks |
+| Findings / masks | 20,000 each |
+| Capture tiles | 2,048, contiguous ownership covering the page |
+| Source canvas / decoded tile | 32,000,000 pixels, matching capture's bound |
+| Summary | 1,000,000 pixels, at most 1,600 pixels per side |
+| Encoded PNG | 3,000,000 bytes / 4,000,000 Base64 characters |
+| Decode or encoding operation | 30 seconds |
+| Gateway work / local review / vault session | 5 minutes |
+
+The encoder releases each tile's bitmap/canvas before proceeding, and releases its summary canvas on success, failure or cancellation. Native decoding/encoding cannot always be physically interrupted; late bitmaps are closed and late encoded results are discarded. Releasing references is not guaranteed immediate physical erasure.
+
+## Approved values
+
+`LocalValueVault` stores values only in private in-memory fields. `approve` requires explicit `approved_profile` provenance, approval, an allowed normal-profile category and a matching non-sensitive destination control. The observation normalization path never calls it. Allowed categories are name, email, phone, postal address and date of birth; credentials and webpage findings are not reference sources.
+
+References use random opaque IDs and fixed generic purposes. Resolution checks task, observation, origin, document revision, generation, tab, target and expiry. Aborting the owning lifecycle, invalidation, expiry or disposal clears the records. Worker restart cannot restore them. The vault also checks final strings against its private values without exposing a mapping. Profile entry/approval UI and action execution are not implemented.
+
+## Evidence and limitations
+
+The privacy unit tests use fictional values and inspect final serialization, including unknown fields, identifiers, screenshot bytes and local profile values. Browser tests decode the actual exported PNG, inspect opaque pixels over all expected masks at 100%, 125% and DPR 2, exercise overlapping text/face/document masks and long pages, and check cancellation, failure, oversized encoding and resource release. The real extension test uses current OCR and MediaPipe, including image-only PII below the fold, and inspects exact JSON, storage, logs and external requests. Existing capture/vision/browser regressions are also run.
+
+Document container tests use synthetic fixtures, not trained-model inference. The supplied local ONNX document model is bundled and runs in a worker; its four classes cover identity documents, fingerprints, signatures, and financial documents. See [the incremental privacy report](privacy-enhancements.md) for strict-mask and detector limitations.
+
+No raw screenshots, OCR, DOM values, profile records, mappings, errors or findings are written to storage, logs, telemetry or a server by this module. Only the newly masked image, sanitized instruction/control descriptions and approved opaque references are eligible for the version-1 payload.
+
+## Changed-file map
+
+| Files | Responsibility |
+| --- | --- |
+| `extension/src/privacy/contracts.ts` | Strict local schemas and resource budgets |
+| `extension/src/privacy/classify.ts`, `text.ts` | Candidate rules, conservative text export and placeholders |
+| `extension/src/privacy/normalize.ts`, `geometry.ts` | Source normalization, OCR spans, coordinate conversion and masks |
+| `extension/src/privacy/image.ts` | Bounded opaque PNG generation and buffer cleanup |
+| `extension/src/privacy/value-vault.ts` | Explicitly approved, bound in-memory references |
+| `extension/src/privacy/payload.ts`, `gateway.ts`, `index.ts` | Minimal v1 payload, final checks and public API |
+| `extension/src/privacy/review.tsx`, `extension/src/ui/main.tsx` | Local review and existing lifecycle connection |
+| `extension/tests/privacy-fixture.ts`, `privacy-browser-harness.ts` | Fictional data and test-only browser harness |
+| `extension/tests/unit/privacy.test.ts` | Policy, contracts, geometry, vault and gateway tests |
+| `extension/tests/browser/privacy.spec.ts`, `privacy-panel.spec.ts` | Pixel/resource/failure tests and real extension integration |
+| `docs/redaction-engine.md` | Implementation and verification notes |
+
+## Validation recorded 2026-09-15
+
+- Typecheck, lint, production build and `git diff --check` passed.
+- All 142 unit tests passed, including 43 privacy tests.
+- All 21 existing browser regressions passed in the full browser run. That run exposed a privacy integration failure; after fixes, all 9 privacy browser tests passed in a targeted rerun. Thus all 30 distinct browser tests have passed across those runs.
+- Final serialized fixture payloads contain no raw fixture PII, original tile Base64, raw OCR fields or local mappings. Pixel checks verify black RGB and alpha 255 across complete expected masks. Long-page allocation and cleanup assertions passed.
+- The real extension test verified image-only PII below the fold, exact payload inspection, Stop/restart, scrolling, opt-out, layout change, zoom change, tab change, and no leaks in extension storage, logs or external requests. Keyboard disclosure and the 380-pixel review layout were checked; the local synthetic preview artifact is `/tmp/sih26-redacted-review.png`.
+
+Earlier failures caught fractional dimensions in a synthetic zoom fixture, over-classification of compact OCR prose, and a review cleanup timing race. The corrected tests and regression cases are included.
